@@ -1,7 +1,4 @@
-use tch::{
-    kind::INT64_CPU,
-    IndexOp, Tensor,
-};
+use tch::{kind::INT64_CPU, IndexOp, Tensor};
 
 #[derive(Default)]
 pub struct TrajectoryTensors {

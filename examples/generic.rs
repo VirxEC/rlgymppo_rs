@@ -299,7 +299,7 @@ fn main() {
         num_games_per_thread,
         render: false,
         exp_buffer_size: 60_000,
-        timestep_limit: 10_000_000,
+        timestep_limit: 1_000_000,
         timesteps_per_save: 10_000_000,
         collection_during_learn: false,
         ppo: PPOLearnerConfig {

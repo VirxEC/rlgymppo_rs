@@ -65,8 +65,13 @@ pub struct AgentConfig {
 }
 
 #[derive(Default)]
+pub struct AgentControls {
+    pub should_run: AtomicBool,
+    pub paused: AtomicBool,
+}
+
+#[derive(Default)]
 struct AgentData {
-    should_run: AtomicBool,
     trajectories: Mutex<Vec<Vec<Trajectory>>>,
     steps_collected: AtomicU64,
 }
@@ -85,6 +90,7 @@ where
     times: Report,
     config: AgentConfig,
     data: Arc<AgentData>,
+    controls: Arc<AgentControls>,
     policy: Arc<RwLock<Arc<DiscretePolicy>>>,
 }
 
@@ -102,6 +108,7 @@ where
         create_env_fn: F,
         index: usize,
         data: Arc<AgentData>,
+        controls: Arc<AgentControls>,
         policy: Arc<RwLock<Arc<DiscretePolicy>>>,
     ) -> Self
     where
@@ -130,13 +137,14 @@ where
             game_instances,
             config,
             data,
+            controls,
             times: Report::default(),
             policy,
         }
     }
 
     pub fn run(&mut self) {
-        while !self.data.should_run.load(Ordering::Relaxed) {
+        while !self.controls.should_run.load(Ordering::Relaxed) {
             sleep(Duration::from_millis(100));
         }
 
@@ -150,15 +158,19 @@ where
         let mut steps_since_update = 0;
 
         'outer: loop {
-            while self.data.steps_collected.load(Ordering::Relaxed) >= self.config.max_steps {
-                if !self.data.should_run.load(Ordering::Relaxed) {
+            let mut was_paused = false;
+            while self.controls.paused.load(Ordering::Relaxed)
+                || self.data.steps_collected.load(Ordering::Relaxed) >= self.config.max_steps
+            {
+                if !self.controls.should_run.load(Ordering::Relaxed) {
                     break 'outer;
                 }
 
-                sleep(Duration::from_millis(3));
+                was_paused = true;
+                sleep(Duration::from_millis(10));
             }
 
-            if steps_since_update == 1500 {
+            if was_paused || steps_since_update == 5000 {
                 policy = self.policy.read().unwrap().clone();
 
                 steps_since_update = 0;
@@ -175,7 +187,6 @@ where
                 let results = policy.get_action(&cur_obs_on_device, self.config.deterministic);
 
                 let policy_infer_elapsed = policy_infer_start.elapsed();
-                // dbg!(policy_infer_elapsed);
                 self.times["policy_infer_time"] += policy_infer_elapsed.as_secs_f64();
                 results
             };
@@ -202,7 +213,6 @@ where
             assert!(action_offset == action_results.action.size1().unwrap() as usize);
 
             let gym_step_elapsed = gym_step_start.elapsed();
-            // dbg!(gym_step_elapsed);
             self.times["gym_step_time"] += gym_step_elapsed.as_secs_f64();
 
             let next_obs_tensor = make_games_obs_tensor(&self.game_instances);
@@ -269,6 +279,7 @@ pub struct AgentController {
 impl AgentController {
     pub fn new<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         config: AgentConfig,
+        controls: Arc<AgentControls>,
         policy: Arc<DiscretePolicy>,
         create_env_fn: F,
         index: usize,
@@ -288,7 +299,15 @@ impl AgentController {
         let thread_data = data.clone();
         let thread_policy = policy.clone();
         let thread_handle = thread::spawn(move || {
-            Agent::new(config, create_env_fn, index, thread_data, thread_policy).run();
+            Agent::new(
+                config,
+                create_env_fn,
+                index,
+                thread_data,
+                controls,
+                thread_policy,
+            )
+            .run();
         });
 
         Self {
@@ -296,10 +315,6 @@ impl AgentController {
             policy,
             thread_handle,
         }
-    }
-
-    pub fn start(&self) {
-        self.data.should_run.store(true, Ordering::Relaxed);
     }
 
     pub fn update_policy(&self, new_policy: Arc<DiscretePolicy>) {
@@ -317,10 +332,6 @@ impl AgentController {
 
     pub fn get_trajectories(&self) -> MutexGuard<Vec<Vec<Trajectory>>> {
         self.data.trajectories.lock().unwrap()
-    }
-
-    pub fn request_stop(&self) {
-        self.data.should_run.store(false, Ordering::Relaxed);
     }
 
     pub fn wait_for_close(self) {

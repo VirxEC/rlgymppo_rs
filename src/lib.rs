@@ -9,11 +9,7 @@ pub use tch;
 
 use ppo::{exp_buf::ExperienceBuffer, ppo_learner::PPOLearner};
 use rlgym_rs::{Action, Env, Obs, Reward, StateSetter, Terminal, Truncate};
-use std::{
-    num::NonZeroUsize,
-    path::PathBuf,
-    time::Instant,
-};
+use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
 use tch::Device;
 use threading::agent_mngr::AgentManager;
 use util::report::Report;
@@ -169,8 +165,9 @@ where
         println!("Creating agent manager...");
         let mut agent_mngr = AgentManager::new(
             ppo.get_policy(),
-            config.ppo.batch_size + config.ppo.batch_size / 10,
+            config.ppo.batch_size + config.ppo.batch_size / 2,
             config.deterministic,
+            config.collection_during_learn,
             config.device_type,
         );
 
@@ -210,16 +207,27 @@ where
             let timesteps = self
                 .agent_mngr
                 .collect_timesteps(self.config.ppo.batch_size);
-        
+
             let timestep_collection_elapsed = timestep_collection_time.elapsed();
             timestep_collection_time = Instant::now();
-            
-            let steps_per_second = timesteps.len() as f64 / timestep_collection_elapsed.as_secs_f64();
-            println!("Collected {} timesteps in {:.2} seconds ({steps_per_second:.0} overall sps)", timesteps.len(), timestep_collection_elapsed.as_secs_f64());
+
+            let steps_per_second =
+                timesteps.len() as f64 / timestep_collection_elapsed.as_secs_f64();
+            println!(
+                "Collected {} timesteps in {:.2} seconds ({steps_per_second:.0} overall sps)",
+                timesteps.len(),
+                timestep_collection_elapsed.as_secs_f64()
+            );
 
             self.total_timesteps += timesteps.len() as u64;
+
+            if self.config.ppo.policy_lr == 0. && self.config.ppo.critic_lr == 0. {
+                println!("Learning rate is 0, skipping learning phase");
+                continue;
+            }
+
             self.agent_mngr.update_policy(self.ppo.get_policy());
-            
+
             self.total_epochs += 1;
         }
 

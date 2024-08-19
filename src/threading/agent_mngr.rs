@@ -1,17 +1,23 @@
 use super::{
-    agent::{AgentConfig, AgentController},
+    agent::{AgentConfig, AgentController, AgentControls},
     trajectory::Trajectory,
 };
 use crate::ppo::discrete::DiscretePolicy;
 use rlgym_rs::{Action, Env, Obs, Reward, StateSetter, Terminal, Truncate};
-use std::{sync::Arc, thread::sleep, time::Duration};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    thread::sleep,
+    time::Duration,
+};
 use tch::Device;
 
 pub struct AgentManager {
     policy: Arc<DiscretePolicy>,
     agents: Vec<AgentController>,
     agent_config: AgentConfig,
+    agent_controls: Arc<AgentControls>,
     max_collect: u64,
+    collect_during_training: bool,
 }
 
 impl AgentManager {
@@ -19,11 +25,13 @@ impl AgentManager {
         policy: Arc<DiscretePolicy>,
         max_collect: u64,
         deterministic: bool,
+        collect_during_training: bool,
         device: Device,
     ) -> Self {
         Self {
             policy,
             max_collect,
+            collect_during_training,
             agents: Vec::new(),
             agent_config: AgentConfig {
                 deterministic,
@@ -31,6 +39,7 @@ impl AgentManager {
                 max_steps: 0,
                 num_games: 0,
             },
+            agent_controls: Arc::default(),
         }
     }
 
@@ -54,6 +63,7 @@ impl AgentManager {
         for i in 0..amount {
             let agent = AgentController::new(
                 self.agent_config.clone(),
+                self.agent_controls.clone(),
                 self.policy.clone(),
                 create_env_fn.clone(),
                 i,
@@ -63,12 +73,16 @@ impl AgentManager {
     }
 
     pub fn start(&self) {
-        for agent in &self.agents {
-            agent.start();
-        }
+        self.agent_controls
+            .should_run
+            .store(true, Ordering::Relaxed);
     }
 
     pub fn collect_timesteps(&self, timesteps: u64) -> Trajectory {
+        if !self.collect_during_training {
+            self.agent_controls.paused.store(false, Ordering::Relaxed);
+        }
+
         // wait in this loop until agents have enough timesteps
         loop {
             let total_steps: u64 = self
@@ -82,6 +96,10 @@ impl AgentManager {
             }
 
             sleep(Duration::from_millis(2));
+        }
+
+        if !self.collect_during_training {
+            self.agent_controls.paused.store(true, Ordering::Relaxed);
         }
 
         let mut result = Trajectory::default();
@@ -135,9 +153,9 @@ impl AgentManager {
 
     pub fn stop(&mut self) {
         println!("Stopping agents...");
-        for agent in &self.agents {
-            agent.request_stop();
-        }
+        self.agent_controls
+            .should_run
+            .store(false, Ordering::Relaxed);
 
         for agent in self.agents.drain(..) {
             agent.wait_for_close();

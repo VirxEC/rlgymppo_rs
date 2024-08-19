@@ -21,7 +21,7 @@ pub struct LearnerConfig {
     pub render: bool,
     /// Set to 0 to disable
     pub timestep_limit: u64,
-    pub exp_buffer_size: i64,
+    pub exp_buffer_size: u64,
     pub standardize_returns: bool,
     // pub standardize_obs: bool,
     pub max_returns_per_stats_inc: u32,
@@ -30,6 +30,28 @@ pub struct LearnerConfig {
     /// This will make your bot play better, but is horrible for learning
     /// Trying to run a PPO learn iteration with deterministic mode will throw an exception
     pub deterministic: bool,
+    /// The number of ***additional*** timesteps to may be collected during the learning phase
+    ///
+    /// Why? This helps when one thread is running slower than the others,
+    /// with the other threads having an extra buffer size to continue collecting
+    /// and make up for the slower thread
+    ///
+    /// If collection_during_learn is `true`,
+    /// this should probably be set to near `0` as the algorithm will naturally overflow.
+    /// A high value may cause runaway memory usage.
+    ///
+    /// If `false`, `batch_size / 2` is recommended
+    pub collection_timesteps_overflow: u64,
+    /// How many ticks to skip before updating checking for
+    /// an updated policy/if the collection should pause
+    ///
+    /// Lower values mean more frequent checks with a
+    /// final timestep closer to the requested number
+    /// and ensuring the the latest policy is being ran,
+    /// but more overhead from loading atomics
+    ///
+    /// Realistically, checking every tick is excessive!
+    pub controls_update_frequency: u64,
     /// Collect additional steps during the learning phase
     /// Note that, once the learning phase completes and the policy is updated, these additional steps are from the old policy
     pub collection_during_learn: bool,
@@ -71,12 +93,14 @@ impl Default for LearnerConfig {
             num_games_per_thread: NonZeroUsize::new(16).unwrap(),
             render: false,
             timestep_limit: 0,
-            exp_buffer_size: 100 * 1000,
+            exp_buffer_size: 100_000,
             standardize_returns: true,
             // standardize_obs: false,
             max_returns_per_stats_inc: 150,
             steps_per_obs_stats_inc: 5,
             deterministic: false,
+            controls_update_frequency: 15,
+            collection_timesteps_overflow: 25_000,
             collection_during_learn: false,
             ppo: PPOLearnerConfig::default(),
             gae_lambda: 0.95,
@@ -85,7 +109,7 @@ impl Default for LearnerConfig {
             checkpoint_load_folder: PathBuf::from("checkpoints"),
             checkpoint_save_folder: PathBuf::from("checkpoints"),
             save_folder_add_unix_timestamp: false,
-            timesteps_per_save: 500 * 1000,
+            timesteps_per_save: 5_000_000,
             random_seed: 123,
             checkpoints_to_keep: 5,
             device_type: Device::cuda_if_available(),
@@ -165,9 +189,10 @@ where
         println!("Creating agent manager...");
         let mut agent_mngr = AgentManager::new(
             ppo.get_policy(),
-            config.ppo.batch_size + config.ppo.batch_size / 2,
+            config.ppo.batch_size + config.collection_timesteps_overflow,
             config.deterministic,
             config.collection_during_learn,
+            config.controls_update_frequency,
             config.device_type,
         );
 
@@ -192,6 +217,7 @@ where
     }
 
     pub fn learn(&mut self) {
+        println!("Starting...");
         self.agent_mngr.start();
 
         // let device = self.config.device_type;
@@ -212,14 +238,14 @@ where
             timestep_collection_time = Instant::now();
 
             let steps_per_second =
-                timesteps.len() as f64 / timestep_collection_elapsed.as_secs_f64();
+                self.config.ppo.batch_size as f32 / timestep_collection_elapsed.as_secs_f32();
             println!(
                 "Collected {} timesteps in {:.2} seconds ({steps_per_second:.0} overall sps)",
                 timesteps.len(),
                 timestep_collection_elapsed.as_secs_f64()
             );
 
-            self.total_timesteps += timesteps.len() as u64;
+            self.total_timesteps += self.config.ppo.batch_size;
 
             if self.config.ppo.policy_lr == 0. && self.config.ppo.critic_lr == 0. {
                 println!("Learning rate is 0, skipping learning phase");

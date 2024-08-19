@@ -26,6 +26,7 @@ impl AgentManager {
         max_collect: u64,
         deterministic: bool,
         collect_during_training: bool,
+        controls_update_frequency: u64,
         device: Device,
     ) -> Self {
         Self {
@@ -36,6 +37,7 @@ impl AgentManager {
             agent_config: AgentConfig {
                 deterministic,
                 device,
+                controls_update_frequency,
                 max_steps: 0,
                 num_games: 0,
             },
@@ -95,7 +97,7 @@ impl AgentManager {
                 break;
             }
 
-            sleep(Duration::from_millis(2));
+            sleep(Duration::from_millis(1));
         }
 
         if !self.collect_during_training {

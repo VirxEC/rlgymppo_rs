@@ -40,13 +40,13 @@ pub struct ExperienceBuffer {
 }
 
 impl ExperienceBuffer {
-    pub fn new(max_size: i64, seed: u64, device: Device) -> Self {
+    pub fn new(max_size: u64, seed: u64, device: Device) -> Self {
         Self {
             device,
             seed,
             data: Default::default(),
             cur_size: 0,
-            max_size,
+            max_size: max_size as i64,
             rng: Rng::with_seed(seed),
         }
     }

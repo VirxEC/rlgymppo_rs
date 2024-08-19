@@ -33,7 +33,7 @@ impl Default for PPOLearnerConfig {
         Self {
             policy_layer_sizes: vec![256, 256, 256],
             critic_layer_sizes: vec![256, 256, 256],
-            batch_size: 50 * 1000,
+            batch_size: 50_000,
             epochs: 10,
             policy_lr: 3e-4,
             critic_lr: 3e-4,

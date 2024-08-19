@@ -9,7 +9,7 @@ use rlgymppo_rs::{
     },
     Learner, LearnerConfig, PPOLearnerConfig,
 };
-use std::{num::NonZeroUsize, thread::available_parallelism};
+use std::{cmp::Ordering, num::NonZeroUsize, thread::available_parallelism};
 
 struct SharedInfo {
     rng: fastrand::Rng,
@@ -29,9 +29,25 @@ impl StateSetter<SharedInfo> for MyStateSetter {
     fn apply(&mut self, arena: &mut UniquePtr<Arena>, shared_info: &mut SharedInfo) {
         arena.pin_mut().reset_tick_count();
 
-        if arena.num_cars() != 2 {
-            let _ = arena.pin_mut().add_car(Team::Blue, CarConfig::octane());
-            let _ = arena.pin_mut().add_car(Team::Orange, CarConfig::octane());
+        let car_ids = arena.pin_mut().get_cars();
+        let mode = shared_info.rng.u8(1..4);
+
+        match (mode as usize).cmp(&(car_ids.len() / 2)) {
+            Ordering::Less => {
+                let to_remove = car_ids.len() / 2 - mode as usize;
+                for car_id in car_ids.into_iter().take(to_remove) {
+                    arena.pin_mut().remove_car(car_id).unwrap();
+                }
+            }
+            Ordering::Greater => {
+                let to_add = mode as usize - car_ids.len() / 2;
+                let car_config = CarConfig::octane();
+                for _ in 0..to_add {
+                    let _ = arena.pin_mut().add_car(Team::Blue, car_config);
+                    let _ = arena.pin_mut().add_car(Team::Orange, car_config);
+                }
+            }
+            Ordering::Equal => {}
         }
 
         arena
@@ -43,7 +59,7 @@ impl StateSetter<SharedInfo> for MyStateSetter {
 struct MyObs;
 
 impl MyObs {
-    const ZERO_PADDING: usize = 1;
+    const ZERO_PADDING: usize = 3;
     const BALL_OBS: usize = 9;
     const CAR_OBS: usize = 9;
 
@@ -129,6 +145,7 @@ impl Obs<SharedInfo> for MyObs {
             obs.push(obs_vec);
         }
 
+        assert!(obs.len() <= Self::ZERO_PADDING * 2);
         obs
     }
 }
@@ -291,22 +308,25 @@ fn main() {
 
     // let num_threads = NonZeroUsize::new(1).unwrap();
     let num_threads = available_parallelism().unwrap();
-    let num_games_per_thread = NonZeroUsize::new(32).unwrap();
-    let minibatch = 25_000;
+    let num_games_per_thread = NonZeroUsize::new(16).unwrap();
+    let mini_batch_size = 25_000;
+    let batch_size = mini_batch_size * 5;
 
     let config = LearnerConfig {
         num_threads,
         num_games_per_thread,
         render: false,
-        exp_buffer_size: 60_000,
+        exp_buffer_size: batch_size,
         timestep_limit: 1_000_000,
         timesteps_per_save: 10_000_000,
+        collection_timesteps_overflow: 0,
+        controls_update_frequency: 15,
         collection_during_learn: false,
         ppo: PPOLearnerConfig {
             policy_layer_sizes: vec![768, 768, 768, 768, 768],
             critic_layer_sizes: vec![768, 768, 768, 768, 768, 768],
-            batch_size: minibatch * 5,
-            mini_batch_size: minibatch,
+            batch_size,
+            mini_batch_size,
             ..Default::default()
         },
         ..Default::default()

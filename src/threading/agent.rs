@@ -61,6 +61,7 @@ pub struct AgentConfig {
     pub deterministic: bool,
     pub num_games: usize,
     pub max_steps: u64,
+    pub controls_update_frequency: u64,
     pub device: Device,
 }
 
@@ -158,19 +159,17 @@ where
         let mut steps_since_update = 0;
 
         'outer: loop {
-            let mut was_paused = false;
-            while self.controls.paused.load(Ordering::Relaxed)
-                || self.data.steps_collected.load(Ordering::Relaxed) >= self.config.max_steps
-            {
-                if !self.controls.should_run.load(Ordering::Relaxed) {
-                    break 'outer;
+            if steps_since_update == self.config.controls_update_frequency {
+                while self.controls.paused.load(Ordering::Relaxed)
+                    || self.data.steps_collected.load(Ordering::Relaxed) >= self.config.max_steps
+                {
+                    if !self.controls.should_run.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+
+                    sleep(Duration::from_millis(1));
                 }
 
-                was_paused = true;
-                sleep(Duration::from_millis(10));
-            }
-
-            if was_paused || steps_since_update == 5000 {
                 policy = self.policy.read().unwrap().clone();
 
                 steps_since_update = 0;

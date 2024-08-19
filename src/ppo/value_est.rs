@@ -1,10 +1,11 @@
+use crate::util::sealed::Sealed;
 use tch::{
     nn::{self, ModuleT},
     Device, Tensor,
 };
 
 pub struct ValueEstimator {
-    seq: nn::SequentialT,
+    seq: Sealed<nn::SequentialT>,
     device: Device,
 }
 
@@ -40,7 +41,10 @@ impl ValueEstimator {
             Default::default(),
         ));
 
-        Self { seq, device }
+        Self {
+            seq: Sealed::new(seq),
+            device,
+        }
     }
 
     pub fn forward(&self, xs: &Tensor, train: bool) -> Tensor {

@@ -1,4 +1,15 @@
-use tch::Tensor;
+use tch::{Device, Kind, Tensor};
+
+pub trait NonBlockingTransfer {
+    fn no_block_to(&self, device: Device) -> Tensor;
+}
+
+impl NonBlockingTransfer for Tensor {
+    #[inline]
+    fn no_block_to(&self, device: Device) -> Tensor {
+        self.to_device_(device, Kind::Float, true, false)
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn gae(

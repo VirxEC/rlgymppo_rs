@@ -1,8 +1,8 @@
-use crate::util::sealed::Sealed;
+use crate::util::{compute::NonBlockingTransfer, sealed::Sealed};
 use tch::{
     kind::FLOAT_CPU,
     nn::{self, ModuleT},
-    Device, Kind, Tensor,
+    Device, Tensor,
 };
 
 pub struct ActionResult {
@@ -111,10 +111,8 @@ impl DiscretePolicy {
         let entropy = -(log_probs * probs).sum(None);
 
         BackpropResult {
-            action_log_probs: action_log_probs.to_device_(self.device, Kind::Float, true, false),
-            entropy: entropy
-                .to_device_(self.device, Kind::Float, true, false)
-                .mean(None),
+            action_log_probs: action_log_probs.no_block_to(self.device),
+            entropy: entropy.no_block_to(self.device).mean(None),
         }
     }
 }

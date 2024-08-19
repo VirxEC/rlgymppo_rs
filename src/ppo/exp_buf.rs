@@ -1,6 +1,14 @@
 use fastrand::Rng;
 use tch::{Device, Kind, Scalar, Tensor};
 
+pub struct SampleSet {
+    pub actions: Tensor,
+    pub log_probs: Tensor,
+    pub states: Tensor,
+    pub values: Tensor,
+    pub advantages: Tensor,
+}
+
 #[derive(Default)]
 pub struct ExperienceTensors {
     pub states: Tensor,
@@ -109,5 +117,29 @@ impl ExperienceBuffer {
         }
 
         self.cur_size = (self.cur_size + new_data.states.size()[0]).min(self.max_size);
+    }
+
+    fn _get_samples(&self, indices: &[i64]) -> SampleSet {
+        let t_indices = Tensor::from_slice(indices);
+
+        SampleSet {
+            actions: self.data.actions.index_select(0, &t_indices),
+            log_probs: self.data.log_probs.index_select(0, &t_indices),
+            states: self.data.states.index_select(0, &t_indices),
+            values: self.data.values.index_select(0, &t_indices),
+            advantages: self.data.advantages.index_select(0, &t_indices),
+        }
+    }
+
+    pub fn get_all_batches_shuffled(&mut self, batch_size: u64) -> Vec<SampleSet> {
+        // Make list of shuffled sample indices
+        let mut indices: Vec<i64> = (0..self.cur_size).collect();
+        self.rng.shuffle(&mut indices);
+
+        // Get a sample set from each of the batches
+        indices
+            .chunks_exact(batch_size as usize)
+            .map(|chunk| self._get_samples(chunk))
+            .collect()
     }
 }

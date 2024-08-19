@@ -1,6 +1,10 @@
-use super::{game_inst::GameInstance, trajectory::Trajectory};
+use super::{
+    game_inst::{GameInstance, GameMetrics},
+    trajectory::Trajectory,
+};
 use crate::{
-    ppo::discrete::DiscretePolicy, threading::trajectory::TrajectoryTensors, util::report::Report,
+    ppo::discrete::DiscretePolicy, threading::trajectory::TrajectoryTensors,
+    util::compute::NonBlockingTransfer,
 };
 use rlgym_rs::{Action, Env, FullObs, Obs, Reward, StateSetter, Terminal, Truncate};
 use std::{
@@ -30,6 +34,7 @@ fn obs_to_tensor(obs: Rc<FullObs>) -> Tensor {
 
 fn make_games_obs_tensor<SS, OBS, ACT, REW, TERM, TRUNC, SI>(
     games: &[GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>],
+    get_next: bool,
 ) -> Tensor
 where
     SS: StateSetter<SI>,
@@ -41,11 +46,19 @@ where
 {
     assert!(!games.is_empty());
 
-    let obs_tensors = games
-        .iter()
-        .map(GameInstance::get_obs)
-        .map(obs_to_tensor)
-        .collect::<Vec<_>>();
+    let obs_tensors = if get_next {
+        games
+            .iter()
+            .map(GameInstance::get_next_obs)
+            .map(obs_to_tensor)
+            .collect::<Vec<_>>()
+    } else {
+        games
+            .iter()
+            .map(GameInstance::get_obs)
+            .map(obs_to_tensor)
+            .collect::<Vec<_>>()
+    };
 
     Tensor::concat(&obs_tensors, 0)
 }
@@ -74,6 +87,7 @@ pub struct AgentControls {
 #[derive(Default)]
 struct AgentData {
     trajectories: Mutex<Vec<Vec<Trajectory>>>,
+    metrics: Mutex<GameMetrics>,
     steps_collected: AtomicU64,
 }
 
@@ -88,7 +102,6 @@ where
 {
     index: usize,
     game_instances: Vec<GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>>,
-    times: Report,
     config: AgentConfig,
     data: Arc<AgentData>,
     controls: Arc<AgentControls>,
@@ -139,7 +152,6 @@ where
             config,
             data,
             controls,
-            times: Report::default(),
             policy,
         }
     }
@@ -152,14 +164,15 @@ where
         self.game_instances.iter_mut().for_each(GameInstance::start);
 
         // Will stores our current observations for all our games
-        let mut cur_obs_tensor = make_games_obs_tensor(&self.game_instances);
+        let mut cur_obs_tensor = make_games_obs_tensor(&self.game_instances, false);
 
         let mut policy = self.policy.read().unwrap().clone();
 
-        let mut steps_since_update = 0;
+        let mut since_controls_update = 0;
+        let mut since_metrics_update = 0;
 
         'outer: loop {
-            if steps_since_update == self.config.controls_update_frequency {
+            if since_controls_update == self.config.controls_update_frequency {
                 while self.controls.paused.load(Ordering::Relaxed)
                     || self.data.steps_collected.load(Ordering::Relaxed) >= self.config.max_steps
                 {
@@ -172,22 +185,32 @@ where
 
                 policy = self.policy.read().unwrap().clone();
 
-                steps_since_update = 0;
+                since_controls_update = 0;
             } else {
-                steps_since_update += 1;
+                since_controls_update += 1;
+            }
+
+            if since_metrics_update == 100 {
+                let mut metrics = self.data.metrics.lock().unwrap();
+
+                for game in &mut self.game_instances {
+                    *metrics += game.get_metrics();
+                    game.reset_metrics();
+                }
+
+                since_metrics_update = 0;
+            } else {
+                since_metrics_update += 1;
             }
 
             // Infer the policy to get actions for all our agents in all our games
-            let cur_obs_on_device =
-                cur_obs_tensor.to_device_(self.config.device, Kind::Float, true, false);
+            let cur_obs_on_device = cur_obs_tensor.no_block_to(self.config.device);
 
-            let action_results = {
+            let (action_results, policy_infer_elapsed) = {
                 let policy_infer_start = Instant::now();
                 let results = policy.get_action(&cur_obs_on_device, self.config.deterministic);
 
-                let policy_infer_elapsed = policy_infer_start.elapsed();
-                self.times["policy_infer_time"] += policy_infer_elapsed.as_secs_f64();
-                results
+                (results, policy_infer_start.elapsed())
             };
 
             let gym_step_start = Instant::now();
@@ -210,20 +233,22 @@ where
             }
 
             assert!(action_offset == action_results.action.size1().unwrap() as usize);
+            let env_step_elapsed = gym_step_start.elapsed();
+            let next_obs_tensor = make_games_obs_tensor(&self.game_instances, true);
+            let mut can_be_reused = true;
 
-            let gym_step_elapsed = gym_step_start.elapsed();
-            self.times["gym_step_time"] += gym_step_elapsed.as_secs_f64();
-
-            let next_obs_tensor = make_games_obs_tensor(&self.game_instances);
-
-            {
+            let trajectory_append_elapsed = {
                 let trajectory_append_start = Instant::now();
                 let mut trajectories = self.data.trajectories.lock().unwrap();
                 let mut player_offset = 0;
 
                 for i in 0..self.config.num_games {
-                    let num_cars = self.game_instances[i].num_cars();
                     let step_result = &step_results[i];
+                    let num_cars = step_result.state.cars.len();
+
+                    if num_cars != self.game_instances[i].num_cars() {
+                        can_be_reused = false;
+                    }
 
                     let done = if step_result.is_terminal { 1. } else { 0. };
 
@@ -260,11 +285,23 @@ where
                     player_offset += num_cars;
                 }
 
-                let trajectory_append_elapsed = trajectory_append_start.elapsed();
-                self.times["trajectory_append_time"] += trajectory_append_elapsed.as_secs_f64();
+                trajectory_append_start.elapsed()
+            };
+
+            {
+                let mut metrics = self.data.metrics.lock().unwrap();
+
+                metrics.report["Policy infer time"] += policy_infer_elapsed.as_secs_f64();
+                metrics.report["Env step time"] += env_step_elapsed.as_secs_f64();
+                metrics.report["Trajectory append time"] += trajectory_append_elapsed.as_secs_f64();
             }
 
-            cur_obs_tensor = next_obs_tensor;
+            if can_be_reused {
+                cur_obs_tensor = next_obs_tensor;
+            } else {
+                println!("Reallocating tensor due to changed number of cars");
+                cur_obs_tensor = make_games_obs_tensor(&self.game_instances, false);
+            }
         }
     }
 }
@@ -331,6 +368,10 @@ impl AgentController {
 
     pub fn get_trajectories(&self) -> MutexGuard<Vec<Vec<Trajectory>>> {
         self.data.trajectories.lock().unwrap()
+    }
+
+    pub fn get_metrics(&self) -> MutexGuard<GameMetrics> {
+        self.data.metrics.lock().unwrap()
     }
 
     pub fn wait_for_close(self) {

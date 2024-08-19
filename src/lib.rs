@@ -15,7 +15,11 @@ use rlgym_rs::{Action, Env, Obs, Reward, StateSetter, Terminal, Truncate};
 use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
 use tch::{no_grad_guard, Device, IndexOp, Kind, Tensor};
 use threading::{agent_mngr::AgentManager, trajectory::Trajectory};
-use util::{compute, report::Report, running_stat::WelfordRunningStat};
+use util::{
+    compute::{self, NonBlockingTransfer},
+    report::Report,
+    running_stat::WelfordRunningStat,
+};
 
 #[derive(Debug, Clone)]
 pub struct LearnerConfig {
@@ -56,7 +60,10 @@ pub struct LearnerConfig {
     /// Realistically, checking every tick is excessive!
     pub controls_update_frequency: u64,
     /// Collect additional steps during the learning phase
+    ///
     /// Note that, once the learning phase completes and the policy is updated, these additional steps are from the old policy
+    ///
+    /// WARNING: Do NOT enable this if training on CPU!
     pub collection_during_learn: bool,
     pub ppo: PPOLearnerConfig,
     pub gae_lambda: f32,
@@ -220,11 +227,7 @@ where
         println!("Starting...");
         self.agent_mngr.start();
 
-        // let device = self.config.device_type;
-        // let deterministic = self.config.deterministic;
-
         let mut steps_since_save = 0;
-        let mut current_time = Instant::now();
 
         let mut timestep_collection_time = Instant::now();
         while self.config.timestep_limit == 0 || self.total_timesteps < self.config.timestep_limit {
@@ -234,19 +237,16 @@ where
                 .agent_mngr
                 .collect_timesteps(self.config.ppo.batch_size);
 
+            let timesteps_collected = timesteps.len();
             let timestep_collection_elapsed = timestep_collection_time.elapsed();
             timestep_collection_time = Instant::now();
 
-            let steps_per_second =
-                self.config.ppo.batch_size as f64 / timestep_collection_elapsed.as_secs_f64();
-            println!(
-                "Collected {} timesteps in {:.2} seconds ({steps_per_second:.0} overall sps)",
-                timesteps.len(),
-                timestep_collection_elapsed.as_secs_f64()
-            );
-            report["overall_steps_per_second"] = steps_per_second;
-
             self.total_timesteps += self.config.ppo.batch_size;
+
+            if self.config.deterministic {
+                println!("Deterministic mode is enabled, skipping learning phase");
+                continue;
+            }
 
             if self.config.ppo.policy_lr == 0. && self.config.ppo.critic_lr == 0. {
                 println!("Learning rate is 0, skipping learning phase");
@@ -255,18 +255,28 @@ where
 
             self.add_new_experience(timesteps, &mut report);
 
-            self.agent_mngr.update_policy(self.ppo.get_policy());
+            self.agent_mngr.get_metrics(&mut report);
 
-            self.total_epochs += 1;
+            report["Timesteps Collected"] = timesteps_collected as f64;
+            report["Overall Steps per Second"] =
+                self.config.ppo.batch_size as f64 / timestep_collection_elapsed.as_secs_f64();
+            report["Cumulative Timesteps"] = self.total_timesteps as f64;
+
+            println!("{report:#?}");
+
+            steps_since_save += self.config.ppo.batch_size;
+            if steps_since_save >= self.config.timesteps_per_save {
+                steps_since_save = 0;
+                println!("Saving has not been implemented yet");
+            }
         }
 
+        println!("Timestep limit reached, stopping...");
         self.agent_mngr.stop();
     }
 
     fn add_new_experience(&mut self, timesteps: Trajectory, report: &mut Report) {
         let _no_grad = no_grad_guard();
-
-        println!("Adding experience...");
 
         let data = timesteps.into_inner();
         let count = data.states.size()[0] as usize;
@@ -279,7 +289,7 @@ where
             ],
             0,
         )
-        .to_device_(self.config.device, Kind::Float, true, false);
+        .no_block_to(self.config.device);
 
         let val_preds_tensor = self
             .ppo
@@ -332,7 +342,14 @@ where
         };
         self.exp_buffer.submit_experience(exp_tensors);
 
-        println!("Done!");
+        let ppo_learn_start = Instant::now();
+
+        self.ppo.learn(&mut self.exp_buffer, report);
+        self.agent_mngr.update_policy(self.ppo.get_policy());
+        self.total_epochs += u64::from(self.config.ppo.epochs);
+
+        let ppo_learn_elapsed = ppo_learn_start.elapsed();
+        report["PPO learning time"] = ppo_learn_elapsed.as_secs_f64();
     }
 }
 

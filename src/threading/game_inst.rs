@@ -1,7 +1,30 @@
 use crate::util::{avg_tracker::AvgTracker, report::Report};
 use rlgym_rs::{Action, Env, FullObs, Obs, Reward, StateSetter, StepResult, Terminal, Truncate};
-use std::rc::Rc;
+use std::{ops::AddAssign, rc::Rc};
 use tch::no_grad_guard;
+
+#[derive(Debug, Default)]
+pub struct GameMetrics {
+    pub avg_steps_reward: AvgTracker,
+    pub avg_episode_reward: AvgTracker,
+    pub report: Report,
+}
+
+impl GameMetrics {
+    pub fn reset(&mut self) {
+        self.avg_steps_reward.reset();
+        self.avg_episode_reward.reset();
+        self.report.clear();
+    }
+}
+
+impl AddAssign<&GameMetrics> for GameMetrics {
+    fn add_assign(&mut self, rhs: &GameMetrics) {
+        self.avg_steps_reward += rhs.avg_steps_reward;
+        self.avg_episode_reward += rhs.avg_episode_reward;
+        self.report += &rhs.report;
+    }
+}
 
 pub struct GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
@@ -14,11 +37,10 @@ where
 {
     env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
     cur_obs: Rc<FullObs>,
+    last_obs: Option<Rc<FullObs>>,
     total_steps: u64,
-    cur_episode_reward: f32,
-    avg_steps_reward: AvgTracker,
-    avg_episode_reward: AvgTracker,
-    metrics: Report,
+    cur_episode_reward: f64,
+    metrics: GameMetrics,
 }
 
 impl<SS, OBS, ACT, REW, TERM, TRUNC, SI> GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>
@@ -34,11 +56,10 @@ where
         Self {
             env,
             cur_obs: Rc::default(),
+            last_obs: None,
             total_steps: 0,
             cur_episode_reward: 0.0,
-            avg_steps_reward: AvgTracker::default(),
-            avg_episode_reward: AvgTracker::default(),
-            metrics: Report::default(),
+            metrics: GameMetrics::default(),
         }
     }
 
@@ -56,17 +77,20 @@ where
 
         // Update avg rewards
         let num_players = result.rewards.len();
-        let total_rew: f32 = result.rewards.iter().sum();
+        let total_rew: f64 = result.rewards.iter().sum::<f32>() as f64;
 
-        self.avg_steps_reward += AvgTracker::new(total_rew, num_players as u64);
-        self.cur_episode_reward += total_rew / num_players as f32;
+        self.metrics.avg_steps_reward += AvgTracker::new(total_rew, num_players as u64);
+        self.cur_episode_reward += total_rew / num_players as f64;
 
         if result.is_terminal || result.truncated {
+            self.last_obs = Some(self.cur_obs.clone());
             self.cur_obs = self.env.reset();
 
-            self.avg_episode_reward += self.cur_episode_reward;
+            println!("Episode reward: {}", self.cur_episode_reward);
+            self.metrics.avg_episode_reward += self.cur_episode_reward;
             self.cur_episode_reward = 0.0;
         } else {
+            self.last_obs = None;
             self.cur_obs = result.obs.clone();
         }
 
@@ -75,13 +99,22 @@ where
         result
     }
 
+    pub fn get_next_obs(&self) -> Rc<FullObs> {
+        match self.last_obs {
+            Some(ref obs) => obs.clone(),
+            None => self.cur_obs.clone(),
+        }
+    }
+
     pub fn get_obs(&self) -> Rc<FullObs> {
         self.cur_obs.clone()
     }
 
+    pub fn get_metrics(&self) -> &GameMetrics {
+        &self.metrics
+    }
+
     pub fn reset_metrics(&mut self) {
-        self.avg_episode_reward.reset();
-        self.avg_steps_reward.reset();
-        self.metrics.clear();
+        self.metrics.reset();
     }
 }

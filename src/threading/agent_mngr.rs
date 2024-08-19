@@ -2,7 +2,10 @@ use super::{
     agent::{AgentConfig, AgentController, AgentControls},
     trajectory::Trajectory,
 };
-use crate::ppo::discrete::DiscretePolicy;
+use crate::{
+    ppo::discrete::DiscretePolicy,
+    util::{avg_tracker::AvgTracker, report::Report},
+};
 use rlgym_rs::{Action, Env, Obs, Reward, StateSetter, Terminal, Truncate};
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -81,10 +84,6 @@ impl AgentManager {
     }
 
     pub fn collect_timesteps(&self, timesteps: u64) -> Trajectory {
-        if !self.collect_during_training {
-            self.agent_controls.paused.store(false, Ordering::Relaxed);
-        }
-
         // wait in this loop until agents have enough timesteps
         loop {
             let total_steps: u64 = self
@@ -100,7 +99,7 @@ impl AgentManager {
             sleep(Duration::from_millis(1));
         }
 
-        if !self.collect_during_training {
+        if !self.agent_config.deterministic && !self.collect_during_training {
             self.agent_controls.paused.store(true, Ordering::Relaxed);
         }
 
@@ -151,6 +150,34 @@ impl AgentManager {
         for agent in &mut self.agents {
             agent.update_policy(policy.clone());
         }
+
+        // policy is only updated when deterministic is false
+        // so we don't need to check in the if statement
+        if !self.collect_during_training {
+            self.agent_controls.paused.store(false, Ordering::Relaxed);
+        }
+    }
+
+    pub fn get_metrics(&mut self, report: &mut Report) {
+        let mut avg_step_rew = AvgTracker::default();
+        let mut avg_ep_rew = AvgTracker::default();
+
+        for agent in &self.agents {
+            let mut agent_metrics = agent.get_metrics();
+
+            avg_step_rew += agent_metrics.avg_steps_reward;
+            avg_ep_rew += agent_metrics.avg_episode_reward;
+            *report += &agent_metrics.report;
+
+            agent_metrics.reset();
+        }
+
+        report["Average Step Reward"] = avg_step_rew.get();
+        report["Average Episode Reward"] = avg_ep_rew.get();
+        report["Policy infer time"] /= self.agents.len() as f64;
+        report["Env step time"] =
+            (report["Env step time"] + report["Trajectory append time"]) / self.agents.len() as f64;
+        report.remove("Trajectory append time");
     }
 
     pub fn stop(&mut self) {

@@ -251,7 +251,7 @@ impl Reward<SharedInfo> for DistanceToBallReward {
             .map(|car| {
                 let car_ball_dist = car.state.pos.distance(state.ball.pos);
 
-                -car_ball_dist
+                -car_ball_dist / 12_000.
             })
             .collect()
     }
@@ -270,6 +270,7 @@ impl Terminal<SharedInfo> for MyTerminal {
             return false;
         }
 
+        println!("Episode lasted {:.2} minutes", elapsed);
         state.ball.pos.z < 94.5
     }
 }
@@ -306,11 +307,11 @@ fn create_env(
 fn main() {
     init(None, true);
 
-    // let num_threads = NonZeroUsize::new(1).unwrap();
+    // let num_threads = NonZeroUsize::new(3).unwrap();
     let num_threads = available_parallelism().unwrap();
     let num_games_per_thread = NonZeroUsize::new(16).unwrap();
-    let mini_batch_size = 25_000;
-    let batch_size = mini_batch_size * 5;
+    let mini_batch_size = 20_000;
+    let batch_size = mini_batch_size * 3;
 
     let config = LearnerConfig {
         num_threads,

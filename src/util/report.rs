@@ -1,27 +1,30 @@
+use ahash::HashMap;
 use std::ops::{AddAssign, Index, IndexMut};
 
-use ahash::HashMap;
-
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Report {
     data: HashMap<String, f64>,
 }
 
 impl Report {
-    pub fn acum_avg(&mut self, key: &str, val: f64) {
-        self[&(key.to_string() + "_avg_total")] += val;
-        self[&(key.to_string() + "_avg_count")] += 1.0;
-    }
+    // pub fn acum_avg(&mut self, key: &str, val: f64) {
+    //     self[&(key.to_string() + "_avg_total")] += val;
+    //     self[&(key.to_string() + "_avg_count")] += 1.0;
+    // }
 
-    pub fn get_avg(&self, key: &str) -> f64 {
-        let total = self[&(key.to_string() + "_avg_total")];
-        let count = self[&(key.to_string() + "_avg_count")];
+    // pub fn get_avg(&self, key: &str) -> f64 {
+    //     let total = self[&(key.to_string() + "_avg_total")];
+    //     let count = self[&(key.to_string() + "_avg_count")];
 
-        if count > 0.0 {
-            total / count
-        } else {
-            0.0
-        }
+    //     if count > 0.0 {
+    //         total / count
+    //     } else {
+    //         0.0
+    //     }
+    // }
+
+    pub fn remove(&mut self, key: &str) {
+        self.data.remove(key);
     }
 
     pub fn clear(&mut self) {

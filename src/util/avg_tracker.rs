@@ -1,21 +1,21 @@
 use std::ops::AddAssign;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct AvgTracker {
-    total: f32,
+    total: f64,
     count: u64,
 }
 
 impl AvgTracker {
-    pub fn new(total: f32, count: u64) -> Self {
+    pub fn new(total: f64, count: u64) -> Self {
         Self { total, count }
     }
 
-    pub fn get(&self) -> f32 {
+    pub fn get(&self) -> f64 {
         if self.count > 0 {
-            self.total / self.count as f32
+            self.total / self.count as f64
         } else {
-            f32::NAN
+            f64::NAN
         }
     }
 
@@ -25,8 +25,8 @@ impl AvgTracker {
     }
 }
 
-impl AddAssign<f32> for AvgTracker {
-    fn add_assign(&mut self, val: f32) {
+impl AddAssign<f64> for AvgTracker {
+    fn add_assign(&mut self, val: f64) {
         if !val.is_nan() {
             self.total += val;
             self.count += 1;

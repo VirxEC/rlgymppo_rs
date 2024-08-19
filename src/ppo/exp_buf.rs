@@ -51,7 +51,7 @@ impl ExperienceBuffer {
         }
     }
 
-    pub fn submit_experience(&mut self, new_data: &mut ExperienceTensors) {
+    pub fn submit_experience(&mut self, mut new_data: ExperienceTensors) {
         let _no_grad = tch::no_grad_guard();
 
         let empty = self.cur_size == 0;

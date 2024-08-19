@@ -117,4 +117,8 @@ impl PPOLearner {
     pub fn get_policy(&self) -> Arc<DiscretePolicy> {
         self.policy.clone()
     }
+
+    pub fn get_value_net(&self) -> &ValueEstimator {
+        &self.value_net
+    }
 }

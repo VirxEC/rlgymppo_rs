@@ -237,21 +237,21 @@ where
                     }
 
                     for j in 0..num_cars {
-                        trajectories[i][j].append_single_step(TrajectoryTensors::new(
-                            cur_obs_tensor.i((player_offset + j) as i64),
-                            action_results
+                        trajectories[i][j].append_single_step(TrajectoryTensors {
+                            states: cur_obs_tensor.i((player_offset + j) as i64),
+                            actions: action_results
                                 .action
                                 .i(((player_offset + j) as i64,))
                                 .view([1]),
-                            action_results
+                            log_probs: action_results
                                 .log_prob
                                 .i((player_offset + j) as i64)
                                 .view([1]),
-                            Tensor::from_slice(&[step_result.rewards[j]]),
-                            next_obs_tensor.i((player_offset + j) as i64),
-                            t_done.shallow_clone(),
-                            t_truncated.shallow_clone(),
-                        ));
+                            rewards: Tensor::from_slice(&[step_result.rewards[j]]),
+                            next_states: next_obs_tensor.i((player_offset + j) as i64),
+                            dones: t_done.shallow_clone(),
+                            truncateds: t_truncated.shallow_clone(),
+                        });
                     }
 
                     self.data

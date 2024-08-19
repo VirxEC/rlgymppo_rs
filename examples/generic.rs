@@ -323,8 +323,6 @@ fn main() {
         controls_update_frequency: 15,
         collection_during_learn: false,
         ppo: PPOLearnerConfig {
-            policy_layer_sizes: vec![768, 768, 768, 768, 768],
-            critic_layer_sizes: vec![768, 768, 768, 768, 768, 768],
             batch_size,
             mini_batch_size,
             ..Default::default()

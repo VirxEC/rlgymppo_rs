@@ -2,37 +2,17 @@ use tch::{kind::INT64_CPU, IndexOp, Tensor};
 
 #[derive(Default)]
 pub struct TrajectoryTensors {
-    states: Tensor,
-    actions: Tensor,
-    log_probs: Tensor,
-    rewards: Tensor,
-    next_states: Tensor,
-    dones: Tensor,
-    truncateds: Tensor,
+    pub states: Tensor,
+    pub actions: Tensor,
+    pub log_probs: Tensor,
+    pub rewards: Tensor,
+    pub next_states: Tensor,
+    pub dones: Tensor,
+    pub truncateds: Tensor,
 }
 
 impl TrajectoryTensors {
     pub const NUM_TENSORS: usize = 7;
-
-    pub fn new(
-        states: Tensor,
-        actions: Tensor,
-        log_probs: Tensor,
-        rewards: Tensor,
-        next_states: Tensor,
-        dones: Tensor,
-        truncateds: Tensor,
-    ) -> Self {
-        Self {
-            states,
-            actions,
-            log_probs,
-            rewards,
-            next_states,
-            dones,
-            truncateds,
-        }
-    }
 
     fn array_of_refs(&self) -> [&Tensor; Self::NUM_TENSORS] {
         [
@@ -94,10 +74,7 @@ impl Trajectory {
             .tensors
             .dones
             .i((self.length - 1) as i64)
-            .iter::<f64>()
-            .unwrap()
-            .next()
-            .unwrap();
+            .double_value(&[]);
         let _ = self
             .tensors
             .truncateds
@@ -161,5 +138,17 @@ impl Trajectory {
         self.capacity = new_length;
     }
 
-    pub fn clear(&mut self) {}
+    fn remove_capacity(&mut self) {
+        for t in self.tensors.array_of_muts() {
+            *t = t.slice(0, 0, self.length as i64, 1);
+        }
+
+        self.capacity = self.length;
+    }
+
+    pub fn into_inner(mut self) -> TrajectoryTensors {
+        self.remove_capacity();
+
+        self.tensors
+    }
 }

@@ -138,7 +138,7 @@ impl AgentManager {
             result.multi_append(game_trajectories);
         }
 
-        debug_assert_ne!(
+        debug_assert_eq!(
             result.len(),
             total_timesteps,
             "Trajectory length does not match total timesteps"

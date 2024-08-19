@@ -7,12 +7,15 @@ pub use rlgym_rs;
 pub use rlgym_rs::rocketsim_rs;
 pub use tch;
 
-use ppo::{exp_buf::ExperienceBuffer, ppo_learner::PPOLearner};
+use ppo::{
+    exp_buf::{ExperienceBuffer, ExperienceTensors},
+    ppo_learner::PPOLearner,
+};
 use rlgym_rs::{Action, Env, Obs, Reward, StateSetter, Terminal, Truncate};
 use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
-use tch::Device;
-use threading::agent_mngr::AgentManager;
-use util::report::Report;
+use tch::{no_grad_guard, Device, IndexOp, Kind, Tensor};
+use threading::{agent_mngr::AgentManager, trajectory::Trajectory};
+use util::{compute, report::Report, running_stat::WelfordRunningStat};
 
 #[derive(Debug, Clone)]
 pub struct LearnerConfig {
@@ -78,7 +81,7 @@ pub struct LearnerConfig {
     /// Checkpoint storage limit before old checkpoints are deleted, set to -1 to disable
     pub checkpoints_to_keep: u32,
     /// Auto will use your CUDA GPU if available
-    pub device_type: Device,
+    pub device: Device,
     // pub send_metrics: bool,
     // pub metrics_project_name: String,
     // pub metrics_group_name: String,
@@ -112,7 +115,7 @@ impl Default for LearnerConfig {
             timesteps_per_save: 5_000_000,
             random_seed: 123,
             checkpoints_to_keep: 5,
-            device_type: Device::cuda_if_available(),
+            device: Device::cuda_if_available(),
             // send_metrics: true,
             // metrics_project_name: "rlgymppo-rs".to_string(),
             // metrics_group_name: "unnamed-runs".to_string(),
@@ -139,6 +142,7 @@ where
     exp_buffer: ExperienceBuffer,
     ppo: PPOLearner,
     agent_mngr: AgentManager,
+    running_stat: WelfordRunningStat,
     total_timesteps: u64,
     total_epochs: u64,
 }
@@ -175,16 +179,11 @@ where
         let exp_buffer = ExperienceBuffer::new(
             config.exp_buffer_size,
             config.random_seed as u64,
-            config.device_type,
+            config.device,
         );
 
         println!("Creating learner...");
-        let ppo = PPOLearner::new(
-            obs_size,
-            action_size,
-            config.ppo.clone(),
-            config.device_type,
-        );
+        let ppo = PPOLearner::new(obs_size, action_size, config.ppo.clone(), config.device);
 
         println!("Creating agent manager...");
         let mut agent_mngr = AgentManager::new(
@@ -193,7 +192,7 @@ where
             config.deterministic,
             config.collection_during_learn,
             config.controls_update_frequency,
-            config.device_type,
+            config.device,
         );
 
         println!("Creating {} agents...", config.num_threads);
@@ -211,6 +210,7 @@ where
             exp_buffer,
             ppo,
             agent_mngr,
+            running_stat: WelfordRunningStat::default(),
             total_timesteps: 0,
             total_epochs: 0,
         }
@@ -238,12 +238,13 @@ where
             timestep_collection_time = Instant::now();
 
             let steps_per_second =
-                self.config.ppo.batch_size as f32 / timestep_collection_elapsed.as_secs_f32();
+                self.config.ppo.batch_size as f64 / timestep_collection_elapsed.as_secs_f64();
             println!(
                 "Collected {} timesteps in {:.2} seconds ({steps_per_second:.0} overall sps)",
                 timesteps.len(),
                 timestep_collection_elapsed.as_secs_f64()
             );
+            report["overall_steps_per_second"] = steps_per_second;
 
             self.total_timesteps += self.config.ppo.batch_size;
 
@@ -252,6 +253,8 @@ where
                 continue;
             }
 
+            self.add_new_experience(timesteps, &mut report);
+
             self.agent_mngr.update_policy(self.ppo.get_policy());
 
             self.total_epochs += 1;
@@ -259,4 +262,82 @@ where
 
         self.agent_mngr.stop();
     }
+
+    fn add_new_experience(&mut self, timesteps: Trajectory, report: &mut Report) {
+        let _no_grad = no_grad_guard();
+
+        println!("Adding experience...");
+
+        let data = timesteps.into_inner();
+        let count = data.states.size()[0] as usize;
+
+        // Construct input to the value function estimator that includes the final state (which an action was not taken in)
+        let val_input = Tensor::cat(
+            &[
+                data.states.shallow_clone(),
+                data.next_states.i(count as i64 - 1).unsqueeze(0),
+            ],
+            0,
+        )
+        .to_device_(self.config.device, Kind::Float, true, false);
+
+        let val_preds_tensor = self
+            .ppo
+            .get_value_net()
+            .forward(&val_input, self.config.deterministic)
+            .to(Device::Cpu)
+            .flatten(0, -1);
+        let val_preds = tensor_to_f32_vec(&val_preds_tensor);
+
+        let ret_std = if self.config.standardize_returns {
+            self.running_stat.get_std()[0]
+        } else {
+            1.0
+        };
+
+        let (advantages, value_targets, returns) = compute::gae(
+            tensor_to_f32_vec(&data.rewards.view([-1])),
+            tensor_to_f32_vec(&data.dones.view([-1])),
+            tensor_to_f32_vec(&data.truncateds.view([-1])),
+            val_preds,
+            self.config.gae_gamma,
+            self.config.gae_lambda,
+            ret_std,
+            self.config.reward_clip_range,
+        );
+
+        let avg_ret = returns.iter().copied().map(f32::abs).sum::<f32>() / returns.len() as f32;
+        report["Avg Return"] = (avg_ret / ret_std) as f64;
+
+        report["Avg Advantage"] = advantages.abs().mean(Kind::Float).double_value(&[]);
+        report["Avg Val Target"] = value_targets.abs().mean(Kind::Float).double_value(&[]);
+
+        if self.config.standardize_returns {
+            let num_to_increment = returns
+                .len()
+                .min(self.config.max_returns_per_stats_inc as usize);
+            self.running_stat.increment(&returns, num_to_increment);
+        }
+
+        let exp_tensors = ExperienceTensors {
+            states: data.states,
+            actions: data.actions,
+            log_probs: data.log_probs,
+            rewards: data.rewards,
+            next_states: data.next_states,
+            dones: data.dones,
+            truncateds: data.truncateds,
+            values: value_targets,
+            advantages,
+        };
+        self.exp_buffer.submit_experience(exp_tensors);
+
+        println!("Done!");
+    }
+}
+
+fn tensor_to_f32_vec(tensor: &Tensor) -> Vec<f32> {
+    assert_eq!(tensor.dim(), 1);
+    let tensor = tensor.to(Device::Cpu).detach().to_kind(Kind::Float);
+    Vec::<f32>::try_from(tensor).unwrap()
 }

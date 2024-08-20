@@ -1,4 +1,4 @@
-use rlgym_rs::{FullObs, Truncate};
+use rlgym_rs::{FullObs, SharedInfoProvider, Truncate};
 use rlgymppo_rs::{
     rlgym_rs::{Action, Env, Obs, Reward, StateSetter, Terminal},
     rocketsim_rs::{
@@ -7,9 +7,10 @@ use rlgymppo_rs::{
         init,
         sim::{Arena, CarConfig, CarControls, Team},
     },
-    Learner, LearnerConfig, PPOLearnerConfig,
+    Learner, LearnerConfig, PPOLearnerConfig, Report,
 };
 use std::{cmp::Ordering, num::NonZeroUsize, thread::available_parallelism};
+use tch::Cuda;
 
 struct SharedInfo {
     rng: fastrand::Rng,
@@ -21,6 +22,13 @@ impl Default for SharedInfo {
             rng: fastrand::Rng::new(),
         }
     }
+}
+
+struct MySharedInfoProvider;
+
+impl SharedInfoProvider<SharedInfo> for MySharedInfoProvider {
+    fn reset(&mut self, initial_state: &GameStateA, shared_info: &mut SharedInfo) {}
+    fn apply(&mut self, game_state: &GameStateA, shared_info: &mut SharedInfo) {}
 }
 
 struct MyStateSetter;
@@ -285,8 +293,16 @@ impl Truncate<SharedInfo> for MyTruncate {
     }
 }
 
-fn create_env(
-) -> Env<MyStateSetter, MyObs, MyAction, CombinedReward, MyTerminal, MyTruncate, SharedInfo> {
+fn create_env() -> Env<
+    MyStateSetter,
+    MySharedInfoProvider,
+    MyObs,
+    MyAction,
+    CombinedReward,
+    MyTerminal,
+    MyTruncate,
+    SharedInfo,
+> {
     let mut arena = Arena::default_standard();
     arena
         .pin_mut()
@@ -295,6 +311,7 @@ fn create_env(
     Env::new(
         arena,
         MyStateSetter,
+        MySharedInfoProvider,
         MyObs,
         MyAction::default(),
         CombinedReward::new(vec![Box::new(DistanceToBallReward)]),
@@ -303,6 +320,8 @@ fn create_env(
         SharedInfo::default(),
     )
 }
+
+fn step_callback(report: &mut Report, shared_info: &SharedInfo, game_state: &GameStateA) {}
 
 fn main() {
     init(None, true);
@@ -328,9 +347,14 @@ fn main() {
             mini_batch_size,
             ..Default::default()
         },
+        device: if Cuda::is_available() {
+            tch::Device::Cuda(0)
+        } else {
+            tch::Device::Cpu
+        },
         ..Default::default()
     };
 
-    let mut learner = Learner::new(create_env, config);
+    let mut learner = Learner::new(create_env, step_callback, config);
     learner.learn();
 }

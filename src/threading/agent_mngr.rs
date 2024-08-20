@@ -6,7 +6,10 @@ use crate::{
     ppo::discrete::DiscretePolicy,
     util::{avg_tracker::AvgTracker, report::Report},
 };
-use rlgym_rs::{Action, Env, Obs, Reward, StateSetter, Terminal, Truncate};
+use rlgym_rs::{
+    rocketsim_rs::glam_ext::GameStateA, Action, Env, Obs, Reward, SharedInfoProvider, StateSetter,
+    Terminal, Truncate,
+};
 use std::{
     sync::{atomic::Ordering, Arc},
     thread::sleep,
@@ -48,14 +51,17 @@ impl AgentManager {
         }
     }
 
-    pub fn create_agents<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+    pub fn create_agents<C, F, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>(
         &mut self,
         create_env_fn: F,
+        step_callback: C,
         amount: usize,
         games_per_agent: usize,
     ) where
-        F: Fn() -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Send + Clone + 'static,
+        F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Send + Clone + 'static,
+        C: Fn(&mut Report, &SI, &GameStateA) + Clone + Send + 'static,
         SS: StateSetter<SI>,
+        SIP: SharedInfoProvider<SI>,
         OBS: Obs<SI>,
         ACT: Action<SI, Input = Vec<i32>>,
         REW: Reward<SI>,
@@ -71,6 +77,7 @@ impl AgentManager {
                 self.agent_controls.clone(),
                 self.policy.clone(),
                 create_env_fn.clone(),
+                step_callback.clone(),
                 i,
             );
             self.agents.push(agent);

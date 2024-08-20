@@ -6,18 +6,21 @@ pub use ppo::ppo_learner::PPOLearnerConfig;
 pub use rlgym_rs;
 pub use rlgym_rs::rocketsim_rs;
 pub use tch;
+pub use util::report::Report;
 
 use ppo::{
     exp_buf::{ExperienceBuffer, ExperienceTensors},
     ppo_learner::PPOLearner,
 };
-use rlgym_rs::{Action, Env, Obs, Reward, StateSetter, Terminal, Truncate};
+use rlgym_rs::{
+    rocketsim_rs::glam_ext::GameStateA, Action, Env, Obs, Reward, SharedInfoProvider, StateSetter,
+    Terminal, Truncate,
+};
 use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
 use tch::{no_grad_guard, Device, IndexOp, Kind, Tensor};
 use threading::{agent_mngr::AgentManager, trajectory::Trajectory};
 use util::{
     compute::{self, NonBlockingTransfer},
-    report::Report,
     running_stat::WelfordRunningStat,
 };
 
@@ -132,17 +135,7 @@ impl Default for LearnerConfig {
     }
 }
 
-pub struct Learner<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>
-where
-    F: Fn() -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Send + Clone + 'static,
-    SS: StateSetter<SI>,
-    OBS: Obs<SI>,
-    ACT: Action<SI, Input = Vec<i32>>,
-    REW: Reward<SI>,
-    TERM: Terminal<SI>,
-    TRUNC: Truncate<SI>,
-{
-    create_env_fn: F,
+pub struct Learner {
     config: LearnerConfig,
     obs_size: usize,
     action_size: usize,
@@ -154,17 +147,23 @@ where
     total_epochs: u64,
 }
 
-impl<F, SS, OBS, ACT, REW, TERM, TRUNC, SI> Learner<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>
-where
-    F: Fn() -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Send + Clone + 'static,
-    SS: StateSetter<SI>,
-    OBS: Obs<SI>,
-    ACT: Action<SI, Input = Vec<i32>>,
-    REW: Reward<SI>,
-    TERM: Terminal<SI>,
-    TRUNC: Truncate<SI>,
-{
-    pub fn new(create_env_fn: F, config: LearnerConfig) -> Self {
+impl Learner {
+    pub fn new<F, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>(
+        create_env_fn: F,
+        step_callback: C,
+        config: LearnerConfig,
+    ) -> Self
+    where
+        F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Send + Clone + 'static,
+        C: Fn(&mut Report, &SI, &GameStateA) + Clone + Send + 'static,
+        SS: StateSetter<SI>,
+        SIP: SharedInfoProvider<SI>,
+        OBS: Obs<SI>,
+        ACT: Action<SI, Input = Vec<i32>>,
+        REW: Reward<SI>,
+        TERM: Terminal<SI>,
+        TRUNC: Truncate<SI>,
+    {
         tch::manual_seed(config.random_seed);
 
         tch::set_num_interop_threads(1);
@@ -204,13 +203,13 @@ where
 
         println!("Creating {} agents...", config.num_threads);
         agent_mngr.create_agents(
-            create_env_fn.clone(),
+            create_env_fn,
+            step_callback.clone(),
             config.num_threads.get(),
             config.num_games_per_thread.get(),
         );
 
         Self {
-            create_env_fn,
             config,
             obs_size,
             action_size,

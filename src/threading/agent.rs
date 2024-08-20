@@ -3,10 +3,14 @@ use super::{
     trajectory::Trajectory,
 };
 use crate::{
-    ppo::discrete::DiscretePolicy, threading::trajectory::TrajectoryTensors,
-    util::compute::NonBlockingTransfer,
+    ppo::discrete::DiscretePolicy,
+    threading::trajectory::TrajectoryTensors,
+    util::{compute::NonBlockingTransfer, report::Report},
 };
-use rlgym_rs::{Action, Env, FullObs, Obs, Reward, StateSetter, Terminal, Truncate};
+use rlgym_rs::{
+    rocketsim_rs::glam_ext::GameStateA, Action, Env, FullObs, Obs, Reward, SharedInfoProvider,
+    StateSetter, Terminal, Truncate,
+};
 use std::{
     iter::repeat_with,
     rc::Rc,
@@ -32,12 +36,14 @@ fn obs_to_tensor(obs: Rc<FullObs>) -> Tensor {
     tensor
 }
 
-fn make_games_obs_tensor<SS, OBS, ACT, REW, TERM, TRUNC, SI>(
-    games: &[GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>],
+fn make_games_obs_tensor<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>(
+    games: &[GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>],
     get_next: bool,
 ) -> Tensor
 where
+    C: Fn(&mut Report, &SI, &GameStateA) + Clone,
     SS: StateSetter<SI>,
+    SIP: SharedInfoProvider<SI>,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = Vec<i32>>,
     REW: Reward<SI>,
@@ -91,9 +97,11 @@ struct AgentData {
     steps_collected: AtomicU64,
 }
 
-struct Agent<SS, OBS, ACT, REW, TERM, TRUNC, SI>
+struct Agent<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
+    C: Fn(&mut Report, &SI, &GameStateA),
     SS: StateSetter<SI>,
+    SIP: SharedInfoProvider<SI>,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = Vec<i32>>,
     REW: Reward<SI>,
@@ -101,16 +109,18 @@ where
     TRUNC: Truncate<SI>,
 {
     index: usize,
-    game_instances: Vec<GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>>,
+    game_instances: Vec<GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>>,
     config: AgentConfig,
     data: Arc<AgentData>,
     controls: Arc<AgentControls>,
     policy: Arc<RwLock<Arc<DiscretePolicy>>>,
 }
 
-impl<SS, OBS, ACT, REW, TERM, TRUNC, SI> Agent<SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> Agent<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
+    C: Fn(&mut Report, &SI, &GameStateA) + Clone,
     SS: StateSetter<SI>,
+    SIP: SharedInfoProvider<SI>,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = Vec<i32>>,
     REW: Reward<SI>,
@@ -120,13 +130,14 @@ where
     pub fn new<F>(
         config: AgentConfig,
         create_env_fn: F,
+        step_callback: C,
         index: usize,
         data: Arc<AgentData>,
         controls: Arc<AgentControls>,
         policy: Arc<RwLock<Arc<DiscretePolicy>>>,
     ) -> Self
     where
-        F: Fn() -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+        F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
     {
         let mut game_instances = Vec::with_capacity(config.num_games);
 
@@ -136,7 +147,7 @@ where
         for _ in 0..config.num_games {
             let env = create_env_fn();
             let num_cars = env.num_cars();
-            let game_instance = GameInstance::new(env);
+            let game_instance = GameInstance::new(env, step_callback.clone());
             game_instances.push(game_instance);
 
             traj.push(Vec::from_iter(
@@ -313,16 +324,19 @@ pub struct AgentController {
 }
 
 impl AgentController {
-    pub fn new<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+    pub fn new<F, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>(
         config: AgentConfig,
         controls: Arc<AgentControls>,
         policy: Arc<DiscretePolicy>,
         create_env_fn: F,
+        step_callback: C,
         index: usize,
     ) -> Self
     where
-        F: Fn() -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Send + 'static,
+        F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Send + 'static,
+        C: Fn(&mut Report, &SI, &GameStateA) + Clone + Send + 'static,
         SS: StateSetter<SI>,
+        SIP: SharedInfoProvider<SI>,
         OBS: Obs<SI>,
         ACT: Action<SI, Input = Vec<i32>>,
         REW: Reward<SI>,
@@ -338,6 +352,7 @@ impl AgentController {
             Agent::new(
                 config,
                 create_env_fn,
+                step_callback,
                 index,
                 thread_data,
                 controls,

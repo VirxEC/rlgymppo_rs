@@ -1,5 +1,8 @@
 use crate::util::{avg_tracker::AvgTracker, report::Report};
-use rlgym_rs::{Action, Env, FullObs, Obs, Reward, StateSetter, StepResult, Terminal, Truncate};
+use rlgym_rs::{
+    rocketsim_rs::glam_ext::GameStateA, Action, Env, FullObs, Obs, Reward, SharedInfoProvider,
+    StateSetter, StepResult, Terminal, Truncate,
+};
 use std::{ops::AddAssign, rc::Rc};
 use tch::no_grad_guard;
 
@@ -26,16 +29,19 @@ impl AddAssign<&GameMetrics> for GameMetrics {
     }
 }
 
-pub struct GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>
+pub struct GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
+    C: Fn(&mut Report, &SI, &GameStateA),
     SS: StateSetter<SI>,
+    SIP: SharedInfoProvider<SI>,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = Vec<i32>>,
     REW: Reward<SI>,
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+    env: Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
+    step_callback: C,
     cur_obs: Rc<FullObs>,
     last_obs: Option<Rc<FullObs>>,
     total_steps: u64,
@@ -43,18 +49,22 @@ where
     metrics: GameMetrics,
 }
 
-impl<SS, OBS, ACT, REW, TERM, TRUNC, SI> GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
+    GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
+    C: Fn(&mut Report, &SI, &GameStateA),
     SS: StateSetter<SI>,
+    SIP: SharedInfoProvider<SI>,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = Vec<i32>>,
     REW: Reward<SI>,
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    pub fn new(env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>) -> Self {
+    pub fn new(env: Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>, step_callback: C) -> Self {
         Self {
             env,
+            step_callback,
             cur_obs: Rc::default(),
             last_obs: None,
             total_steps: 0,
@@ -74,6 +84,12 @@ where
     pub fn step(&mut self, actions: ACT::Input) -> StepResult {
         let _no_grad = no_grad_guard();
         let result = self.env.step(actions);
+
+        (self.step_callback)(
+            &mut self.metrics.report,
+            self.env.shared_info(),
+            &result.state,
+        );
 
         // Update avg rewards
         let num_players = result.rewards.len();

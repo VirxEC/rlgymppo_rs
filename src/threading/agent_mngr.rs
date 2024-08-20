@@ -179,11 +179,12 @@ impl AgentManager {
             agent_metrics.reset();
         }
 
-        report["Average Step Reward"] = avg_step_rew.get();
-        report["Average Episode Reward"] = avg_ep_rew.get();
-        report["Policy infer time"] /= self.agents.len() as f64;
-        report["Env step time"] =
-            (report["Env step time"] + report["Trajectory append time"]) / self.agents.len() as f64;
+        report["Average Step Reward"] = avg_step_rew.into();
+        report["Average Episode Reward"] = avg_ep_rew.into();
+        *report["Policy infer time"].as_val_mut() /= self.agents.len() as f64;
+        *report["Env step time"].as_val_mut() = (report["Env step time"].as_val()
+            + report["Trajectory append time"].as_val())
+            / self.agents.len() as f64;
         report.remove("Trajectory append time");
     }
 

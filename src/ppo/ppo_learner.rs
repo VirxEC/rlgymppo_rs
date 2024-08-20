@@ -317,9 +317,9 @@ impl PPOLearner {
                             clip_fractions.push(clip_fraction);
                         }
 
-                        reporter["PPO Backprop Time"] += metrics.backprop_time;
-                        reporter["PPO Value Estimate Time"] += metrics.value_est_time;
-                        reporter["PPO Gradient Time"] += metrics.gradient_time;
+                        reporter["PPO Backprop Time"] += metrics.backprop_time.into();
+                        reporter["PPO Value Estimate Time"] += metrics.value_est_time.into();
+                        reporter["PPO Gradient Time"] += metrics.gradient_time.into();
 
                         num_mini_batch_iterations += 1;
                     }
@@ -381,9 +381,9 @@ impl PPOLearner {
                                 clip_fractions.push(clip_fraction);
                             }
 
-                            reporter["PPO Backprop Time"] += metrics.backprop_time;
-                            reporter["PPO Value Estimate Time"] += metrics.value_est_time;
-                            reporter["PPO Gradient Time"] += metrics.gradient_time;
+                            reporter["PPO Backprop Time"] += metrics.backprop_time.into();
+                            reporter["PPO Value Estimate Time"] += metrics.value_est_time.into();
+                            reporter["PPO Gradient Time"] += metrics.gradient_time.into();
 
                             num_mini_batch_iterations += 1;
                         }
@@ -425,16 +425,17 @@ impl PPOLearner {
         let total_time_elapsed = train_time_start.elapsed();
 
         self.cumulative_model_updates += u64::from(self.config.epochs);
-        report["PPO Batch Consumption Time"] = total_time_elapsed.as_secs_f64() / num_iterations;
-        report["Cumulative Model Updates"] = self.cumulative_model_updates as f64;
-        report["Policy Entropy"] += mean_entropy;
-        report["Mean KL Divergence"] += mean_divergence;
-        report["Mean Ratio"] += mean_ratio;
-        report["Value Function Loss"] += mean_val_loss;
-        report["SB3 Clip Fraction"] += mean_clip;
-        report["Policy Update Magnitude"] += policy_update_magnitude;
-        report["Value Function Update Magnitude"] += critic_update_magnitude;
-        report["PPO Learn Time"] += total_time_elapsed.as_secs_f64();
+        report["PPO Batch Consumption Time"] =
+            (total_time_elapsed.as_secs_f64() / num_iterations).into();
+        report["Cumulative Model Updates"] = self.cumulative_model_updates.into();
+        report["Policy Entropy"] += mean_entropy.into();
+        report["Mean KL Divergence"] += mean_divergence.into();
+        report["Mean Ratio"] += mean_ratio.into();
+        report["Value Function Loss"] += mean_val_loss.into();
+        report["SB3 Clip Fraction"] += mean_clip.into();
+        report["Policy Update Magnitude"] += policy_update_magnitude.into();
+        report["Value Function Update Magnitude"] += critic_update_magnitude.into();
+        report["PPO Learn Time"] += total_time_elapsed.as_secs_f64().into();
 
         self.policy_optimizer.zero_grad();
         self.value_optimizer.zero_grad();

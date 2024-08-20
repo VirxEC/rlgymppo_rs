@@ -6,6 +6,7 @@ pub use ppo::ppo_learner::PPOLearnerConfig;
 pub use rlgym_rs;
 pub use rlgym_rs::rocketsim_rs;
 pub use tch;
+pub use util::avg_tracker::AvgTracker;
 pub use util::report::Report;
 
 use ppo::{
@@ -256,12 +257,13 @@ impl Learner {
 
             self.agent_mngr.get_metrics(&mut report);
 
-            report["Timesteps Collected"] = timesteps_collected as f64;
-            report["Overall Steps per Second"] =
-                self.config.ppo.batch_size as f64 / timestep_collection_elapsed.as_secs_f64();
-            report["Cumulative Timesteps"] = self.total_timesteps as f64;
+            report["Timesteps Collected"] = timesteps_collected.into();
+            report["Overall Steps per Second"] = (self.config.ppo.batch_size as f64
+                / timestep_collection_elapsed.as_secs_f64())
+            .into();
+            report["Cumulative Timesteps"] = self.total_timesteps.into();
 
-            println!("{report:#?}");
+            println!("{report}");
 
             steps_since_save += self.config.ppo.batch_size;
             if steps_since_save >= self.config.timesteps_per_save {
@@ -316,10 +318,14 @@ impl Learner {
         );
 
         let avg_ret = returns.iter().copied().map(f32::abs).sum::<f32>() / returns.len() as f32;
-        report["Avg Return"] = (avg_ret / ret_std) as f64;
+        report["Avg Return"] = (avg_ret / ret_std).into();
 
-        report["Avg Advantage"] = advantages.abs().mean(Kind::Float).double_value(&[]);
-        report["Avg Val Target"] = value_targets.abs().mean(Kind::Float).double_value(&[]);
+        report["Avg Advantage"] = advantages.abs().mean(Kind::Float).double_value(&[]).into();
+        report["Avg Val Target"] = value_targets
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[])
+            .into();
 
         if self.config.standardize_returns {
             let num_to_increment = returns
@@ -348,7 +354,7 @@ impl Learner {
         self.total_epochs += u64::from(self.config.ppo.epochs);
 
         let ppo_learn_elapsed = ppo_learn_start.elapsed();
-        report["PPO learning time"] = ppo_learn_elapsed.as_secs_f64();
+        report["PPO learning time"] = ppo_learn_elapsed.as_secs_f64().into();
     }
 }
 

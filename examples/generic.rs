@@ -7,19 +7,21 @@ use rlgymppo_rs::{
         init,
         sim::{Arena, CarConfig, CarControls, Team},
     },
-    Learner, LearnerConfig, PPOLearnerConfig, Report,
+    AvgTracker, Learner, LearnerConfig, PPOLearnerConfig, Report,
 };
 use std::{cmp::Ordering, num::NonZeroUsize, thread::available_parallelism};
 use tch::Cuda;
 
 struct SharedInfo {
     rng: fastrand::Rng,
+    avg_dist_to_ball: AvgTracker,
 }
 
 impl Default for SharedInfo {
     fn default() -> Self {
         Self {
             rng: fastrand::Rng::new(),
+            avg_dist_to_ball: AvgTracker::default(),
         }
     }
 }
@@ -27,8 +29,16 @@ impl Default for SharedInfo {
 struct MySharedInfoProvider;
 
 impl SharedInfoProvider<SharedInfo> for MySharedInfoProvider {
-    fn reset(&mut self, initial_state: &GameStateA, shared_info: &mut SharedInfo) {}
-    fn apply(&mut self, game_state: &GameStateA, shared_info: &mut SharedInfo) {}
+    fn reset(&mut self, _initial_state: &GameStateA, shared_info: &mut SharedInfo) {
+        shared_info.avg_dist_to_ball.reset();
+    }
+
+    fn apply(&mut self, game_state: &GameStateA, shared_info: &mut SharedInfo) {
+        for car in &game_state.cars {
+            let dist_to_ball = car.state.pos.distance(game_state.ball.pos);
+            shared_info.avg_dist_to_ball += dist_to_ball as f64;
+        }
+    }
 }
 
 struct MyStateSetter;
@@ -321,7 +331,9 @@ fn create_env() -> Env<
     )
 }
 
-fn step_callback(report: &mut Report, shared_info: &SharedInfo, game_state: &GameStateA) {}
+fn step_callback(report: &mut Report, shared_info: &SharedInfo, _game_state: &GameStateA) {
+    report["Avg distance to ball"] = shared_info.avg_dist_to_ball.into();
+}
 
 fn main() {
     init(None, true);

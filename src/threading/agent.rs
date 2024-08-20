@@ -201,7 +201,7 @@ where
                 since_controls_update += 1;
             }
 
-            if since_metrics_update == 100 {
+            if since_metrics_update == self.config.controls_update_frequency {
                 let mut metrics = self.data.metrics.lock().unwrap();
 
                 for game in &mut self.game_instances {
@@ -302,9 +302,10 @@ where
             {
                 let mut metrics = self.data.metrics.lock().unwrap();
 
-                metrics.report["Policy infer time"] += policy_infer_elapsed.as_secs_f64();
-                metrics.report["Env step time"] += env_step_elapsed.as_secs_f64();
-                metrics.report["Trajectory append time"] += trajectory_append_elapsed.as_secs_f64();
+                metrics.report["Policy infer time"] += policy_infer_elapsed.as_secs_f64().into();
+                metrics.report["Env step time"] += env_step_elapsed.as_secs_f64().into();
+                metrics.report["Trajectory append time"] +=
+                    trajectory_append_elapsed.as_secs_f64().into();
             }
 
             if can_be_reused {

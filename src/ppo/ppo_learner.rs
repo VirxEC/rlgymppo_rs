@@ -1,6 +1,8 @@
 use super::{discrete::DiscretePolicy, exp_buf::ExperienceBuffer, value_est::ValueEstimator};
 use crate::util::{compute::NonBlockingTransfer, report::Report};
 use std::{
+    fs,
+    path::Path,
     sync::Arc,
     thread::{self, available_parallelism},
     time::Instant,
@@ -83,7 +85,7 @@ pub struct PPOLearner {
     // noiseTrackerValueNet: GradNoiseTracker,
     value_loss_fn: Reduction,
     config: PPOLearnerConfig,
-    cumulative_model_updates: u64,
+    pub cumulative_model_updates: u64,
     device: Device,
 }
 
@@ -139,6 +141,35 @@ impl PPOLearner {
             cumulative_model_updates: 0,
             device,
         }
+    }
+
+    /// https://github.com/LaurentMazare/tch-rs?tab=readme-ov-file#importing-pre-trained-weights-from-pytorch-using-safetensors
+    /// > `safetensors` is a new simple format by HuggingFace for storing tensors.
+    ///   It does not rely on Python's pickle module,
+    ///   and therefore the tensors are not bound to the specific classes
+    ///   and the exact directory structure used when the model is saved.
+    ///   It is also zero-copy, which means that reading the file will
+    ///   require no more memory than the original file.
+    ///
+    /// The link above shows how to load a safetensors file in Python.
+    pub fn load<P: AsRef<Path>>(&mut self, path: P) {
+        let path = path.as_ref();
+        self.policy_store
+            .load(path.join("policy.safetensors"))
+            .unwrap();
+        self.value_store
+            .load(path.join("critic.safetensors"))
+            .unwrap();
+    }
+
+    pub fn save<P: AsRef<Path>>(&self, path: P) {
+        let path = path.as_ref();
+        self.policy_store
+            .save(path.join("policy.safetensors"))
+            .unwrap();
+        self.value_store
+            .save(path.join("critic.safetensors"))
+            .unwrap();
     }
 
     pub fn get_policy(&self) -> Arc<DiscretePolicy> {

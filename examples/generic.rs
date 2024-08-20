@@ -350,7 +350,8 @@ fn main() {
         render: false,
         exp_buffer_size: batch_size,
         timestep_limit: 1_000_000,
-        timesteps_per_save: 10_000_000,
+        // timesteps_per_save: 10_000_000,
+        timesteps_per_save: batch_size,
         collection_timesteps_overflow: 0,
         controls_update_frequency: 15,
         collection_during_learn: false,
@@ -368,5 +369,7 @@ fn main() {
     };
 
     let mut learner = Learner::new(create_env, step_callback, config);
+    learner.load();
     learner.learn();
+    learner.save();
 }

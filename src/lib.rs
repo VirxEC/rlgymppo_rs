@@ -5,6 +5,7 @@ mod util;
 pub use ppo::ppo_learner::PPOLearnerConfig;
 pub use rlgym_rs;
 pub use rlgym_rs::rocketsim_rs;
+use serde::{Deserialize, Serialize};
 pub use tch;
 pub use util::avg_tracker::AvgTracker;
 pub use util::report::Report;
@@ -17,12 +18,17 @@ use rlgym_rs::{
     rocketsim_rs::glam_ext::GameStateA, Action, Env, Obs, Reward, SharedInfoProvider, StateSetter,
     Terminal, Truncate,
 };
-use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
+use std::{
+    fs,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 use tch::{no_grad_guard, Device, IndexOp, Kind, Tensor};
 use threading::{agent_mngr::AgentManager, trajectory::Trajectory};
 use util::{
     compute::{self, NonBlockingTransfer},
-    running_stat::WelfordRunningStat,
+    running_stat::{WStatConfig, WelfordRunningStat},
 };
 
 #[derive(Debug, Clone)]
@@ -136,14 +142,24 @@ impl Default for LearnerConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Stats {
+    cumulative_timesteps: u64,
+    cumulative_model_updates: u64,
+    epoch: u64,
+    return_stat: WStatConfig,
+    // todo, for wandb metrics reporting
+    // run_id: String,
+}
+
 pub struct Learner {
     config: LearnerConfig,
-    obs_size: usize,
-    action_size: usize,
+    // obs_size: usize,
+    // action_size: usize,
     exp_buffer: ExperienceBuffer,
     ppo: PPOLearner,
     agent_mngr: AgentManager,
-    running_stat: WelfordRunningStat,
+    return_stat: WelfordRunningStat,
     total_timesteps: u64,
     total_epochs: u64,
 }
@@ -212,12 +228,12 @@ impl Learner {
 
         Self {
             config,
-            obs_size,
-            action_size,
+            // obs_size,
+            // action_size,
             exp_buffer,
             ppo,
             agent_mngr,
-            running_stat: WelfordRunningStat::default(),
+            return_stat: WelfordRunningStat::default(),
             total_timesteps: 0,
             total_epochs: 0,
         }
@@ -267,13 +283,80 @@ impl Learner {
 
             steps_since_save += self.config.ppo.batch_size;
             if steps_since_save >= self.config.timesteps_per_save {
+                self.save();
                 steps_since_save = 0;
-                println!("Saving has not been implemented yet");
             }
         }
 
         println!("Timestep limit reached, stopping...");
         self.agent_mngr.stop();
+    }
+
+    fn load_stats<P: AsRef<Path>>(&mut self, path: P) {
+        let path = path.as_ref().join("stats.toml");
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let stats: Stats = toml::from_str(&contents).unwrap();
+
+        self.total_timesteps = stats.cumulative_timesteps;
+        self.ppo.cumulative_model_updates = stats.cumulative_model_updates;
+        self.total_epochs = stats.epoch;
+        self.return_stat = stats.return_stat.into();
+    }
+
+    fn save_stats<P: AsRef<Path>>(&self, path: P) {
+        let path = path.as_ref().join("stats.toml");
+
+        let stats = Stats {
+            cumulative_timesteps: self.total_timesteps,
+            cumulative_model_updates: self.ppo.cumulative_model_updates,
+            epoch: self.total_epochs,
+            return_stat: self.return_stat.config().clone(),
+        };
+
+        fs::write(&path, toml::to_string(&stats).unwrap()).unwrap();
+    }
+
+    pub fn load(&mut self) {
+        println!("Loading model checkpoint...");
+        let folder = self.config.checkpoint_load_folder.clone();
+
+        if !folder.exists() {
+            println!("Checkpoint folder does not exist, skipping load");
+            return;
+        }
+
+        let mut checkpoint_name = None;
+        let mut max_timesteps = 0;
+        for entry in fs::read_dir(folder).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let dirname = path.file_name().unwrap().to_str();
+                let timesteps = dirname.unwrap().parse::<u64>().unwrap();
+                if timesteps > max_timesteps {
+                    checkpoint_name = Some(path);
+                    max_timesteps = timesteps;
+                }
+            }
+        }
+
+        let Some(checkpoint_name) = checkpoint_name else {
+            println!("No checkpoint found in folder, skipping load");
+            return;
+        };
+
+        self.ppo.load(checkpoint_name);
+    }
+
+    pub fn save(&self) {
+        println!("Saving model checkpoint...");
+        let mut folder = self.config.checkpoint_save_folder.clone();
+        folder.push(self.total_timesteps.to_string());
+
+        fs::create_dir_all(&folder).unwrap();
+
+        self.save_stats(&folder);
+        self.ppo.save(folder);
     }
 
     fn add_new_experience(&mut self, timesteps: Trajectory, report: &mut Report) {
@@ -301,7 +384,7 @@ impl Learner {
         let val_preds = tensor_to_f32_vec(&val_preds_tensor);
 
         let ret_std = if self.config.standardize_returns {
-            self.running_stat.get_std()[0]
+            self.return_stat.get_std()[0]
         } else {
             1.0
         };
@@ -331,7 +414,7 @@ impl Learner {
             let num_to_increment = returns
                 .len()
                 .min(self.config.max_returns_per_stats_inc as usize);
-            self.running_stat.increment(&returns, num_to_increment);
+            self.return_stat.increment(&returns, num_to_increment);
         }
 
         let exp_tensors = ExperienceTensors {

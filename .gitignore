@@ -2,3 +2,6 @@
 /venv
 /collision_meshes
 /checkpoints
+rlviser*
+settings.txt
+Cargo.lock

@@ -108,7 +108,6 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    index: usize,
     game_instances: Vec<GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>>,
     config: AgentConfig,
     data: Arc<AgentData>,
@@ -131,7 +130,6 @@ where
         config: AgentConfig,
         create_env_fn: F,
         step_callback: C,
-        index: usize,
         data: Arc<AgentData>,
         controls: Arc<AgentControls>,
         policy: Arc<RwLock<Arc<DiscretePolicy>>>,
@@ -142,7 +140,7 @@ where
         let mut game_instances = Vec::with_capacity(config.num_games);
 
         let mut traj = data.trajectories.lock().unwrap();
-        traj.reserve(config.num_games);
+        traj.reserve_exact(config.num_games);
 
         for _ in 0..config.num_games {
             let env = create_env_fn();
@@ -158,7 +156,6 @@ where
         drop(traj);
 
         Self {
-            index,
             game_instances,
             config,
             data,
@@ -174,7 +171,7 @@ where
 
         self.game_instances.iter_mut().for_each(GameInstance::start);
 
-        // Will stores our current observations for all our games
+        // Will store our current observations for all our games
         let mut cur_obs_tensor = make_games_obs_tensor(&self.game_instances, false);
 
         let mut policy = self.policy.read().unwrap().clone();
@@ -238,7 +235,8 @@ where
                     (action_offset + num_cars) as i64,
                     1,
                 );
-                step_results.push(game.step(tensor_to_i32_vec(&action_slice)));
+
+                step_results.push(game.step(tensor_to_i32_vec(&action_slice), false));
 
                 action_offset += num_cars;
             }
@@ -267,10 +265,6 @@ where
 
                     let t_done = Tensor::from_slice(&[done]);
                     let t_truncated = Tensor::from_slice(&[truncated]);
-
-                    while num_cars > trajectories[i].len() {
-                        trajectories[i].push(Trajectory::default());
-                    }
 
                     for j in 0..num_cars {
                         trajectories[i][j].append_single_step(TrajectoryTensors {
@@ -311,10 +305,56 @@ where
             if can_be_reused {
                 cur_obs_tensor = next_obs_tensor;
             } else {
-                println!("Reallocating tensor due to changed number of cars");
+                drop(next_obs_tensor);
                 cur_obs_tensor = make_games_obs_tensor(&self.game_instances, false);
             }
         }
+    }
+
+    pub fn run_render(&mut self) {
+        while !self.controls.should_run.load(Ordering::Relaxed) {
+            sleep(Duration::from_millis(100));
+        }
+
+        self.game_instances[0].start();
+        self.game_instances[0].open_rlviser();
+
+        'outer: loop {
+            if !self.controls.should_run.load(Ordering::Relaxed) {
+                break 'outer;
+            }
+
+            let mut was_paused = false;
+            while self.controls.paused.load(Ordering::Relaxed) {
+                if !self.controls.should_run.load(Ordering::Relaxed) {
+                    break 'outer;
+                }
+
+                if !was_paused {
+                    self.game_instances[0].close_rlviser();
+                }
+                was_paused = true;
+                sleep(Duration::from_millis(50));
+            }
+
+            if was_paused {
+                self.game_instances[0].open_rlviser();
+            }
+
+            let policy = self.policy.read().unwrap().clone();
+
+            let cur_obs_on_device =
+                make_games_obs_tensor(&self.game_instances, false).no_block_to(self.config.device);
+            let action_results = policy.get_action(&cur_obs_on_device, self.config.deterministic);
+            let action_slice =
+                action_results
+                    .action
+                    .slice(0, 0, self.game_instances[0].num_cars() as i64, 1);
+
+            self.game_instances[0].step(tensor_to_i32_vec(&action_slice), true);
+        }
+
+        self.game_instances[0].close_rlviser();
     }
 }
 
@@ -331,7 +371,7 @@ impl AgentController {
         policy: Arc<DiscretePolicy>,
         create_env_fn: F,
         step_callback: C,
-        index: usize,
+        render: bool,
     ) -> Self
     where
         F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Send + 'static,
@@ -350,16 +390,20 @@ impl AgentController {
         let thread_data = data.clone();
         let thread_policy = policy.clone();
         let thread_handle = thread::spawn(move || {
-            Agent::new(
+            let mut agent = Agent::new(
                 config,
                 create_env_fn,
                 step_callback,
-                index,
                 thread_data,
                 controls,
                 thread_policy,
-            )
-            .run();
+            );
+
+            if render {
+                agent.run_render();
+            } else {
+                agent.run();
+            }
         });
 
         Self {

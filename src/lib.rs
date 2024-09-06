@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 mod ppo;
 mod threading;
 mod util;
@@ -5,7 +7,7 @@ mod util;
 pub use ppo::ppo_learner::PPOLearnerConfig;
 pub use rlgym_rs;
 pub use rlgym_rs::rocketsim_rs;
-use serde::{Deserialize, Serialize};
+pub use rocketsim_rs::glam_ext::glam;
 pub use tch;
 pub use util::avg_tracker::AvgTracker;
 pub use util::report::Report;
@@ -18,6 +20,7 @@ use rlgym_rs::{
     rocketsim_rs::glam_ext::GameStateA, Action, Env, Obs, Reward, SharedInfoProvider, StateSetter,
     Terminal, Truncate,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     num::NonZeroUsize,
@@ -68,7 +71,7 @@ pub struct LearnerConfig {
     /// but more overhead from loading atomics
     ///
     /// Realistically, checking every tick is excessive!
-    pub controls_update_frequency: u64,
+    pub check_update_frequency: u64,
     /// Collect additional steps during the learning phase
     ///
     /// Note that, once the learning phase completes and the policy is updated, these additional steps are from the old policy
@@ -119,7 +122,7 @@ impl Default for LearnerConfig {
             max_returns_per_stats_inc: 150,
             steps_per_obs_stats_inc: 5,
             deterministic: false,
-            controls_update_frequency: 15,
+            check_update_frequency: 15,
             collection_timesteps_overflow: 25_000,
             collection_during_learn: false,
             ppo: PPOLearnerConfig::default(),
@@ -214,7 +217,7 @@ impl Learner {
             config.ppo.batch_size + config.collection_timesteps_overflow,
             config.deterministic,
             config.collection_during_learn,
-            config.controls_update_frequency,
+            config.check_update_frequency,
             config.device,
         );
 
@@ -224,6 +227,7 @@ impl Learner {
             step_callback.clone(),
             config.num_threads.get(),
             config.num_games_per_thread.get(),
+            config.render,
         );
 
         Self {
@@ -345,6 +349,7 @@ impl Learner {
             return;
         };
 
+        self.load_stats(&checkpoint_name);
         self.ppo.load(checkpoint_name);
     }
 

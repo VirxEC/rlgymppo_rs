@@ -1,7 +1,7 @@
 use crate::util::{compute::NonBlockingTransfer, sealed::Sealed};
 use tch::{
     kind::FLOAT_CPU,
-    nn::{self, ModuleT},
+    nn::{self, LinearConfig, ModuleT},
     Device, Tensor,
 };
 
@@ -31,13 +31,10 @@ impl DiscretePolicy {
         path: nn::Path,
         device: Device,
     ) -> Self {
+        let config = LinearConfig::default();
+
         let mut seq = nn::seq_t()
-            .add(nn::linear(
-                &path / 0,
-                input_size,
-                layer_sizes[0],
-                Default::default(),
-            ))
+            .add(nn::linear(&path / 0, input_size, layer_sizes[0], config))
             .add_fn(|xs| xs.relu());
 
         let mut prev_layer_size = layer_sizes[0];
@@ -47,7 +44,7 @@ impl DiscretePolicy {
                     &path / (i + 1),
                     prev_layer_size,
                     layer_size,
-                    Default::default(),
+                    config,
                 ))
                 .add_fn(|xs| xs.relu());
             prev_layer_size = layer_size;
@@ -59,7 +56,7 @@ impl DiscretePolicy {
                 path / layer_sizes.len(),
                 prev_layer_size,
                 output_size,
-                Default::default(),
+                config,
             ))
             .add_fn(|xs| xs.softmax(-1, tch::Kind::Float));
 

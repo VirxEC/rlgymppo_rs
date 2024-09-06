@@ -1,6 +1,7 @@
-use rlgym_rs::{FullObs, SharedInfoProvider, Truncate};
 use rlgymppo_rs::{
-    rlgym_rs::{Action, Env, Obs, Reward, StateSetter, Terminal},
+    rlgym_rs::{
+        Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
+    },
     rocketsim_rs::{
         cxx::UniquePtr,
         glam_ext::{BallA, CarInfoA, GameStateA},
@@ -9,12 +10,12 @@ use rlgymppo_rs::{
     },
     AvgTracker, Learner, LearnerConfig, PPOLearnerConfig, Report,
 };
-use std::{cmp::Ordering, num::NonZeroUsize, thread::available_parallelism};
-use tch::Cuda;
+use std::{num::NonZeroUsize, thread::available_parallelism};
 
 struct SharedInfo {
     rng: fastrand::Rng,
     avg_dist_to_ball: AvgTracker,
+    avg_vel: AvgTracker,
 }
 
 impl Default for SharedInfo {
@@ -22,6 +23,7 @@ impl Default for SharedInfo {
         Self {
             rng: fastrand::Rng::new(),
             avg_dist_to_ball: AvgTracker::default(),
+            avg_vel: AvgTracker::default(),
         }
     }
 }
@@ -37,6 +39,8 @@ impl SharedInfoProvider<SharedInfo> for MySharedInfoProvider {
         for car in &game_state.cars {
             let dist_to_ball = car.state.pos.distance(game_state.ball.pos);
             shared_info.avg_dist_to_ball += dist_to_ball as f64;
+
+            shared_info.avg_vel += car.state.vel.length() as f64;
         }
     }
 }
@@ -47,30 +51,28 @@ impl StateSetter<SharedInfo> for MyStateSetter {
     fn apply(&mut self, arena: &mut UniquePtr<Arena>, shared_info: &mut SharedInfo) {
         arena.pin_mut().reset_tick_count();
 
-        let car_ids = arena.pin_mut().get_cars();
-        let mode = shared_info.rng.u8(1..4);
+        // remove previous cars
+        for car_id in arena.pin_mut().get_cars() {
+            arena.pin_mut().remove_car(car_id).unwrap();
+        }
 
-        match (mode as usize).cmp(&(car_ids.len() / 2)) {
-            Ordering::Less => {
-                let to_remove = car_ids.len() / 2 - mode as usize;
-                for car_id in car_ids.into_iter().take(to_remove) {
-                    arena.pin_mut().remove_car(car_id).unwrap();
-                }
-            }
-            Ordering::Greater => {
-                let to_add = mode as usize - car_ids.len() / 2;
-                let car_config = CarConfig::octane();
-                for _ in 0..to_add {
-                    let _ = arena.pin_mut().add_car(Team::Blue, car_config);
-                    let _ = arena.pin_mut().add_car(Team::Orange, car_config);
-                }
-            }
-            Ordering::Equal => {}
+        // random game mode, 1v1, 2v2, or 3v3
+        let octane = CarConfig::octane();
+        for _ in 0..shared_info.rng.u8(1..4) {
+            let _ = arena.pin_mut().add_car(Team::Blue, octane);
+            let _ = arena.pin_mut().add_car(Team::Orange, octane);
         }
 
         arena
             .pin_mut()
             .reset_to_random_kickoff(Some(shared_info.rng.i32(-1000..1000)));
+
+        let mut state = arena.pin_mut().get_game_state();
+        for car in &mut state.cars {
+            car.state.vel.x = (shared_info.rng.f32() * 2. - 1.) * 1300.;
+            car.state.vel.y = (shared_info.rng.f32() * 2. - 1.) * 1300.;
+        }
+        arena.pin_mut().set_game_state(&state).unwrap();
     }
 }
 
@@ -176,8 +178,9 @@ impl Default for MyAction {
     fn default() -> Self {
         let mut actions_table = Vec::new();
 
-        for throttle in [1.0, 0.0, -1.0] {
-            for steer in [1.0, 0.0, -1.0] {
+        // ground
+        for throttle in [-1.0, 0.0, 1.0] {
+            for steer in [-1.0, 0.0, 1.0] {
                 for boost in [false, true] {
                     for handbrake in [false, true] {
                         if boost && throttle != 1.0 {
@@ -194,6 +197,40 @@ impl Default for MyAction {
                             yaw: 0.0,
                             roll: 0.0,
                         });
+                    }
+                }
+            }
+        }
+
+        // aerial
+        for pitch in [-1.0, 0.0, 1.0] {
+            for yaw in [-1.0, 0.0, 1.0] {
+                for roll in [-1.0, 0.0, 1.0] {
+                    for jump in [false, true] {
+                        for boost in [false, true] {
+                            // Only need roll for sideflip
+                            if jump && yaw != 0.0 {
+                                continue;
+                            }
+
+                            // Duplicate with ground
+                            if pitch == 0.0 && roll == 0.0 && !jump {
+                                continue;
+                            }
+
+                            // Enable handbrake for potential wavedashes
+                            let handbrake = jump && (pitch != 0.0 || yaw != 0.0 || roll != 0.0);
+                            actions_table.push(CarControls {
+                                throttle: 0.0,
+                                steer: yaw,
+                                boost,
+                                handbrake,
+                                jump,
+                                pitch,
+                                yaw,
+                                roll,
+                            });
+                        }
                     }
                 }
             }
@@ -224,6 +261,7 @@ impl Action<SharedInfo> for MyAction {
     ) -> Vec<CarControls> {
         actions
             .into_iter()
+            // .map(|action| dbg!(self.actions_table[dbg!(action) as usize]))
             .map(|action| self.actions_table[action as usize])
             .collect()
     }
@@ -257,20 +295,16 @@ impl Reward<SharedInfo> for CombinedReward {
     }
 }
 
-struct DistanceToBallReward;
+struct VelocityReward;
 
-impl Reward<SharedInfo> for DistanceToBallReward {
+impl Reward<SharedInfo> for VelocityReward {
     fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
 
     fn get_rewards(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> Vec<f32> {
         state
             .cars
             .iter()
-            .map(|car| {
-                let car_ball_dist = car.state.pos.distance(state.ball.pos);
-
-                -car_ball_dist / 12_000.
-            })
+            .map(|car| car.state.vel.length() / 2300.)
             .collect()
     }
 }
@@ -281,14 +315,13 @@ impl Terminal<SharedInfo> for MyTerminal {
     fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
 
     fn is_terminal(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> bool {
-        // reset after 5 minutes
         let elapsed = state.tick_count as f32 / state.tick_rate / 60.0;
 
-        if elapsed < 5.0 {
+        // reset after some minutes
+        if elapsed < 2.0 {
             return false;
         }
 
-        println!("Episode lasted {:.2} minutes", elapsed);
         state.ball.pos.z < 94.5
     }
 }
@@ -318,13 +351,21 @@ fn create_env() -> Env<
         .pin_mut()
         .set_goal_scored_callback(|arena, _, _| arena.reset_to_random_kickoff(None), 0);
 
+    // set the initial environment to the max number of cars
+    // this will help avoid errors during training
+    let octane = CarConfig::octane();
+    for _ in 0..MyObs::ZERO_PADDING {
+        let _ = arena.pin_mut().add_car(Team::Blue, octane);
+        let _ = arena.pin_mut().add_car(Team::Orange, octane);
+    }
+
     Env::new(
         arena,
         MyStateSetter,
         MySharedInfoProvider,
         MyObs,
         MyAction::default(),
-        CombinedReward::new(vec![Box::new(DistanceToBallReward)]),
+        CombinedReward::new(vec![Box::new(VelocityReward)]),
         MyTerminal,
         MyTruncate,
         SharedInfo::default(),
@@ -332,38 +373,40 @@ fn create_env() -> Env<
 }
 
 fn step_callback(report: &mut Report, shared_info: &SharedInfo, _game_state: &GameStateA) {
-    report["Avg distance to ball"] = shared_info.avg_dist_to_ball.into();
+    report["Avg. distance to ball"] = shared_info.avg_dist_to_ball.into();
+    report["Avg. velocity"] = shared_info.avg_vel.into();
 }
 
 fn main() {
     init(None, true);
 
-    // let num_threads = NonZeroUsize::new(3).unwrap();
+    // let num_threads = NonZeroUsize::new(1).unwrap();
     let num_threads = available_parallelism().unwrap();
-    let num_games_per_thread = NonZeroUsize::new(16).unwrap();
-    let mini_batch_size = 20_000;
-    let batch_size = mini_batch_size * 3;
+    let num_games_per_thread = NonZeroUsize::new(1).unwrap();
+    let mini_batch_size = 25_000;
+    let batch_size = mini_batch_size * 4;
+    let lr = 3e-4;
 
     let config = LearnerConfig {
         num_threads,
         num_games_per_thread,
         render: false,
         exp_buffer_size: batch_size,
-        timestep_limit: 1_000_000,
-        // timesteps_per_save: 10_000_000,
-        timesteps_per_save: batch_size,
+        timesteps_per_save: 10_000_000,
         collection_timesteps_overflow: 0,
-        controls_update_frequency: 15,
+        check_update_frequency: 15,
         collection_during_learn: false,
         ppo: PPOLearnerConfig {
             batch_size,
             mini_batch_size,
+            ent_coef: 0.01,
+            policy_lr: lr,
+            critic_lr: lr,
+            // policy_layer_sizes: vec![512, 512, 512, 512, 512],
+            // critic_layer_sizes: vec![512, 512, 512, 512, 512],
+            policy_layer_sizes: vec![16, 16, 16],
+            critic_layer_sizes: vec![16, 16, 16],
             ..Default::default()
-        },
-        device: if Cuda::is_available() {
-            tch::Device::Cuda(0)
-        } else {
-            tch::Device::Cpu
         },
         ..Default::default()
     };

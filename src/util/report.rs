@@ -128,9 +128,7 @@ impl Index<&str> for Report {
 
 impl IndexMut<&str> for Report {
     fn index_mut(&mut self, key: &str) -> &mut Self::Output {
-        self.data
-            .entry(key.to_string())
-            .or_insert_with(Default::default)
+        self.data.entry(key.to_string()).or_default()
     }
 }
 

@@ -22,6 +22,7 @@ pub struct AgentManager {
     agents: Vec<AgentController>,
     agent_config: AgentConfig,
     agent_controls: Arc<AgentControls>,
+    render_controls: Arc<AgentControls>,
     max_collect: u64,
     collect_during_training: bool,
 }
@@ -48,6 +49,7 @@ impl AgentManager {
                 num_games: 0,
             },
             agent_controls: Arc::default(),
+            render_controls: Arc::default(),
         }
     }
 
@@ -57,6 +59,7 @@ impl AgentManager {
         step_callback: C,
         amount: usize,
         games_per_agent: usize,
+        create_renderer: bool,
     ) where
         F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Send + Clone + 'static,
         C: Fn(&mut Report, &SI, &GameStateA) + Clone + Send + 'static,
@@ -71,21 +74,41 @@ impl AgentManager {
         self.agent_config.num_games = games_per_agent;
         self.agent_config.max_steps = self.max_collect / amount as u64;
 
-        for i in 0..amount {
-            let agent = AgentController::new(
+        self.agents.extend((0..amount).map(|_| {
+            AgentController::new(
                 self.agent_config.clone(),
                 self.agent_controls.clone(),
                 self.policy.clone(),
                 create_env_fn.clone(),
                 step_callback.clone(),
-                i,
-            );
-            self.agents.push(agent);
+                false,
+            )
+        }));
+
+        if create_renderer {
+            self.agents.push(AgentController::new(
+                AgentConfig {
+                    deterministic: true,
+                    num_games: 1,
+                    max_steps: 0,
+                    controls_update_frequency: 1,
+                    device: Device::Cpu,
+                },
+                self.render_controls.clone(),
+                self.policy.clone(),
+                create_env_fn.clone(),
+                step_callback.clone(),
+                true,
+                // amount,
+            ))
         }
     }
 
     pub fn start(&self) {
         self.agent_controls
+            .should_run
+            .store(true, Ordering::Relaxed);
+        self.render_controls
             .should_run
             .store(true, Ordering::Relaxed);
     }
@@ -103,7 +126,7 @@ impl AgentManager {
                 break;
             }
 
-            sleep(Duration::from_millis(1));
+            sleep(Duration::from_millis(10));
         }
 
         if !self.agent_config.deterministic && !self.collect_during_training {
@@ -191,6 +214,9 @@ impl AgentManager {
     pub fn stop(&mut self) {
         println!("Stopping agents...");
         self.agent_controls
+            .should_run
+            .store(false, Ordering::Relaxed);
+        self.render_controls
             .should_run
             .store(false, Ordering::Relaxed);
 

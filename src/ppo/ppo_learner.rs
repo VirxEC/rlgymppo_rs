@@ -1,7 +1,6 @@
 use super::{discrete::DiscretePolicy, exp_buf::ExperienceBuffer, value_est::ValueEstimator};
 use crate::util::{compute::NonBlockingTransfer, report::Report};
 use std::{
-    fs,
     path::Path,
     sync::Arc,
     thread::{self, available_parallelism},
@@ -48,11 +47,6 @@ pub struct PPOLearnerConfig {
     pub clip_range: f64,
     /// Set to 0 to just use batchSize
     pub mini_batch_size: u64,
-    // /// https://openai.com/index/how-ai-training-scales/
-    // /// Measures the noise of both policy and critic gradients every epoch
-    // pub measure_gradient_noise: bool,
-    // pub gradient_noise_update_interval: i64,
-    // pub gradient_noise_avg_decay: f32,
 }
 
 impl Default for PPOLearnerConfig {
@@ -67,9 +61,6 @@ impl Default for PPOLearnerConfig {
             ent_coef: 0.005,
             clip_range: 0.2,
             mini_batch_size: 0,
-            // measure_gradient_noise: false,
-            // gradient_noise_update_interval: 10,
-            // gradient_noise_avg_decay: 0.9925,
         }
     }
 }
@@ -81,8 +72,6 @@ pub struct PPOLearner {
     value_optimizer: nn::Optimizer,
     policy_store: nn::VarStore,
     value_store: nn::VarStore,
-    // noiseTrackerPolicy: GradNoiseTracker,
-    // noiseTrackerValueNet: GradNoiseTracker,
     value_loss_fn: Reduction,
     config: PPOLearnerConfig,
     pub cumulative_model_updates: u64,
@@ -127,8 +116,6 @@ impl PPOLearner {
             .build(&value_store, config.critic_lr)
             .unwrap();
 
-        // grad noise stuff?
-
         Self {
             policy: Arc::new(policy),
             value_net,
@@ -145,11 +132,11 @@ impl PPOLearner {
 
     /// https://github.com/LaurentMazare/tch-rs?tab=readme-ov-file#importing-pre-trained-weights-from-pytorch-using-safetensors
     /// > `safetensors` is a new simple format by HuggingFace for storing tensors.
-    ///   It does not rely on Python's pickle module,
-    ///   and therefore the tensors are not bound to the specific classes
-    ///   and the exact directory structure used when the model is saved.
-    ///   It is also zero-copy, which means that reading the file will
-    ///   require no more memory than the original file.
+    /// > It does not rely on Python's pickle module,
+    /// > and therefore the tensors are not bound to the specific classes
+    /// > and the exact directory structure used when the model is saved.
+    /// > It is also zero-copy, which means that reading the file will
+    /// > require no more memory than the original file.
     ///
     /// The link above shows how to load a safetensors file in Python.
     pub fn load<P: AsRef<Path>>(&mut self, path: P) {

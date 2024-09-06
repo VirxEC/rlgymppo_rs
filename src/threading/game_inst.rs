@@ -3,7 +3,12 @@ use rlgym_rs::{
     rocketsim_rs::glam_ext::GameStateA, Action, Env, FullObs, Obs, Reward, SharedInfoProvider,
     StateSetter, StepResult, Terminal, Truncate,
 };
-use std::{ops::AddAssign, rc::Rc};
+use std::{
+    ops::AddAssign,
+    rc::Rc,
+    thread::sleep,
+    time::{Duration, Instant},
+};
 use tch::no_grad_guard;
 
 #[derive(Debug, Default)]
@@ -47,6 +52,8 @@ where
     total_steps: u64,
     cur_episode_reward: f64,
     metrics: GameMetrics,
+    tick_rate: Duration,
+    next_time: Instant,
 }
 
 impl<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
@@ -70,6 +77,8 @@ where
             total_steps: 0,
             cur_episode_reward: 0.0,
             metrics: GameMetrics::default(),
+            tick_rate: Duration::from_secs_f32(ACT::get_tick_skip() as f32 / 120.),
+            next_time: Instant::now(),
         }
     }
 
@@ -81,36 +90,62 @@ where
         self.env.num_cars()
     }
 
-    pub fn step(&mut self, actions: ACT::Input) -> StepResult {
+    pub fn open_rlviser(&mut self) {
+        self.env.enable_rendering();
+    }
+
+    pub fn close_rlviser(&mut self) {
+        self.env.stop_rendering();
+    }
+
+    pub fn step(&mut self, actions: ACT::Input, render: bool) -> StepResult {
         let _no_grad = no_grad_guard();
         let result = self.env.step(actions);
 
-        (self.step_callback)(
-            &mut self.metrics.report,
-            self.env.shared_info(),
-            &result.state,
-        );
-
-        // Update avg rewards
-        let num_players = result.rewards.len();
-        let total_rew: f64 = result.rewards.iter().sum::<f32>() as f64;
-
-        self.metrics.avg_steps_reward += AvgTracker::new(total_rew, num_players as u64);
-        self.cur_episode_reward += total_rew / num_players as f64;
-
-        if result.is_terminal || result.truncated {
-            self.last_obs = Some(self.cur_obs.clone());
-            self.cur_obs = self.env.reset();
-
-            println!("Episode reward: {}", self.cur_episode_reward);
-            self.metrics.avg_episode_reward += self.cur_episode_reward;
-            self.cur_episode_reward = 0.0;
-        } else {
-            self.last_obs = None;
-            self.cur_obs = result.obs.clone();
+        if !render {
+            (self.step_callback)(
+                &mut self.metrics.report,
+                self.env.shared_info(),
+                &result.state,
+            );
         }
 
-        self.total_steps += 1;
+        if !render || !self.env.is_paused() {
+            // Update avg rewards
+            let num_players = result.rewards.len();
+            let total_rew: f64 = result.rewards.iter().sum::<f32>() as f64;
+
+            self.metrics.avg_steps_reward += AvgTracker::new(total_rew, num_players as u64);
+            self.cur_episode_reward += total_rew / num_players as f64;
+
+            if result.is_terminal || result.truncated {
+                self.last_obs = Some(self.cur_obs.clone());
+                self.cur_obs = self.env.reset();
+
+                self.metrics.avg_episode_reward += self.cur_episode_reward;
+                self.cur_episode_reward = 0.0;
+            } else {
+                self.last_obs = None;
+                self.cur_obs = result.obs.clone();
+            }
+
+            self.total_steps += 1;
+        }
+
+        if render {
+            // check for state settings requests
+            // also sets the requested game speed & pause state
+            self.env
+                .handle_incoming_states(&mut self.tick_rate)
+                .unwrap();
+
+            // ensure we only run at the requested game speed
+            let wait_time = self.next_time - Instant::now();
+            if wait_time > Duration::default() {
+                sleep(wait_time);
+            }
+            self.next_time += self.tick_rate;
+        }
 
         result
     }

@@ -40,7 +40,6 @@ impl ExperienceTensors {
 
 pub struct ExperienceBuffer {
     device: Device,
-    seed: u64,
     data: ExperienceTensors,
     cur_size: i64,
     max_size: i64,
@@ -51,7 +50,6 @@ impl ExperienceBuffer {
     pub fn new(max_size: u64, seed: u64, device: Device) -> Self {
         Self {
             device,
-            seed,
             data: Default::default(),
             cur_size: 0,
             max_size: max_size as i64,

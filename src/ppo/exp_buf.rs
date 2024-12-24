@@ -39,7 +39,6 @@ impl ExperienceTensors {
 }
 
 pub struct ExperienceBuffer {
-    device: Device,
     data: ExperienceTensors,
     cur_size: i64,
     max_size: i64,
@@ -47,9 +46,8 @@ pub struct ExperienceBuffer {
 }
 
 impl ExperienceBuffer {
-    pub fn new(max_size: u64, seed: u64, device: Device) -> Self {
+    pub fn new(max_size: u64, seed: u64) -> Self {
         Self {
-            device,
             data: Default::default(),
             cur_size: 0,
             max_size: max_size as i64,
@@ -86,7 +84,7 @@ impl ExperienceBuffer {
                 let sizes = new_ten.size();
                 let mut new_sizes = sizes.to_vec();
                 new_sizes[0] = self.max_size;
-                *curr_ten = Tensor::zeros(&new_sizes, (Kind::Float, self.device));
+                *curr_ten = Tensor::zeros(&new_sizes, (Kind::Float, Device::Cpu));
 
                 // Make ourTen NAN, such that it is obvious if uninitialized data is being used
                 let _ = curr_ten.f_add_scalar_(Scalar::float(f64::NAN)).unwrap();
@@ -111,7 +109,6 @@ impl ExperienceBuffer {
             our_ten_insert_view.copy_(new_ten);
             assert!(curr_ten
                 .get(end_idx - 1)
-                .to(Device::Cpu)
                 .equal(&new_ten.get(new_ten.size()[0] - 1)));
         }
 
@@ -119,7 +116,7 @@ impl ExperienceBuffer {
     }
 
     fn _get_samples(&self, indices: &[i64]) -> SampleSet {
-        let t_indices = Tensor::from_slice(indices).to(self.device);
+        let t_indices = Tensor::from_slice(indices);
 
         SampleSet {
             actions: self.data.actions.index_select(0, &t_indices),
@@ -130,15 +127,44 @@ impl ExperienceBuffer {
         }
     }
 
-    pub fn get_all_batches_shuffled(&mut self, batch_size: u64) -> Vec<SampleSet> {
-        // Make list of shuffled sample indices
-        let mut indices: Vec<i64> = (0..self.cur_size).collect();
-        self.rng.shuffle(&mut indices);
+    pub fn get_all_batches_shuffled(&mut self, batch_size: u64) -> BatchShuffleIter {
+        BatchShuffleIter::new(self, batch_size)
+    }
+}
 
-        // Get a sample set from each of the batches
-        indices
-            .chunks_exact(batch_size as usize)
-            .map(|chunk| self._get_samples(chunk))
-            .collect()
+pub struct BatchShuffleIter<'a> {
+    buffer: &'a mut ExperienceBuffer,
+    batch_size: u64,
+    indices: Vec<i64>,
+    cur_idx: usize,
+}
+
+impl<'a> BatchShuffleIter<'a> {
+    fn new(buffer: &'a mut ExperienceBuffer, batch_size: u64) -> Self {
+        let mut indices: Vec<i64> = (0..buffer.cur_size).collect();
+        buffer.rng.shuffle(&mut indices);
+
+        Self {
+            buffer,
+            batch_size,
+            indices,
+            cur_idx: 0,
+        }
+    }
+}
+
+impl Iterator for BatchShuffleIter<'_> {
+    type Item = SampleSet;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cur_idx >= self.indices.len() {
+            return None;
+        }
+
+        let start_idx = self.cur_idx;
+        let end_idx = (self.cur_idx + self.batch_size as usize).min(self.indices.len());
+        self.cur_idx = end_idx;
+
+        Some(self.buffer._get_samples(&self.indices[start_idx..end_idx]))
     }
 }

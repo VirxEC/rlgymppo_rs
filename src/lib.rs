@@ -209,7 +209,6 @@ impl Learner {
         let exp_buffer = ExperienceBuffer::new(
             config.exp_buffer_size,
             config.random_seed as u64,
-            config.device,
         );
 
         println!("Creating learner...");
@@ -254,17 +253,19 @@ impl Learner {
 
         let mut steps_since_save = 0;
 
-        let mut timestep_collection_time = Instant::now();
+        let mut overall_time = Instant::now();
         while self.config.timestep_limit == 0 || self.total_timesteps < self.config.timestep_limit {
             let mut report = Report::default();
 
+            let collection_time = Instant::now();
             let timesteps = self
                 .agent_mngr
                 .collect_timesteps(self.config.ppo.batch_size);
 
             let timesteps_collected = timesteps.len();
-            let timestep_collection_elapsed = timestep_collection_time.elapsed();
-            timestep_collection_time = Instant::now();
+            let collection_time_elapsed = collection_time.elapsed();
+            let overall_time_elapsed = overall_time.elapsed();
+            overall_time = Instant::now();
 
             self.total_timesteps += self.config.ppo.batch_size;
 
@@ -283,9 +284,10 @@ impl Learner {
             self.agent_mngr.get_metrics(&mut report);
 
             report["Timesteps Collected"] = timesteps_collected.into();
-            report["Overall Steps per Second"] = (self.config.ppo.batch_size as f64
-                / timestep_collection_elapsed.as_secs_f64())
-            .into();
+            report["Overall Steps per Second"] =
+                (self.config.ppo.batch_size as f64 / overall_time_elapsed.as_secs_f64()).into();
+            report["Collected Steps per Second"] =
+                (self.config.ppo.batch_size as f64 / collection_time_elapsed.as_secs_f64()).into();
             report["Cumulative Timesteps"] = self.total_timesteps.into();
 
             println!("{report}");

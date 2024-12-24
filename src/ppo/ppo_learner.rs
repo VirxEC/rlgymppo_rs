@@ -171,7 +171,7 @@ impl PPOLearner {
         &self.value_net
     }
 
-    pub fn learn(&mut self, exp_buffer: &mut ExperienceBuffer, mut report: &mut Report) {
+    pub fn learn(&mut self, exp_buffer: &mut ExperienceBuffer, report: &mut Report) {
         let mut num_mini_batch_iterations = 0;
         let mut mean_entropy: f64 = 0.;
         let mut mean_divergence: f64 = 0.;
@@ -236,8 +236,8 @@ impl PPOLearner {
 
                             // Compute policy loss
                             let policy_loss = -(&ratio * &advantages)
-                                .minimum(&(&clipped * &advantages))
-                                .mean(Kind::Float);
+                                .minimum(&(clipped * advantages))
+                                .mean(None);
 
                             let ppo_loss =
                                 (&policy_loss - &entropy * self.config.ent_coef) * batch_size_ratio;
@@ -301,7 +301,6 @@ impl PPOLearner {
                     metrics
                 };
 
-                let reporter = &mut report;
                 if self.device.is_cuda() {
                     for start in (0..self.config.batch_size as i64)
                         .step_by(self.config.mini_batch_size as usize)
@@ -349,10 +348,10 @@ impl PPOLearner {
                             clip_fractions.push(clip_fraction);
                         }
 
-                        reporter["PPO Backward Time"] += metrics.backwards_time.into();
-                        reporter["PPO Backprop Time"] += metrics.backprop_time.into();
-                        reporter["PPO Value Estimate Time"] += metrics.value_est_time.into();
-                        reporter["PPO Gradient Time"] += metrics.gradient_time.into();
+                        report["PPO Backward Time"] += metrics.backwards_time.into();
+                        report["PPO Backprop Time"] += metrics.backprop_time.into();
+                        report["PPO Value Estimate Time"] += metrics.value_est_time.into();
+                        report["PPO Gradient Time"] += metrics.gradient_time.into();
 
                         num_mini_batch_iterations += 1;
                     }
@@ -414,9 +413,9 @@ impl PPOLearner {
                                 clip_fractions.push(clip_fraction);
                             }
 
-                            reporter["PPO Backprop Time"] += metrics.backprop_time.into();
-                            reporter["PPO Value Estimate Time"] += metrics.value_est_time.into();
-                            reporter["PPO Gradient Time"] += metrics.gradient_time.into();
+                            report["PPO Backprop Time"] += metrics.backprop_time.into();
+                            report["PPO Value Estimate Time"] += metrics.value_est_time.into();
+                            report["PPO Gradient Time"] += metrics.gradient_time.into();
 
                             num_mini_batch_iterations += 1;
                         }

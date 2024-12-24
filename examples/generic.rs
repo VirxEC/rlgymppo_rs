@@ -382,7 +382,7 @@ fn main() {
 
     // let num_threads = NonZeroUsize::new(1).unwrap();
     let num_threads = available_parallelism().unwrap();
-    let num_games_per_thread = NonZeroUsize::new(1).unwrap();
+    let num_games_per_thread = NonZeroUsize::new(12).unwrap();
     let mini_batch_size = 15_000;
     let batch_size = mini_batch_size * 5;
     let lr = 3e-4;
@@ -400,11 +400,12 @@ fn main() {
         ppo: PPOLearnerConfig {
             batch_size,
             mini_batch_size,
+            epochs: 3,
             ent_coef: 0.01,
             policy_lr: lr,
             critic_lr: lr,
-            policy_layer_sizes: vec![512, 512, 512, 512],
-            critic_layer_sizes: vec![512, 512, 512, 512],
+            policy_layer_sizes: vec![512, 512, 512, 512, 512],
+            critic_layer_sizes: vec![512, 512, 512, 512, 512, 512],
             // policy_layer_sizes: vec![16, 16, 16],
             // critic_layer_sizes: vec![16, 16, 16],
             ..Default::default()

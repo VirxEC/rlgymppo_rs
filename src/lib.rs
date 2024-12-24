@@ -39,6 +39,9 @@ pub struct LearnerConfig {
     pub num_threads: NonZeroUsize,
     pub num_games_per_thread: NonZeroUsize,
     pub render: bool,
+    /// If render is true, this will attempt to launch the RLViser
+    /// If this is false, RLViser will not be launched
+    pub try_launch_exe: bool,
     /// Set to 0 to disable
     pub timestep_limit: u64,
     pub exp_buffer_size: u64,
@@ -115,6 +118,7 @@ impl Default for LearnerConfig {
             num_threads: NonZeroUsize::new(8).unwrap(),
             num_games_per_thread: NonZeroUsize::new(16).unwrap(),
             render: false,
+            try_launch_exe: false,
             timestep_limit: 0,
             exp_buffer_size: 100_000,
             standardize_returns: true,
@@ -228,6 +232,7 @@ impl Learner {
             config.num_threads.get(),
             config.num_games_per_thread.get(),
             config.render,
+            config.try_launch_exe,
         );
 
         Self {
@@ -433,6 +438,7 @@ impl Learner {
             values: value_targets,
             advantages,
         };
+
         self.exp_buffer.submit_experience(exp_tensors);
 
         let ppo_learn_start = Instant::now();

@@ -111,6 +111,7 @@ impl ExperienceBuffer {
             our_ten_insert_view.copy_(new_ten);
             assert!(curr_ten
                 .get(end_idx - 1)
+                .to(Device::Cpu)
                 .equal(&new_ten.get(new_ten.size()[0] - 1)));
         }
 
@@ -118,7 +119,7 @@ impl ExperienceBuffer {
     }
 
     fn _get_samples(&self, indices: &[i64]) -> SampleSet {
-        let t_indices = Tensor::from_slice(indices);
+        let t_indices = Tensor::from_slice(indices).to(self.device);
 
         SampleSet {
             actions: self.data.actions.index_select(0, &t_indices),

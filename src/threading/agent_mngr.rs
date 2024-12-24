@@ -60,6 +60,7 @@ impl AgentManager {
         amount: usize,
         games_per_agent: usize,
         create_renderer: bool,
+        try_launch_exe: bool,
     ) where
         F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Send + Clone + 'static,
         C: Fn(&mut Report, &SI, &GameStateA) + Clone + Send + 'static,
@@ -82,6 +83,7 @@ impl AgentManager {
                 create_env_fn.clone(),
                 step_callback.clone(),
                 false,
+                false,
             )
         }));
 
@@ -99,6 +101,7 @@ impl AgentManager {
                 create_env_fn.clone(),
                 step_callback.clone(),
                 true,
+                try_launch_exe,
                 // amount,
             ))
         }

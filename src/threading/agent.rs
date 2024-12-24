@@ -311,13 +311,13 @@ where
         }
     }
 
-    pub fn run_render(&mut self) {
+    pub fn run_render(&mut self, try_launch_exe: bool) {
         while !self.controls.should_run.load(Ordering::Relaxed) {
             sleep(Duration::from_millis(100));
         }
 
         self.game_instances[0].start();
-        self.game_instances[0].open_rlviser();
+        self.game_instances[0].open_rlviser(try_launch_exe);
 
         'outer: loop {
             if !self.controls.should_run.load(Ordering::Relaxed) {
@@ -338,7 +338,7 @@ where
             }
 
             if was_paused {
-                self.game_instances[0].open_rlviser();
+                self.game_instances[0].open_rlviser(false);
             }
 
             let policy = self.policy.read().unwrap().clone();
@@ -372,6 +372,7 @@ impl AgentController {
         create_env_fn: F,
         step_callback: C,
         render: bool,
+        try_launch_exe: bool,
     ) -> Self
     where
         F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Send + 'static,
@@ -400,7 +401,7 @@ impl AgentController {
             );
 
             if render {
-                agent.run_render();
+                agent.run_render(try_launch_exe);
             } else {
                 agent.run();
             }

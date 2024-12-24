@@ -90,8 +90,8 @@ where
         self.env.num_cars()
     }
 
-    pub fn open_rlviser(&mut self) {
-        self.env.enable_rendering();
+    pub fn open_rlviser(&mut self, try_launch_exe: bool) {
+        self.env.enable_rendering(try_launch_exe);
     }
 
     pub fn close_rlviser(&mut self) {

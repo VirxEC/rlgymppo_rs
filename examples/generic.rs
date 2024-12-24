@@ -383,8 +383,8 @@ fn main() {
     // let num_threads = NonZeroUsize::new(1).unwrap();
     let num_threads = available_parallelism().unwrap();
     let num_games_per_thread = NonZeroUsize::new(1).unwrap();
-    let mini_batch_size = 25_000;
-    let batch_size = mini_batch_size * 4;
+    let mini_batch_size = 15_000;
+    let batch_size = mini_batch_size * 5;
     let lr = 3e-4;
 
     let config = LearnerConfig {
@@ -396,16 +396,17 @@ fn main() {
         collection_timesteps_overflow: 0,
         check_update_frequency: 15,
         collection_during_learn: false,
+        device: tch::Device::cuda_if_available(),
         ppo: PPOLearnerConfig {
             batch_size,
             mini_batch_size,
             ent_coef: 0.01,
             policy_lr: lr,
             critic_lr: lr,
-            // policy_layer_sizes: vec![512, 512, 512, 512, 512],
-            // critic_layer_sizes: vec![512, 512, 512, 512, 512],
-            policy_layer_sizes: vec![16, 16, 16],
-            critic_layer_sizes: vec![16, 16, 16],
+            policy_layer_sizes: vec![512, 512, 512, 512],
+            critic_layer_sizes: vec![512, 512, 512, 512],
+            // policy_layer_sizes: vec![16, 16, 16],
+            // critic_layer_sizes: vec![16, 16, 16],
             ..Default::default()
         },
         ..Default::default()

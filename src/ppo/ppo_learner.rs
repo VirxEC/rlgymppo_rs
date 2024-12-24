@@ -8,7 +8,7 @@ use std::{
 };
 use tch::{
     nn::{self, OptimizerConfig},
-    no_grad_guard, Device, Kind, Reduction, Tensor,
+    no_grad_guard, with_grad, Device, Kind, Reduction, Tensor,
 };
 
 fn var_store_to_tensor(vs: &nn::VarStore) -> Tensor {
@@ -30,6 +30,7 @@ struct TrainMetrics {
     backprop_time: f64,
     value_est_time: f64,
     gradient_time: f64,
+    backwards_time: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +94,9 @@ impl PPOLearner {
             panic!("Batch size must be divisible by mini batch size");
         }
 
+        println!("Creating varstore for policy");
         let policy_store = nn::VarStore::new(device);
+        println!("Creating policy");
         let policy = DiscretePolicy::new(
             obs_space_size as i64,
             action_space_size as i64,
@@ -101,6 +104,7 @@ impl PPOLearner {
             policy_store.root(),
             device,
         );
+        println!("Creating optimizer");
         let policy_optimizer = nn::Adam::default()
             .build(&policy_store, config.policy_lr)
             .unwrap();
@@ -200,7 +204,7 @@ impl PPOLearner {
                     let mut metrics = TrainMetrics::default();
 
                     let forward_time_start = Instant::now();
-                    let mut vals = self.value_net.forward(&obs, true);
+                    let mut vals = with_grad(|| self.value_net.forward(&obs, true));
                     let forward_time_elapsed = forward_time_start.elapsed();
                     metrics.value_est_time = forward_time_elapsed.as_secs_f64();
 
@@ -208,45 +212,48 @@ impl PPOLearner {
 
                     let mut train_policy_data = None;
                     if train_policy {
-                        // Get policy log probs & entropy
-                        let bp_result = self.policy.get_backprop_data(&obs, &acts);
+                        train_policy_data = Some(with_grad(|| {
+                            // Get policy log probs & entropy
+                            let bp_result = self.policy.get_backprop_data(&obs, &acts);
 
-                        let mut log_probs = bp_result.action_log_probs;
-                        let entropy = bp_result.entropy;
+                            let mut log_probs = bp_result.action_log_probs;
+                            let entropy = bp_result.entropy;
 
-                        log_probs = log_probs.view_as(&old_probs);
+                            log_probs = log_probs.view_as(&old_probs);
 
-                        let backward_time_elapsed = backward_time_start.elapsed();
-                        metrics.backprop_time = backward_time_elapsed.as_secs_f64();
+                            let backward_time_elapsed = backward_time_start.elapsed();
+                            metrics.backprop_time = backward_time_elapsed.as_secs_f64();
 
-                        // Compute PPO loss
-                        let ratio = (&log_probs - &old_probs).exp();
-                        metrics.ratio = ratio
-                            .mean(Kind::Float)
-                            .detach()
-                            .to(Device::Cpu)
-                            .double_value(&[]);
-                        let clipped =
-                            ratio.clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
+                            // Compute PPO loss
+                            let ratio = (&log_probs - &old_probs).exp();
+                            metrics.ratio = ratio
+                                .mean(Kind::Float)
+                                .detach()
+                                .to(Device::Cpu)
+                                .double_value(&[]);
+                            let clipped = ratio
+                                .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
 
-                        // Compute policy loss
-                        let policy_loss = -(&ratio * &advantages)
-                            .minimum(&(&clipped * &advantages))
-                            .mean(Kind::Float);
-                        let ppo_loss =
-                            (&policy_loss - &entropy * self.config.ent_coef) * batch_size_ratio;
-                        metrics.entropy = entropy.detach().to(Device::Cpu).double_value(&[]);
+                            // Compute policy loss
+                            let policy_loss = -(&ratio * &advantages)
+                                .minimum(&(&clipped * &advantages))
+                                .mean(Kind::Float);
 
-                        train_policy_data = Some((log_probs, ratio, ppo_loss));
+                            let ppo_loss =
+                                (&policy_loss - &entropy * self.config.ent_coef) * batch_size_ratio;
+                            metrics.entropy = entropy.detach().to(Device::Cpu).double_value(&[]);
+
+                            (log_probs, ratio, ppo_loss)
+                        }));
                     }
 
                     let mut value_loss = None;
                     if train_critic {
                         // Compute value loss
-                        vals = vals.view_as(&target_values);
-                        value_loss = Some(
-                            vals.mse_loss(&target_values, self.value_loss_fn) * batch_size_ratio,
-                        );
+                        value_loss = Some(with_grad(|| {
+                            vals = vals.view_as(&target_values);
+                            vals.mse_loss(&target_values, self.value_loss_fn) * batch_size_ratio
+                        }));
                     }
 
                     if let Some((log_probs, ratio, _)) = &train_policy_data {
@@ -272,16 +279,23 @@ impl PPOLearner {
                         metrics.clip_fraction = Some(clip_fraction);
                     }
 
-                    if let Some((_, _, ppo_loss)) = train_policy_data {
-                        ppo_loss.backward();
-                    }
+                    let backwards_start = Instant::now();
 
-                    if let Some(value_loss) = value_loss {
-                        value_loss.backward();
-                        metrics.val_loss = value_loss.detach().to(Device::Cpu).double_value(&[]);
-                    }
+                    with_grad(|| {
+                        if let Some((_, _, ppo_loss)) = train_policy_data {
+                            ppo_loss.backward();
+                        }
 
+                        if let Some(value_loss) = &value_loss {
+                            value_loss.backward();
+                            metrics.val_loss =
+                                value_loss.detach().to(Device::Cpu).double_value(&[]);
+                        }
+                    });
+
+                    let backward_time_elapsed = backwards_start.elapsed();
                     let gradient_time_elapsed = backward_time_start.elapsed();
+                    metrics.backwards_time = backward_time_elapsed.as_secs_f64();
                     metrics.gradient_time = gradient_time_elapsed.as_secs_f64();
 
                     metrics
@@ -335,6 +349,7 @@ impl PPOLearner {
                             clip_fractions.push(clip_fraction);
                         }
 
+                        reporter["PPO Backward Time"] += metrics.backwards_time.into();
                         reporter["PPO Backprop Time"] += metrics.backprop_time.into();
                         reporter["PPO Value Estimate Time"] += metrics.value_est_time.into();
                         reporter["PPO Gradient Time"] += metrics.gradient_time.into();

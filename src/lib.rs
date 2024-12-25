@@ -206,10 +206,7 @@ impl Learner {
         };
 
         println!("Creating experience buffer...");
-        let exp_buffer = ExperienceBuffer::new(
-            config.exp_buffer_size,
-            config.random_seed as u64,
-        );
+        let exp_buffer = ExperienceBuffer::new(config.exp_buffer_size, config.random_seed as u64);
 
         println!("Creating learner...");
         let ppo = PPOLearner::new(obs_size, action_size, config.ppo.clone(), config.device);
@@ -443,14 +440,9 @@ impl Learner {
 
         self.exp_buffer.submit_experience(exp_tensors);
 
-        let ppo_learn_start = Instant::now();
-
         self.ppo.learn(&mut self.exp_buffer, report);
         self.agent_mngr.update_policy(self.ppo.get_policy());
         self.total_epochs += u64::from(self.config.ppo.epochs);
-
-        let ppo_learn_elapsed = ppo_learn_start.elapsed();
-        report["PPO learning time"] = ppo_learn_elapsed.as_secs_f64().into();
     }
 }
 

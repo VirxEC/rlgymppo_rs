@@ -94,7 +94,7 @@ impl AgentManager {
                     num_games: 1,
                     max_steps: 0,
                     controls_update_frequency: 1,
-                    device: Device::Cpu,
+                    device: self.agent_config.device,
                 },
                 self.render_controls.clone(),
                 self.policy.clone(),

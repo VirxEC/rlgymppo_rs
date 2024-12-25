@@ -110,7 +110,7 @@ where
             );
         }
 
-        if !render || !self.env.is_paused() {
+        if !(self.env.is_paused() || render) {
             // Update avg rewards
             let num_players = result.rewards.len();
             let total_rew: f64 = result.rewards.iter().sum::<f32>() as f64;

@@ -94,9 +94,7 @@ impl PPOLearner {
             panic!("Batch size must be divisible by mini batch size");
         }
 
-        println!("Creating varstore for policy");
         let policy_store = nn::VarStore::new(device);
-        println!("Creating policy");
         let policy = DiscretePolicy::new(
             obs_space_size as i64,
             action_space_size as i64,
@@ -104,7 +102,7 @@ impl PPOLearner {
             policy_store.root(),
             device,
         );
-        println!("Creating optimizer");
+
         let policy_optimizer = nn::Adam::default()
             .build(&policy_store, config.policy_lr)
             .unwrap();
@@ -302,29 +300,59 @@ impl PPOLearner {
                 };
 
                 if self.device.is_cuda() {
-                    for start in (0..self.config.batch_size as i64)
+                    let mini_batch_size = self.config.mini_batch_size as i64;
+
+                    // Send everything to the device and enforce correct shapes
+                    let mut next_acts = batch_acts
+                        .slice(0, 0, mini_batch_size, 1)
+                        .no_block_to(self.device);
+                    let mut next_obs = batch
+                        .states
+                        .slice(0, 0, mini_batch_size, 1)
+                        .no_block_to(self.device);
+
+                    let mut next_advantages = batch
+                        .advantages
+                        .slice(0, 0, mini_batch_size, 1)
+                        .no_block_to(self.device);
+                    let mut next_old_probs = batch
+                        .log_probs
+                        .slice(0, 0, mini_batch_size, 1)
+                        .no_block_to(self.device);
+                    let mut next_target_values = batch
+                        .values
+                        .slice(0, 0, mini_batch_size, 1)
+                        .no_block_to(self.device);
+
+                    for start in (mini_batch_size..self.config.batch_size as i64)
                         .step_by(self.config.mini_batch_size as usize)
                     {
-                        let stop = start + self.config.mini_batch_size as i64;
+                        let stop = start + mini_batch_size;
                         let batch_size_ratio =
                             (stop - start) as f64 / self.config.batch_size as f64;
 
-                        // Send everything to the device and enforce correct shapes
-                        let acts = batch_acts.slice(0, start, stop, 1).no_block_to(self.device);
-                        let obs = batch
+                        let acts = next_acts;
+                        let obs = next_obs;
+                        let advantages = next_advantages;
+                        let old_probs = next_old_probs;
+                        let target_values = next_target_values;
+
+                        // transfer the next batch to the gpu while the current batch is being processed
+                        next_acts = batch_acts.slice(0, start, stop, 1).no_block_to(self.device);
+                        next_obs = batch
                             .states
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);
 
-                        let advantages = batch
+                        next_advantages = batch
                             .advantages
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);
-                        let old_probs = batch
+                        next_old_probs = batch
                             .log_probs
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);
-                        let target_values = batch
+                        next_target_values = batch
                             .values
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);

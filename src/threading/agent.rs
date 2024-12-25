@@ -343,14 +343,13 @@ where
 
             let policy = self.policy.read().unwrap().clone();
 
-            let cur_obs_on_device =
-                make_games_obs_tensor(&self.game_instances, false).no_block_to(self.config.device);
+            let cur_obs_on_device = make_games_obs_tensor(&self.game_instances[..1], false)
+                .no_block_to(self.config.device);
             let action_results = policy.get_action(&cur_obs_on_device, self.config.deterministic);
             let action_slice =
                 action_results
                     .action
                     .slice(0, 0, self.game_instances[0].num_cars() as i64, 1);
-
             self.game_instances[0].step(tensor_to_i32_vec(&action_slice), true);
         }
 

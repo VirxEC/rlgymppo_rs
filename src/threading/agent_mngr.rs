@@ -6,7 +6,7 @@ use crate::{
     ppo::discrete::DiscretePolicy,
     util::{avg_tracker::AvgTracker, report::Report},
 };
-use rlgym_rs::{
+use rlgym::{
     rocketsim_rs::glam_ext::GameStateA, Action, Env, Obs, Reward, SharedInfoProvider, StateSetter,
     Terminal, Truncate,
 };

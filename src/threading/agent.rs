@@ -7,7 +7,7 @@ use crate::{
     threading::trajectory::TrajectoryTensors,
     util::{compute::NonBlockingTransfer, report::Report},
 };
-use rlgym_rs::{
+use rlgym::{
     rocketsim_rs::glam_ext::GameStateA, Action, Env, FullObs, Obs, Reward, SharedInfoProvider,
     StateSetter, Terminal, Truncate,
 };

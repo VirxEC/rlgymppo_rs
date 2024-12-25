@@ -1,5 +1,5 @@
-use rlgymppo_rs::{
-    rlgym_rs::{
+use rlgymppo::{
+    rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     },
     rocketsim_rs::{
@@ -9,6 +9,7 @@ use rlgymppo_rs::{
         sim::{Arena, CarConfig, CarControls, Team},
     },
     AvgTracker, Learner, LearnerConfig, PPOLearnerConfig, Report,
+    tch::Device
 };
 use std::{num::NonZeroUsize, thread::available_parallelism};
 
@@ -179,7 +180,7 @@ impl Default for MyAction {
         let mut actions_table = Vec::new();
 
         // ground
-        for throttle in [-1.0, 0.0, 1.0] {
+        for throttle in [-1.0, 1.0] {
             for steer in [-1.0, 0.0, 1.0] {
                 for boost in [false, true] {
                     for handbrake in [false, true] {
@@ -203,38 +204,38 @@ impl Default for MyAction {
         }
 
         // aerial
-        for pitch in [-1.0, 0.0, 1.0] {
-            for yaw in [-1.0, 0.0, 1.0] {
-                for roll in [-1.0, 0.0, 1.0] {
-                    for jump in [false, true] {
-                        for boost in [false, true] {
-                            // Only need roll for sideflip
-                            if jump && yaw != 0.0 {
-                                continue;
-                            }
+        // for pitch in [-1.0, 0.0, 1.0] {
+        //     for yaw in [-1.0, 0.0, 1.0] {
+        //         for roll in [-1.0, 0.0, 1.0] {
+        //             for jump in [false, true] {
+        //                 for boost in [false, true] {
+        //                     // Only need roll for sideflip
+        //                     if jump && yaw != 0.0 {
+        //                         continue;
+        //                     }
 
-                            // Duplicate with ground
-                            if pitch == 0.0 && roll == 0.0 && !jump {
-                                continue;
-                            }
+        //                     // Duplicate with ground
+        //                     if pitch == 0.0 && roll == 0.0 && !jump {
+        //                         continue;
+        //                     }
 
-                            // Enable handbrake for potential wavedashes
-                            let handbrake = jump && (pitch != 0.0 || yaw != 0.0 || roll != 0.0);
-                            actions_table.push(CarControls {
-                                throttle: 0.0,
-                                steer: yaw,
-                                boost,
-                                handbrake,
-                                jump,
-                                pitch,
-                                yaw,
-                                roll,
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        //                     // Enable handbrake for potential wavedashes
+        //                     let handbrake = jump && (pitch != 0.0 || yaw != 0.0 || roll != 0.0);
+        //                     actions_table.push(CarControls {
+        //                         throttle: 0.0,
+        //                         steer: yaw,
+        //                         boost,
+        //                         handbrake,
+        //                         jump,
+        //                         pitch,
+        //                         yaw,
+        //                         roll,
+        //                     });
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
 
         Self { actions_table }
     }
@@ -292,6 +293,20 @@ impl Reward<SharedInfo> for CombinedReward {
         }
 
         rewards
+    }
+}
+
+struct DistanceToBall;
+
+impl Reward<SharedInfo> for DistanceToBall {
+    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
+
+    fn get_rewards(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> Vec<f32> {
+        state
+            .cars
+            .iter()
+            .map(|car| -car.state.pos.distance(state.ball.pos) / 12000.)
+            .collect()
     }
 }
 
@@ -365,7 +380,7 @@ fn create_env() -> Env<
         MySharedInfoProvider,
         MyObs,
         MyAction::default(),
-        CombinedReward::new(vec![Box::new(VelocityReward)]),
+        CombinedReward::new(vec![Box::new(VelocityReward), Box::new(DistanceToBall)]),
         MyTerminal,
         MyTruncate,
         SharedInfo::default(),
@@ -382,21 +397,21 @@ fn main() {
 
     // let num_threads = NonZeroUsize::new(1).unwrap();
     let num_threads = available_parallelism().unwrap();
-    let num_games_per_thread = NonZeroUsize::new(12).unwrap();
-    let mini_batch_size = 15_000;
-    let batch_size = mini_batch_size * 5;
+    let num_games_per_thread = NonZeroUsize::new(24).unwrap();
+    let mini_batch_size = 2500;
+    let batch_size = mini_batch_size * 30;
     let lr = 3e-4;
 
     let config = LearnerConfig {
         num_threads,
         num_games_per_thread,
-        render: false,
+        render: true,
         exp_buffer_size: batch_size,
         timesteps_per_save: 10_000_000,
         collection_timesteps_overflow: 0,
         check_update_frequency: 15,
         collection_during_learn: false,
-        device: tch::Device::cuda_if_available(),
+        device: Device::cuda_if_available(),
         ppo: PPOLearnerConfig {
             batch_size,
             mini_batch_size,
@@ -404,8 +419,8 @@ fn main() {
             ent_coef: 0.01,
             policy_lr: lr,
             critic_lr: lr,
-            policy_layer_sizes: vec![512, 512, 512, 512, 512],
-            critic_layer_sizes: vec![512, 512, 512, 512, 512, 512],
+            policy_layer_sizes: vec![256, 256, 256],
+            critic_layer_sizes: vec![256, 256, 256],
             // policy_layer_sizes: vec![16, 16, 16],
             // critic_layer_sizes: vec![16, 16, 16],
             ..Default::default()

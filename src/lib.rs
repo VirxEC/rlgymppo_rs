@@ -5,8 +5,8 @@ mod threading;
 mod util;
 
 pub use ppo::ppo_learner::PPOLearnerConfig;
-pub use rlgym_rs;
-pub use rlgym_rs::rocketsim_rs;
+pub use rlgym;
+pub use rlgym::rocketsim_rs;
 pub use rocketsim_rs::glam_ext::glam;
 pub use tch;
 pub use util::avg_tracker::AvgTracker;
@@ -16,7 +16,7 @@ use ppo::{
     exp_buf::{ExperienceBuffer, ExperienceTensors},
     ppo_learner::PPOLearner,
 };
-use rlgym_rs::{
+use rlgym::{
     rocketsim_rs::glam_ext::GameStateA, Action, Env, Obs, Reward, SharedInfoProvider, StateSetter,
     Terminal, Truncate,
 };

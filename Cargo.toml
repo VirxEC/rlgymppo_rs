@@ -1,11 +1,11 @@
 [package]
-name = "rlgymppo_rs"
+name = "rlgymppo"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 tch = "0.18.1"
-rlgym_rs = { path = "../rlgym_rs" }
+rlgym = { path = "../rlgym_rs" }
 fastrand = "2.1.0"
 ahash = "0.8.11"
 toml = { version = "0.8.19", features = ["preserve_order"] }

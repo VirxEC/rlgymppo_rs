@@ -1,5 +1,5 @@
 use crate::util::{avg_tracker::AvgTracker, report::Report};
-use rlgym_rs::{
+use rlgym::{
     rocketsim_rs::glam_ext::GameStateA, Action, Env, FullObs, Obs, Reward, SharedInfoProvider,
     StateSetter, StepResult, Terminal, Truncate,
 };

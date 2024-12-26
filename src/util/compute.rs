@@ -63,9 +63,8 @@ pub fn gae(
     }
 
     let out_values_list: Vec<f32> = values
-        .iter()
-        .take(values.len() - 1)
-        .zip(adv.iter())
+        .into_iter()
+        .zip(&adv)
         .map(|(v, a)| v + a)
         .collect();
 

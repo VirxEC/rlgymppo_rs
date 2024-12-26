@@ -1,8 +1,6 @@
 use crate::util::{compute::NonBlockingTransfer, sealed::Sealed};
 use tch::{
-    kind::FLOAT_CPU,
-    nn::{self, LinearConfig, ModuleT},
-    Device, Tensor,
+    kind::FLOAT_CPU, nn::{self, LinearConfig, ModuleT}, Device, Kind, Tensor
 };
 
 pub struct ActionResult {
@@ -100,12 +98,12 @@ impl DiscretePolicy {
     }
 
     pub fn get_backprop_data(&self, obs: &Tensor, acts: &Tensor) -> BackpropResult {
-        let acts = acts.to_dtype(tch::Kind::Int64, true, false);
+        let acts = acts.to_dtype(Kind::Int64, true, false);
         let probs = self.get_action_probs(obs, true);
 
         let log_probs = probs.log();
         let action_log_probs = log_probs.gather(-1, &acts, false);
-        let entropy = -(log_probs * probs).sum(None);
+        let entropy = -(log_probs * probs).sum_dim_intlist(-1, false, None);
 
         BackpropResult {
             action_log_probs: action_log_probs.no_block_to(self.device),

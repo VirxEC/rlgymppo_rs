@@ -103,6 +103,10 @@ impl PPOLearner {
             device,
         );
 
+        // print the number of parameters in the policy network
+        let num_params = policy_store.variables().values().map(Tensor::numel).sum::<usize>();
+        println!("\tPolicy network has {num_params} parameters");
+
         let policy_optimizer = nn::Adam::default()
             .build(&policy_store, config.policy_lr)
             .unwrap();
@@ -114,6 +118,10 @@ impl PPOLearner {
             value_store.root(),
             device,
         );
+
+        let num_params = value_store.variables().values().map(Tensor::numel).sum::<usize>();
+        println!("\tCritic network has {num_params} parameters");
+
         let value_optimizer = nn::Adam::default()
             .build(&value_store, config.critic_lr)
             .unwrap();

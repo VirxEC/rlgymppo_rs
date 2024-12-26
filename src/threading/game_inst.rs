@@ -113,7 +113,7 @@ where
         if !(self.env.is_paused() || render) {
             // Update avg rewards
             let num_players = result.rewards.len();
-            let total_rew: f64 = result.rewards.iter().sum::<f32>() as f64;
+            let total_rew = result.rewards.iter().sum::<f32>() as f64;
 
             self.metrics.avg_steps_reward += AvgTracker::new(total_rew, num_players as u64);
             self.cur_episode_reward += total_rew / num_players as f64;

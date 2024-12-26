@@ -73,7 +73,6 @@ pub struct PPOLearner {
     value_optimizer: nn::Optimizer,
     policy_store: nn::VarStore,
     value_store: nn::VarStore,
-    value_loss_fn: Reduction,
     config: PPOLearnerConfig,
     pub cumulative_model_updates: u64,
     device: Device,
@@ -133,7 +132,6 @@ impl PPOLearner {
             value_optimizer,
             policy_store,
             value_store,
-            value_loss_fn: Reduction::Mean,
             config,
             cumulative_model_updates: 0,
             device,
@@ -198,6 +196,7 @@ impl PPOLearner {
 
             for batch in batches {
                 let batch_acts = batch.actions.view([self.config.batch_size as i64, -1]);
+
                 self.policy_optimizer.zero_grad();
                 self.value_optimizer.zero_grad();
 
@@ -240,8 +239,31 @@ impl PPOLearner {
                             let clipped = ratio
                                 .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
 
+                            // Compute KL divergence & clip fraction using SB3 method for reporting
+                            {
+                                let _no_grad = no_grad_guard();
+    
+                                let log_ratio = log_probs - old_probs;
+                                let kl_tensor = (&log_ratio.exp() - 1.0) - &log_ratio;
+                                let kl = kl_tensor
+                                    .mean(Kind::Float)
+                                    .detach()
+                                    .to(Device::Cpu)
+                                    .double_value(&[]);
+                                metrics.divergence = kl;
+    
+                                let clip_fraction = (&ratio - 1.0)
+                                    .abs()
+                                    .gt(self.config.clip_range)
+                                    .to_kind(Kind::Float)
+                                    .mean(None)
+                                    .to(Device::Cpu)
+                                    .double_value(&[]);
+                                metrics.clip_fraction = Some(clip_fraction);
+                            }
+
                             // Compute policy loss
-                            let policy_loss = -(&ratio * &advantages)
+                            let policy_loss = -(ratio * &advantages)
                                 .minimum(&(clipped * advantages))
                                 .mean(None);
 
@@ -249,7 +271,7 @@ impl PPOLearner {
                                 (&policy_loss - &entropy * self.config.ent_coef) * batch_size_ratio;
                             metrics.entropy = entropy.detach().to(Device::Cpu).double_value(&[]);
 
-                            (log_probs, ratio, ppo_loss)
+                            ppo_loss
                         }));
                     }
 
@@ -258,37 +280,14 @@ impl PPOLearner {
                         // Compute value loss
                         value_loss = Some(with_grad(|| {
                             vals = vals.view_as(&target_values);
-                            vals.mse_loss(&target_values, self.value_loss_fn) * batch_size_ratio
+                            vals.mse_loss(&target_values, Reduction::Mean)
                         }));
-                    }
-
-                    if let Some((log_probs, ratio, _)) = &train_policy_data {
-                        // Compute KL divergence & clip fraction using SB3 method for reporting
-                        let _no_grad = no_grad_guard();
-
-                        let log_ratio = log_probs - old_probs;
-                        let kl_tensor = (&log_ratio.exp() - 1.0) - &log_ratio;
-                        let kl = kl_tensor
-                            .mean(Kind::Float)
-                            .detach()
-                            .to(Device::Cpu)
-                            .double_value(&[]);
-                        metrics.divergence = kl;
-
-                        let clip_fraction = (ratio - 1.0)
-                            .abs()
-                            .gt(self.config.clip_range)
-                            .to_kind(Kind::Float)
-                            .mean(Kind::Float)
-                            .to(Device::Cpu)
-                            .double_value(&[]);
-                        metrics.clip_fraction = Some(clip_fraction);
                     }
 
                     let backwards_start = Instant::now();
 
                     with_grad(|| {
-                        if let Some((_, _, ppo_loss)) = train_policy_data {
+                        if let Some(ppo_loss) = train_policy_data {
                             ppo_loss.backward();
                         }
 
@@ -310,58 +309,27 @@ impl PPOLearner {
                 if self.device.is_cuda() {
                     let mini_batch_size = self.config.mini_batch_size as i64;
 
-                    // Send everything to the device and enforce correct shapes
-                    let mut next_acts = batch_acts
-                        .slice(0, 0, mini_batch_size, 1)
-                        .no_block_to(self.device);
-                    let mut next_obs = batch
-                        .states
-                        .slice(0, 0, mini_batch_size, 1)
-                        .no_block_to(self.device);
-
-                    let mut next_advantages = batch
-                        .advantages
-                        .slice(0, 0, mini_batch_size, 1)
-                        .no_block_to(self.device);
-                    let mut next_old_probs = batch
-                        .log_probs
-                        .slice(0, 0, mini_batch_size, 1)
-                        .no_block_to(self.device);
-                    let mut next_target_values = batch
-                        .values
-                        .slice(0, 0, mini_batch_size, 1)
-                        .no_block_to(self.device);
-
-                    for start in (mini_batch_size..self.config.batch_size as i64)
+                    for start in (0..self.config.batch_size as i64)
                         .step_by(self.config.mini_batch_size as usize)
                     {
                         let stop = start + mini_batch_size;
                         let batch_size_ratio =
                             (stop - start) as f64 / self.config.batch_size as f64;
 
-                        let acts = next_acts;
-                        let obs = next_obs;
-                        let advantages = next_advantages;
-                        let old_probs = next_old_probs;
-                        let target_values = next_target_values;
-
-                        // transfer the next batch to the gpu while the current batch is being processed
-                        next_acts = batch_acts.slice(0, start, stop, 1).no_block_to(self.device);
-                        next_obs = batch
+                        let acts = batch_acts.slice(0, start, stop, 1).no_block_to(self.device);
+                        let obs = batch
                             .states
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);
-
-                        next_advantages = batch
+                        let advantages = batch
                             .advantages
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);
-                        next_old_probs = batch
+                        let old_probs = batch
                             .log_probs
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);
-                        next_target_values = batch
-                            .values
+                        let target_values = batch.values
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);
 
@@ -419,8 +387,7 @@ impl PPOLearner {
                                 .log_probs
                                 .slice(0, start, stop, 1)
                                 .no_block_to(self.device);
-                            let target_values = batch
-                                .values
+                            let target_values = batch.values
                                 .slice(0, start, stop, 1)
                                 .no_block_to(self.device);
 
@@ -457,16 +424,22 @@ impl PPOLearner {
                         }
                     })
                 }
-            }
 
-            if train_policy {
-                self.policy_optimizer.clip_grad_norm(0.5);
-                self.policy_optimizer.step();
-            }
+                if train_policy {
+                    self.policy_optimizer.clip_grad_norm(0.5);
+                }
 
-            if train_critic {
-                self.value_optimizer.clip_grad_norm(0.5);
-                self.value_optimizer.step();
+                if train_critic {
+                    self.value_optimizer.clip_grad_norm(0.5);
+                }
+
+                if train_policy {
+                    self.policy_optimizer.step();
+                }
+    
+                if train_critic {
+                    self.value_optimizer.step();
+                }
             }
         }
 

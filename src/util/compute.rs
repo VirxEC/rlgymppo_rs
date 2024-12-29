@@ -62,11 +62,7 @@ pub fn gae(
         adv[step] = last_gae_lam;
     }
 
-    let out_values_list: Vec<f32> = values
-        .into_iter()
-        .zip(&adv)
-        .map(|(v, a)| v + a)
-        .collect();
+    let out_values_list: Vec<f32> = values.into_iter().zip(&adv).map(|(v, a)| v + a).collect();
 
     (
         Tensor::from_slice(&adv),

@@ -1,6 +1,8 @@
 use crate::util::{compute::NonBlockingTransfer, sealed::Sealed};
 use tch::{
-    kind::FLOAT_CPU, nn::{self, LinearConfig, ModuleT}, Device, Kind, Tensor
+    kind::FLOAT_CPU,
+    nn::{self, LinearConfig, ModuleT},
+    Device, Kind, Tensor,
 };
 
 pub struct ActionResult {

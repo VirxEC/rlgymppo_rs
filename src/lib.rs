@@ -280,7 +280,7 @@ impl Learner {
 
             self.agent_mngr.get_metrics(&mut report);
 
-            report["Timesteps Collected"] = timesteps_collected.into();
+            report["Iteration Timesteps Collected"] = timesteps_collected.into();
             report["Overall Steps per Second"] =
                 (self.config.ppo.batch_size as f64 / overall_time_elapsed.as_secs_f64()).into();
             report["Collected Steps per Second"] =

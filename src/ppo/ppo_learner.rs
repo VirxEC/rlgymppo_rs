@@ -103,7 +103,11 @@ impl PPOLearner {
         );
 
         // print the number of parameters in the policy network
-        let num_params = policy_store.variables().values().map(Tensor::numel).sum::<usize>();
+        let num_params = policy_store
+            .variables()
+            .values()
+            .map(Tensor::numel)
+            .sum::<usize>();
         println!("\tPolicy network has {num_params} parameters");
 
         let policy_optimizer = nn::Adam::default()
@@ -118,7 +122,11 @@ impl PPOLearner {
             device,
         );
 
-        let num_params = value_store.variables().values().map(Tensor::numel).sum::<usize>();
+        let num_params = value_store
+            .variables()
+            .values()
+            .map(Tensor::numel)
+            .sum::<usize>();
         println!("\tCritic network has {num_params} parameters");
 
         let value_optimizer = nn::Adam::default()
@@ -242,7 +250,7 @@ impl PPOLearner {
                             // Compute KL divergence & clip fraction using SB3 method for reporting
                             {
                                 let _no_grad = no_grad_guard();
-    
+
                                 let log_ratio = log_probs - old_probs;
                                 let kl_tensor = (&log_ratio.exp() - 1.0) - &log_ratio;
                                 let kl = kl_tensor
@@ -251,7 +259,7 @@ impl PPOLearner {
                                     .to(Device::Cpu)
                                     .double_value(&[]);
                                 metrics.divergence = kl;
-    
+
                                 let clip_fraction = (&ratio - 1.0)
                                     .abs()
                                     .gt(self.config.clip_range)
@@ -284,6 +292,8 @@ impl PPOLearner {
                         }));
                     }
 
+                    let gradient_time_elapsed = backward_time_start.elapsed();
+                    metrics.gradient_time = gradient_time_elapsed.as_secs_f64();
                     let backwards_start = Instant::now();
 
                     with_grad(|| {
@@ -299,9 +309,7 @@ impl PPOLearner {
                     });
 
                     let backward_time_elapsed = backwards_start.elapsed();
-                    let gradient_time_elapsed = backward_time_start.elapsed();
                     metrics.backwards_time = backward_time_elapsed.as_secs_f64();
-                    metrics.gradient_time = gradient_time_elapsed.as_secs_f64();
 
                     metrics
                 };
@@ -329,7 +337,8 @@ impl PPOLearner {
                             .log_probs
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);
-                        let target_values = batch.values
+                        let target_values = batch
+                            .values
                             .slice(0, start, stop, 1)
                             .no_block_to(self.device);
 
@@ -387,7 +396,8 @@ impl PPOLearner {
                                 .log_probs
                                 .slice(0, start, stop, 1)
                                 .no_block_to(self.device);
-                            let target_values = batch.values
+                            let target_values = batch
+                                .values
                                 .slice(0, start, stop, 1)
                                 .no_block_to(self.device);
 
@@ -436,7 +446,7 @@ impl PPOLearner {
                 if train_policy {
                     self.policy_optimizer.step();
                 }
-    
+
                 if train_critic {
                     self.value_optimizer.step();
                 }

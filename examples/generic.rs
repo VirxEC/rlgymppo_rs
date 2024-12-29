@@ -8,8 +8,8 @@ use rlgymppo::{
         init,
         sim::{Arena, CarConfig, CarControls, Team},
     },
+    tch::Device,
     AvgTracker, Learner, LearnerConfig, PPOLearnerConfig, Report,
-    tch::Device
 };
 use std::{num::NonZeroUsize, thread::available_parallelism};
 

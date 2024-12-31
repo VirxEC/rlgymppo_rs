@@ -31,7 +31,7 @@ use tch::{no_grad_guard, Device, IndexOp, Kind, Tensor};
 use threading::{agent_mngr::AgentManager, trajectory::Trajectory};
 use util::{
     compute::{self, NonBlockingTransfer},
-    running_stat::{WStatConfig, WelfordRunningStat},
+    running_stat::WelfordRunningStat,
 };
 
 #[derive(Debug, Clone)]
@@ -154,7 +154,7 @@ pub struct Stats {
     cumulative_timesteps: u64,
     cumulative_model_updates: u64,
     epoch: u64,
-    return_stat: WStatConfig,
+    return_stat: WelfordRunningStat,
     // todo, for wandb metrics reporting
     // run_id: String,
 }
@@ -309,7 +309,7 @@ impl Learner {
         self.total_timesteps = stats.cumulative_timesteps;
         self.ppo.cumulative_model_updates = stats.cumulative_model_updates;
         self.total_epochs = stats.epoch;
-        self.return_stat = stats.return_stat.into();
+        self.return_stat = stats.return_stat;
     }
 
     fn save_stats<P: AsRef<Path>>(&self, path: P) {
@@ -319,7 +319,7 @@ impl Learner {
             cumulative_timesteps: self.total_timesteps,
             cumulative_model_updates: self.ppo.cumulative_model_updates,
             epoch: self.total_epochs,
-            return_stat: self.return_stat.config().clone(),
+            return_stat: self.return_stat,
         };
 
         fs::write(&path, toml::to_string(&stats).unwrap()).unwrap();
@@ -393,7 +393,7 @@ impl Learner {
         let val_preds = tensor_to_f32_vec(&val_preds_tensor);
 
         let ret_std = if self.config.standardize_returns {
-            self.return_stat.get_std()[0]
+            self.return_stat.get_std()
         } else {
             1.0
         };
@@ -423,7 +423,7 @@ impl Learner {
             let num_to_increment = returns
                 .len()
                 .min(self.config.max_returns_per_stats_inc as usize);
-            self.return_stat.increment(&returns, num_to_increment);
+            self.return_stat.increment(returns, num_to_increment);
         }
 
         let exp_tensors = ExperienceTensors {

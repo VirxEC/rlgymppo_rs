@@ -17,6 +17,7 @@ pub struct BackpropResult {
 
 pub struct DiscretePolicy {
     seq: Sealed<nn::SequentialT>,
+    action_size: i64,
     device: Device,
 }
 
@@ -58,10 +59,11 @@ impl DiscretePolicy {
                 output_size,
                 config,
             ))
-            .add_fn(|xs| xs.softmax(-1, tch::Kind::Float));
+            .add_fn(|xs| xs.softmax(-1, Kind::Float));
 
         Self {
             seq: Sealed::new(seq),
+            action_size: output_size,
             device,
         }
     }
@@ -72,7 +74,7 @@ impl DiscretePolicy {
 
     fn get_action_probs(&self, obs: &Tensor, train: bool) -> Tensor {
         let mut probs = self.get_output(obs, train);
-        probs = probs.view((-1i64, probs.size()[1]));
+        probs = probs.view((-1i64, self.action_size));
         probs = probs.clamp(Self::ACTION_MIN_PROB, 1.0);
         probs
     }

@@ -90,7 +90,7 @@ impl AgentManager {
         if create_renderer {
             self.agents.push(AgentController::new(
                 AgentConfig {
-                    deterministic: true,
+                    deterministic: self.agent_config.deterministic,
                     num_games: 1,
                     max_steps: 0,
                     controls_update_frequency: 1,
@@ -102,7 +102,6 @@ impl AgentManager {
                 step_callback.clone(),
                 true,
                 try_launch_exe,
-                // amount,
             ))
         }
     }

@@ -1,4 +1,4 @@
-use crate::util::sealed::Sealed;
+use crate::util::{compute::NonBlockingTransfer, sealed::Sealed};
 use tch::{
     nn::{self, ModuleT},
     Device, Tensor,
@@ -48,6 +48,6 @@ impl ValueEstimator {
     }
 
     pub fn forward(&self, xs: &Tensor, train: bool) -> Tensor {
-        self.seq.forward_t(xs, train).to(self.device)
+        self.seq.forward_t(xs, train).no_block_to(self.device)
     }
 }

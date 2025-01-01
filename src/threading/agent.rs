@@ -181,9 +181,11 @@ where
 
         'outer: loop {
             if since_controls_update == self.config.controls_update_frequency {
+                let mut was_paused = false;
                 while self.controls.paused.load(Ordering::Relaxed)
                     || self.data.steps_collected.load(Ordering::Relaxed) >= self.config.max_steps
                 {
+                    was_paused = true;
                     if !self.controls.should_run.load(Ordering::Relaxed) {
                         break 'outer;
                     }
@@ -191,7 +193,9 @@ where
                     sleep(Duration::from_millis(1));
                 }
 
-                policy = self.policy.read().unwrap().clone();
+                if was_paused {
+                    policy = self.policy.read().unwrap().clone();
+                }
 
                 since_controls_update = 0;
             } else {
@@ -330,15 +334,15 @@ where
                     break 'outer;
                 }
 
-                if !was_paused {
+                if !was_paused && try_launch_exe {
                     self.game_instances[0].close_rlviser();
                 }
                 was_paused = true;
                 sleep(Duration::from_millis(50));
             }
 
-            if was_paused {
-                self.game_instances[0].open_rlviser(false);
+            if try_launch_exe && was_paused {
+                self.game_instances[0].open_rlviser(true);
             }
 
             let policy = self.policy.read().unwrap().clone();
@@ -350,6 +354,7 @@ where
                 action_results
                     .action
                     .slice(0, 0, self.game_instances[0].num_cars() as i64, 1);
+            // action_slice.print();
             self.game_instances[0].step(tensor_to_i32_vec(&action_slice), true);
         }
 

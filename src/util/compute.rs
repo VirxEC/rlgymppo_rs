@@ -23,7 +23,6 @@ pub fn gae(
     clip_range: f32,
 ) -> (Tensor, Tensor, Vec<f32>) {
     let next_values = values.iter().skip(1).copied().collect::<Vec<f32>>();
-    let terminal = &dones;
 
     let mut return_scale = 1.0 / return_std;
     if return_scale.is_nan() {
@@ -38,8 +37,8 @@ pub fn gae(
     let mut last_return = 0.0;
 
     for step in (0..n_returns).rev() {
-        let done = 1.0 - terminal[step];
-        let trunc = 1.0 - truncated[step];
+        let not_done = 1.0 - dones[step];
+        let not_trunc = 1.0 - truncated[step];
 
         let norm_rew = if return_std != 0.0 {
             let mut rew = rews[step] * return_scale;
@@ -53,12 +52,12 @@ pub fn gae(
             rews[step]
         };
 
-        let pred_ret = norm_rew + gamma * next_values[step] * done;
+        let pred_ret = norm_rew + gamma * next_values[step] * not_done;
         let delta = pred_ret - values[step];
-        let ret = rews[step] + last_return * gamma * done * trunc;
+        let ret = rews[step] + last_return * gamma * not_done * not_trunc;
         returns[step] = ret;
         last_return = ret;
-        last_gae_lam = delta + gamma * lambda * done * trunc * last_gae_lam;
+        last_gae_lam = delta + gamma * lambda * not_done * not_trunc * last_gae_lam;
         adv[step] = last_gae_lam;
     }
 

@@ -1,6 +1,8 @@
 use super::{discrete::DiscretePolicy, exp_buf::ExperienceBuffer, value_est::ValueEstimator};
 use crate::util::{compute::NonBlockingTransfer, report::Report};
 use std::{
+    fs::{create_dir, File},
+    io::Write,
     path::Path,
     sync::Arc,
     thread::{self, available_parallelism},
@@ -8,7 +10,7 @@ use std::{
 };
 use tch::{
     nn::{self, OptimizerConfig},
-    no_grad_guard, with_grad, Device, Kind, Reduction, Tensor,
+    no_grad, no_grad_guard, with_grad, Device, Kind, Reduction, Tensor,
 };
 
 fn var_store_to_tensor(vs: &nn::VarStore) -> Tensor {
@@ -18,6 +20,92 @@ fn var_store_to_tensor(vs: &nn::VarStore) -> Tensor {
 
     let tensors: Vec<_> = vars.iter().map(|(_, t)| t.flatten(0, -1)).collect();
     Tensor::cat(&tensors, 0)
+}
+
+pub fn store_vs(vs: &nn::VarStore, file_name: &str) {
+    let mut flat = Vec::new();
+
+    let mut vars: Vec<_> = vs.variables().into_iter().collect();
+    // Ensure deterministic order
+    vars.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    for (_, t) in vars {
+        flat.push(Vec::<f32>::try_from(t.flatten(0, -1)).unwrap());
+    }
+
+    let _ = create_dir("out");
+    let mut file = File::create(format!("out/{}.txt", file_name)).unwrap();
+
+    for tensor in flat {
+        for val in tensor {
+            write!(file, "{} ", val).unwrap();
+        }
+        writeln!(file).unwrap();
+    }
+}
+
+pub fn store_vs_grad(vs: &nn::VarStore, file_name: &str) {
+    let mut flat = Vec::new();
+
+    let mut vars: Vec<_> = vs.variables().into_iter().collect();
+    // Ensure deterministic order
+    vars.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    for (_, t) in vars {
+        let mut grad = t.grad();
+
+        if grad.defined() {
+            grad = t
+                .grad()
+                .to(Device::Cpu)
+                .detach()
+                .ravel()
+                .to_kind(Kind::Float);
+            flat.push(Vec::<f32>::try_from(grad).unwrap());
+        } else {
+            let zeros = Tensor::zeros_like(&t);
+            flat.push(Vec::<f32>::try_from(zeros.ravel()).unwrap());
+        }
+    }
+
+    let _ = create_dir("out");
+    let mut file = File::create(format!("out/{}.txt", file_name)).unwrap();
+
+    for grad in flat {
+        for val in grad {
+            write!(file, "{} ", val).unwrap();
+        }
+        writeln!(file).unwrap();
+    }
+}
+
+#[track_caller]
+pub fn store_t_1d(t: &Tensor, file_name: &str) {
+    let cpu_t = t.to(Device::Cpu).detach().to_kind(Kind::Float);
+
+    let _ = create_dir("out");
+    let mut file = File::create(format!("out/{}.txt", file_name)).unwrap();
+
+    for val in Vec::<f32>::try_from(cpu_t).unwrap() {
+        write!(file, "{:.18} ", val).unwrap();
+    }
+    writeln!(file).unwrap();
+}
+
+#[track_caller]
+pub fn store_t_2d(t: &Tensor, file_name: &str) {
+    let cpu_t = t.to(Device::Cpu).detach();
+
+    let _ = create_dir("out");
+    let mut file = File::create(format!("out/{}.txt", file_name)).unwrap();
+
+    for row in 0..cpu_t.size()[0] {
+        let row = cpu_t.get(row);
+        for val in Vec::<f32>::try_from(row).unwrap() {
+            write!(file, "{:.18} ", val).unwrap();
+        }
+        writeln!(file).unwrap();
+    }
 }
 
 #[derive(Default)]
@@ -248,9 +336,7 @@ impl PPOLearner {
                                 .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
 
                             // Compute KL divergence & clip fraction using SB3 method for reporting
-                            {
-                                let _no_grad = no_grad_guard();
-
+                            no_grad(|| {
                                 let log_ratio = log_probs - old_probs;
                                 let kl_tensor = (&log_ratio.exp() - 1.0) - &log_ratio;
                                 let kl = kl_tensor
@@ -268,7 +354,7 @@ impl PPOLearner {
                                     .to(Device::Cpu)
                                     .double_value(&[]);
                                 metrics.clip_fraction = Some(clip_fraction);
-                            }
+                            });
 
                             // Compute policy loss
                             let policy_loss = -(ratio * &advantages)
@@ -324,23 +410,36 @@ impl PPOLearner {
                         let batch_size_ratio =
                             (stop - start) as f64 / self.config.batch_size as f64;
 
-                        let acts = batch_acts.slice(0, start, stop, 1).no_block_to(self.device);
-                        let obs = batch
-                            .states
-                            .slice(0, start, stop, 1)
-                            .no_block_to(self.device);
-                        let advantages = batch
-                            .advantages
-                            .slice(0, start, stop, 1)
-                            .no_block_to(self.device);
-                        let old_probs = batch
-                            .log_probs
-                            .slice(0, start, stop, 1)
-                            .no_block_to(self.device);
-                        let target_values = batch
-                            .values
-                            .slice(0, start, stop, 1)
-                            .no_block_to(self.device);
+                        let acts = batch_acts.slice(0, start, stop, 1).to_device_(
+                            self.device,
+                            Kind::Float,
+                            true,
+                            true,
+                        );
+                        let obs = batch.states.slice(0, start, stop, 1).to_device_(
+                            self.device,
+                            Kind::Float,
+                            true,
+                            true,
+                        );
+                        let advantages = batch.advantages.slice(0, start, stop, 1).to_device_(
+                            self.device,
+                            Kind::Float,
+                            true,
+                            true,
+                        );
+                        let old_probs = batch.log_probs.slice(0, start, stop, 1).to_device_(
+                            self.device,
+                            Kind::Float,
+                            true,
+                            true,
+                        );
+                        let target_values = batch.values.slice(0, start, stop, 1).to_device_(
+                            self.device,
+                            Kind::Float,
+                            true,
+                            true,
+                        );
 
                         let metrics = run_minibatch(
                             batch_size_ratio,

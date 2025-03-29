@@ -107,7 +107,7 @@ impl DiscretePolicy {
 
         let log_probs = probs.log();
         let action_log_probs = log_probs.gather(-1, &acts, false);
-        let entropy = -(log_probs * probs).sum_dim_intlist(-1, false, None);
+        let entropy = (-log_probs * probs).sum_dim_intlist(-1, false, None);
 
         BackpropResult {
             action_log_probs: action_log_probs.no_block_to(self.device),

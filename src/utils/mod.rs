@@ -4,11 +4,13 @@ mod report;
 pub use avg_tracker::AvgTracker;
 pub use report::{Report, Reportable};
 
-use burn::LearningRate;
-use burn::module::AutodiffModule;
-use burn::optim::{GradientsParams, Optimizer};
-use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Tensor, TensorData, Transaction};
+use burn::{
+    LearningRate,
+    module::AutodiffModule,
+    optim::{GradientsParams, Optimizer},
+    prelude::*,
+    tensor::{Transaction, backend::AutodiffBackend},
+};
 use rand::{
     Rng,
     distr::{Distribution, weighted::WeightedIndex},

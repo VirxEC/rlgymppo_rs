@@ -1,5 +1,4 @@
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::prelude::*;
 use itertools::izip;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 

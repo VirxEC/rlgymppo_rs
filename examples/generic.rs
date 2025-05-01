@@ -2,7 +2,7 @@
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rlgymppo::{
-    agent::{PPO, config::PPOTrainingConfig, net::Actic},
+    agent::{PPO, config::PPOTrainingConfig, model::Actic},
     environment::rsim::GameInstance,
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
@@ -449,12 +449,12 @@ fn main() {
     run::<Autodiff<Vulkan>>();
 }
 
-use burn::tensor::backend::AutodiffBackend;
 use burn::{
     backend::{Autodiff, Vulkan},
-    module::AutodiffModule,
+    module::{AutodiffModule, ModuleDisplayDefault},
+    optim::AdamConfig,
+    tensor::backend::AutodiffBackend,
 };
-use burn::{module::ModuleDisplayDefault, optim::AdamConfig};
 use rlgymppo::base::Memory;
 
 pub fn run<B: AutodiffBackend>() {

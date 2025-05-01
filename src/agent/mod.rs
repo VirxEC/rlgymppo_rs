@@ -1,20 +1,21 @@
 pub mod config;
 pub mod model;
-pub mod net;
 
-use crate::agent::config::PPOTrainingConfig;
-use crate::agent::model::PPOOutput;
-use crate::base::{Memory, MemoryIndices, Model, get_action_batch, get_batch_1d, get_states_batch};
-use crate::utils::{
-    elementwise_min, sample_actions_from_tensor, to_state_tensor_2d, update_parameters,
+use crate::{
+    agent::{
+        config::PPOTrainingConfig,
+        model::{Actic, Net, PPOOutput},
+    },
+    base::{Memory, MemoryIndices, get_action_batch, get_batch_1d, get_states_batch},
+    utils::{elementwise_min, sample_actions_from_tensor, to_state_tensor_2d, update_parameters},
 };
-use burn::nn::loss::{MseLoss, Reduction};
-use burn::optim::Optimizer;
-use burn::tensor::Tensor;
-use burn::tensor::backend::{AutodiffBackend, Backend};
-use net::{Actic, Net};
-use rand::Rng;
-use rand::seq::SliceRandom;
+use burn::{
+    nn::loss::{MseLoss, Reduction},
+    optim::Optimizer,
+    prelude::*,
+    tensor::backend::AutodiffBackend,
+};
+use rand::{Rng, seq::SliceRandom};
 use std::marker::PhantomData;
 
 pub struct PPO<B: Backend> {

@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use rand::{Rng, SeedableRng, rngs::ThreadRng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rlgymppo::{
     agent::{PPO, config::PPOTrainingConfig, net::Actic},
     environment::rsim::GameInstance,
@@ -18,7 +18,7 @@ use rlgymppo::{
 use std::{mem, num::NonZeroUsize, thread::available_parallelism, time::Instant};
 
 struct SharedInfo {
-    rng: ThreadRng,
+    rng: SmallRng,
     avg_dist_to_ball: AvgTracker,
     avg_vel: AvgTracker,
 }
@@ -26,7 +26,7 @@ struct SharedInfo {
 impl Default for SharedInfo {
     fn default() -> Self {
         Self {
-            rng: rand::rng(),
+            rng: SmallRng::from_os_rng(),
             avg_dist_to_ball: AvgTracker::default(),
             avg_vel: AvgTracker::default(),
         }
@@ -63,7 +63,6 @@ impl StateSetter<SharedInfo> for MyStateSetter {
 
         // random game mode, 1v1, 2v2, or 3v3
         let octane = CarConfig::octane();
-        // for _ in 0..shared_info.rng.random_range(1u8..4) {
         for _ in 0..2 {
             let _ = arena.pin_mut().add_car(Team::Blue, octane);
             let _ = arena.pin_mut().add_car(Team::Orange, octane);
@@ -341,8 +340,7 @@ struct MyTerminal {
 
 impl Terminal<SharedInfo> for MyTerminal {
     fn reset(&mut self, _initial_state: &GameStateA, shared_info: &mut SharedInfo) {
-        // self.episode_duration = shared_info.rng.random_range(2.0..5.0);
-        self.episode_duration = 2.0;
+        self.episode_duration = shared_info.rng.random_range(2.0..5.0);
     }
 
     fn is_terminal(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> bool {
@@ -451,12 +449,12 @@ fn main() {
     run::<Autodiff<Vulkan>>();
 }
 
-use burn::optim::AdamConfig;
 use burn::tensor::backend::AutodiffBackend;
 use burn::{
     backend::{Autodiff, Vulkan},
     module::AutodiffModule,
 };
+use burn::{module::ModuleDisplayDefault, optim::AdamConfig};
 use rlgymppo::base::Memory;
 
 pub fn run<B: AutodiffBackend>() {
@@ -470,13 +468,11 @@ pub fn run<B: AutodiffBackend>() {
 
     let device = B::Device::default();
     let mut rng = rand::rngs::SmallRng::from_os_rng();
-    let mut model = Actic::<B>::new(
-        obs_space,
-        action_space,
-        vec![256, 256, 256, 256],
-        vec![256, 256, 256, 256],
-        &device,
-    );
+    let mut model = Actic::<B>::new(obs_space, action_space, vec![256], vec![256], &device);
+
+    println!("# parameters in actor: {}", model.actor.num_params());
+    println!("# parameters in critic: {}", model.critic.num_params());
+
     let config = PPOTrainingConfig::default();
 
     let mut policy_optimizer = AdamConfig::new()
@@ -497,8 +493,7 @@ pub fn run<B: AutodiffBackend>() {
         let mut episode_done = false;
         let (mut state, mut obs) = game.reset();
         while !episode_done {
-            let actions =
-                PPO::<B::InnerBackend>::react_with_model(&obs, &model_no_grad, &mut rng, &device);
+            let actions = PPO::<B::InnerBackend>::react(&obs, &model_no_grad, &mut rng, &device);
             let result = game.step(&state, &actions);
 
             let old_obs = mem::replace(&mut obs, result.obs);

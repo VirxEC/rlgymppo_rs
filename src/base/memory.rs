@@ -1,5 +1,5 @@
 use burn::tensor::backend::Backend;
-use burn::tensor::{BasicOps, Tensor, TensorKind};
+use burn::tensor::{Int, Tensor, TensorData};
 use itertools::izip;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 
@@ -13,20 +13,32 @@ pub fn get_batch_1d<T: Copy>(data: &AllocRingBuffer<T>, indices: &MemoryIndices)
         .collect::<Vec<_>>()
 }
 
-pub fn get_batch<B: Backend, T, K: TensorKind<B> + BasicOps<B>>(
-    data: &AllocRingBuffer<T>,
+pub fn get_states_batch<B: Backend>(
+    data: &AllocRingBuffer<Vec<f32>>,
     indices: &[usize],
-    converter: impl Fn(&T) -> Tensor<B, 1, K>,
-) -> Tensor<B, 2, K> {
-    Tensor::cat(
-        indices
-            .iter()
-            .filter_map(|i| data.get(*i))
-            .map(converter)
-            .collect::<Vec<_>>(),
-        0,
-    )
-    .reshape([indices.len() as i32, -1])
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let shape = [indices.len(), data.get(0).unwrap().len()];
+    let mut states: Vec<f32> = Vec::with_capacity(shape[0] * shape[1]);
+    for i in indices {
+        states.extend(data.get(*i).unwrap());
+    }
+
+    Tensor::from_data(TensorData::new(states, shape), device)
+}
+
+pub fn get_action_batch<B: Backend>(
+    data: &AllocRingBuffer<usize>,
+    indices: &[usize],
+    device: &B::Device,
+) -> Tensor<B, 2, Int> {
+    let shape = [indices.len(), 1];
+    let mut states: Vec<u32> = Vec::with_capacity(shape[0] * shape[1]);
+    for i in indices {
+        states.push(*data.get(*i).unwrap() as u32);
+    }
+
+    Tensor::from_data(TensorData::new(states, shape), device)
 }
 
 pub struct Memory {

@@ -4,14 +4,14 @@ pub mod net;
 
 use crate::agent::config::PPOTrainingConfig;
 use crate::agent::model::PPOOutput;
-use crate::base::{Memory, MemoryIndices, Model, get_batch, get_batch_1d};
+use crate::base::{Memory, MemoryIndices, Model, get_action_batch, get_batch_1d, get_states_batch};
 use crate::utils::{
     elementwise_min, sample_actions_from_tensor, to_state_tensor_2d, update_parameters,
 };
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::optim::Optimizer;
+use burn::tensor::Tensor;
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Int, Tensor};
 use net::{Actic, Net};
 use rand::Rng;
 use rand::seq::SliceRandom;
@@ -22,7 +22,7 @@ pub struct PPO<B: Backend> {
 }
 
 impl<B: Backend> PPO<B> {
-    pub fn react_with_model<R: Rng>(
+    pub fn react<R: Rng>(
         state: &[Vec<f32>],
         model: &Actic<B>,
         rng: &mut R,
@@ -46,9 +46,7 @@ impl<B: AutodiffBackend> PPO<B> {
         let PPOOutput {
             policies: mut old_polices,
             values: mut old_values,
-        } = net.forward(get_batch(memory.states(), &memory_indices, |v| {
-            Tensor::<B, 1>::from_floats(v.as_slice(), device)
-        }));
+        } = net.forward(get_states_batch(memory.states(), &memory_indices, device));
         old_polices = old_polices.detach();
         old_values = old_values.detach();
 
@@ -75,12 +73,8 @@ impl<B: AutodiffBackend> PPO<B> {
 
                 let sample_indices_tensor = Tensor::from_ints(sample_indices, device);
 
-                let state_batch = get_batch(memory.states(), sample_indices, |v| {
-                    Tensor::<B, 1>::from_floats(v.as_slice(), device)
-                });
-                let action_batch = get_batch(memory.actions(), sample_indices, |v| {
-                    Tensor::<B, 1, Int>::from_ints([*v], device)
-                });
+                let state_batch = get_states_batch(memory.states(), sample_indices, device);
+                let action_batch = get_action_batch(memory.actions(), sample_indices, device);
                 let old_policy_batch = old_polices.clone().select(0, sample_indices_tensor.clone());
                 let advantage_batch = advantages.clone().select(0, sample_indices_tensor.clone());
                 let expected_return_batch = expected_returns

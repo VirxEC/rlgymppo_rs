@@ -11,6 +11,7 @@ toml = { version = "0.8.19", features = ["preserve_order"] }
 serde = { version = "1.0.208", features = ["derive"] }
 ringbuffer = "0.15.0"
 rand = "0.9.1"
+itertools = "0.14.0"
 
 [features]
 default = ["burn/ndarray", "burn/vulkan"]

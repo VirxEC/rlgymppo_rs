@@ -18,7 +18,7 @@ impl Default for PPOTrainingConfig {
             gamma: 0.99,
             lambda: 0.95,
             clip_range: 0.2,
-            entropy_coeff: 0.005,
+            entropy_coeff: 0.01,
             learning_rate: 3e-4,
             epochs: 2,
             batch_size: 50_000,

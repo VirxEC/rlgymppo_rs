@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use rand::{Rng, SeedableRng, rngs::ThreadRng};
 use rlgymppo::{
     agent::{PPO, config::PPOTrainingConfig, net::Actic},
@@ -13,7 +15,7 @@ use rlgymppo::{
     },
     utils::{AvgTracker, Report},
 };
-use std::{num::NonZeroUsize, thread::available_parallelism, time::Instant};
+use std::{mem, num::NonZeroUsize, thread::available_parallelism, time::Instant};
 
 struct SharedInfo {
     rng: ThreadRng,
@@ -449,9 +451,12 @@ fn main() {
     run::<Autodiff<Vulkan>>();
 }
 
-use burn::backend::{Autodiff, Vulkan};
 use burn::optim::AdamConfig;
 use burn::tensor::backend::AutodiffBackend;
+use burn::{
+    backend::{Autodiff, Vulkan},
+    module::AutodiffModule,
+};
 use rlgymppo::base::Memory;
 
 pub fn run<B: AutodiffBackend>() {
@@ -487,23 +492,27 @@ pub fn run<B: AutodiffBackend>() {
     loop {
         let start = Instant::now();
 
+        let model_no_grad = model.valid();
+
         let mut episode_done = false;
         let (mut state, mut obs) = game.reset();
         while !episode_done {
-            let actions = PPO::<B>::react_with_model(&obs, &model, &mut rng, &device);
+            let actions =
+                PPO::<B::InnerBackend>::react_with_model(&obs, &model_no_grad, &mut rng, &device);
             let result = game.step(&state, &actions);
 
+            let old_obs = mem::replace(&mut obs, result.obs);
+
             memory.push_batch(
+                old_obs,
                 &obs,
-                &result.obs,
-                &actions,
+                actions,
                 result.rewards,
                 result.is_terminal,
                 result.truncated,
             );
 
             state = result.state;
-            obs = result.obs;
             episode_done = result.is_terminal || result.truncated;
         }
 

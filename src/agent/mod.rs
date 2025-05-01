@@ -4,10 +4,9 @@ pub mod net;
 
 use crate::agent::config::PPOTrainingConfig;
 use crate::agent::model::PPOOutput;
-use crate::base::{Agent, Memory, MemoryIndices, Model, get_batch, get_batch_1d};
+use crate::base::{Memory, MemoryIndices, Model, get_batch, get_batch_1d};
 use crate::utils::{
-    elementwise_min, sample_action_from_tensor, sample_actions_from_tensor, to_state_tensor_2d,
-    update_parameters,
+    elementwise_min, sample_actions_from_tensor, to_state_tensor_2d, update_parameters,
 };
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::optim::Optimizer;
@@ -19,17 +18,7 @@ use rand::seq::SliceRandom;
 use std::marker::PhantomData;
 
 pub struct PPO<B: Backend> {
-    model: Actic<B>,
     backend: PhantomData<B>,
-}
-
-impl<B: Backend> Agent<B> for PPO<B> {
-    fn react(&self, state: &[f32], device: &B::Device) -> usize {
-        sample_action_from_tensor::<B>(
-            self.model
-                .infer(Tensor::<B, 1>::from_floats(state, device).unsqueeze()),
-        )
-    }
 }
 
 impl<B: Backend> PPO<B> {

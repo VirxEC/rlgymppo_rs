@@ -9,8 +9,10 @@ use burn::module::AutodiffModule;
 use burn::optim::{GradientsParams, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Tensor, TensorData, Transaction};
-use rand::distr::{Distribution, weighted::WeightedIndex};
-use rand::{Rng, rng};
+use rand::{
+    Rng,
+    distr::{Distribution, weighted::WeightedIndex},
+};
 
 pub(crate) fn to_state_tensor_2d<B: Backend>(
     state: &[Vec<f32>],
@@ -24,20 +26,12 @@ pub(crate) fn to_state_tensor_2d<B: Backend>(
     Tensor::from_data(TensorData::new(data, [state.len(), state[0].len()]), device)
 }
 
-pub(crate) fn sample_action_from_tensor<B: Backend>(output: Tensor<B, 2>) -> usize {
-    let prob = output.into_data().into_vec::<f32>().unwrap();
-    let dist = WeightedIndex::new(prob).unwrap();
-
-    let mut rng = rng();
-    dist.sample(&mut rng)
-}
-
 pub(crate) fn sample_actions_from_tensor<B: Backend, R: Rng>(
     output: Tensor<B, 2>,
     rng: &mut R,
 ) -> Vec<usize> {
     let num_actions = output.shape().dims[0];
-    
+
     let mut transaction = Transaction::default();
     for data in output.iter_dim(0) {
         transaction = transaction.register(data);

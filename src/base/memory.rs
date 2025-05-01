@@ -1,5 +1,6 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{BasicOps, Tensor, TensorKind};
+use itertools::izip;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 
 pub type MemoryIndices = Vec<usize>;
@@ -76,23 +77,27 @@ impl Memory {
 
     pub fn push_batch(
         &mut self,
-        state: &[Vec<f32>],
+        state: Vec<Vec<f32>>,
         next_state: &[Vec<f32>],
-        action: &[usize],
+        action: Vec<usize>,
         reward: Vec<f32>,
         done: bool,
         truncated: bool,
     ) {
-        let n = state.len();
-        assert_eq!(n, next_state.len());
-        assert_eq!(n, action.len());
-        assert_eq!(n, reward.len());
-        for i in 0..n {
+        #[cfg(debug_assertions)]
+        {
+            let n = state.len();
+            assert_eq!(n, next_state.len());
+            assert_eq!(n, action.len());
+            assert_eq!(n, reward.len());
+        }
+
+        for (i, (state, action, reward)) in izip!(state, action, reward).enumerate() {
             self.push(
-                state[i].clone(),
+                state,
                 next_state[i].clone(),
-                action[i],
-                reward[i],
+                action,
+                reward,
                 done,
                 truncated,
             );

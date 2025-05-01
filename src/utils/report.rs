@@ -3,8 +3,7 @@ use std::{
     fmt,
     ops::{AddAssign, Index, IndexMut},
 };
-
-use crate::AvgTracker;
+use crate::utils::AvgTracker;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Reportable {

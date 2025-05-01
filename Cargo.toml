@@ -4,12 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tch = "0.18.1"
+burn = { version = "0.17.0", features = ["autodiff", "fusion"] }
 rlgym = { path = "../rlgym_rs" }
-fastrand = "2.1.0"
 ahash = "0.8.11"
 toml = { version = "0.8.19", features = ["preserve_order"] }
 serde = { version = "1.0.208", features = ["derive"] }
+ringbuffer = "0.15.0"
+rand = "0.9.1"
+
+[features]
+default = ["burn/rocm", "burn/ndarray"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 lto = true

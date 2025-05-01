@@ -1,4 +1,10 @@
+use rand::{Rng, rngs::ThreadRng};
 use rlgymppo::{
+    agent::{
+        config::PPOTrainingConfig, model::{PPOModel, PPOOutput}, PPO
+    },
+    base::Agent,
+    environment::rsim::GameInstance,
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     },
@@ -8,13 +14,12 @@ use rlgymppo::{
         init,
         sim::{Arena, CarConfig, CarControls, Team},
     },
-    tch::Device,
-    AvgTracker, Learner, LearnerConfig, PPOLearnerConfig, Report,
+    utils::{AvgTracker, Report},
 };
 use std::{num::NonZeroUsize, thread::available_parallelism};
 
 struct SharedInfo {
-    rng: fastrand::Rng,
+    rng: ThreadRng,
     avg_dist_to_ball: AvgTracker,
     avg_vel: AvgTracker,
 }
@@ -22,7 +27,7 @@ struct SharedInfo {
 impl Default for SharedInfo {
     fn default() -> Self {
         Self {
-            rng: fastrand::Rng::new(),
+            rng: rand::rng(),
             avg_dist_to_ball: AvgTracker::default(),
             avg_vel: AvgTracker::default(),
         }
@@ -59,19 +64,19 @@ impl StateSetter<SharedInfo> for MyStateSetter {
 
         // random game mode, 1v1, 2v2, or 3v3
         let octane = CarConfig::octane();
-        for _ in 0..shared_info.rng.u8(1..4) {
+        for _ in 0..shared_info.rng.random_range(1u8..4) {
             let _ = arena.pin_mut().add_car(Team::Blue, octane);
             let _ = arena.pin_mut().add_car(Team::Orange, octane);
         }
 
         arena
             .pin_mut()
-            .reset_to_random_kickoff(Some(shared_info.rng.i32(-1000..1000)));
+            .reset_to_random_kickoff(Some(shared_info.rng.random_range(-1000..1000)));
 
         let mut state = arena.pin_mut().get_game_state();
         for car in &mut state.cars {
-            car.state.vel.x = (shared_info.rng.f32() * 2. - 1.) * 1300.;
-            car.state.vel.y = (shared_info.rng.f32() * 2. - 1.) * 1300.;
+            car.state.vel.x = shared_info.rng.random_range(-1300.0..1300.0);
+            car.state.vel.y = shared_info.rng.random_range(-1300.0..1300.0);
         }
         arena.pin_mut().set_game_state(&state).unwrap();
     }
@@ -173,6 +178,7 @@ impl Obs<SharedInfo> for MyObs {
 
 struct MyAction {
     actions_table: Vec<CarControls>,
+    action_buffer: [(u32, CarControls); 8],
 }
 
 impl Default for MyAction {
@@ -237,12 +243,15 @@ impl Default for MyAction {
         //     }
         // }
 
-        Self { actions_table }
+        Self {
+            actions_table,
+            action_buffer: Default::default(),
+        }
     }
 }
 
 impl Action<SharedInfo> for MyAction {
-    type Input = Vec<i32>;
+    type Input = usize;
 
     fn get_tick_skip() -> u32 {
         8
@@ -256,15 +265,15 @@ impl Action<SharedInfo> for MyAction {
 
     fn parse_actions(
         &mut self,
-        actions: Self::Input,
-        _state: &GameStateA,
+        actions: &[usize],
+        state: &GameStateA,
         _shared_info: &mut SharedInfo,
-    ) -> Vec<CarControls> {
-        actions
-            .into_iter()
-            // .map(|action| dbg!(self.actions_table[dbg!(action) as usize]))
-            .map(|action| self.actions_table[action as usize])
-            .collect()
+    ) -> &[(u32, CarControls)] {
+        for ((buf, car), action) in self.action_buffer.iter_mut().zip(&state.cars).zip(actions) {
+            *buf = (car.id, self.actions_table[*action]);
+        }
+
+        &self.action_buffer[..state.cars.len()]
     }
 }
 
@@ -324,16 +333,21 @@ impl Reward<SharedInfo> for VelocityReward {
     }
 }
 
-struct MyTerminal;
+#[derive(Default)]
+struct MyTerminal {
+    episode_duration: f32,
+}
 
 impl Terminal<SharedInfo> for MyTerminal {
-    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
+    fn reset(&mut self, _initial_state: &GameStateA, shared_info: &mut SharedInfo) {
+        self.episode_duration = shared_info.rng.random_range(0.0..5.0);
+    }
 
     fn is_terminal(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> bool {
-        let elapsed = state.tick_count as f32 / state.tick_rate / 60.0;
+        let elapsed = state.tick_count as f32 / state.tick_rate / 120.0;
 
         // reset after some minutes
-        if elapsed < 2.0 {
+        if elapsed < self.episode_duration {
             return false;
         }
 
@@ -381,7 +395,7 @@ fn create_env() -> Env<
         MyObs,
         MyAction::default(),
         CombinedReward::new(vec![Box::new(VelocityReward), Box::new(DistanceToBall)]),
-        MyTerminal,
+        MyTerminal::default(),
         MyTruncate,
         SharedInfo::default(),
     )
@@ -396,40 +410,148 @@ fn main() {
     init(None, true);
 
     // let num_threads = NonZeroUsize::new(1).unwrap();
-    let num_threads = available_parallelism().unwrap();
-    let num_games_per_thread = NonZeroUsize::new(24).unwrap();
-    let mini_batch_size = 2500;
-    let batch_size = mini_batch_size * 30;
-    let lr = 3e-4;
+    // let num_threads = available_parallelism().unwrap();
+    // let num_games_per_thread = NonZeroUsize::new(24).unwrap();
+    // let mini_batch_size = 2500;
+    // let batch_size = mini_batch_size * 30;
+    // let lr = 3e-4;
 
-    let config = LearnerConfig {
-        num_threads,
-        num_games_per_thread,
-        render: true,
-        exp_buffer_size: batch_size,
-        timesteps_per_save: 10_000_000,
-        collection_timesteps_overflow: 0,
-        check_update_frequency: 15,
-        collection_during_learn: false,
-        device: Device::cuda_if_available(),
-        ppo: PPOLearnerConfig {
-            batch_size,
-            mini_batch_size,
-            epochs: 3,
-            ent_coef: 0.01,
-            policy_lr: lr,
-            critic_lr: lr,
-            policy_layer_sizes: vec![256, 256, 256],
-            critic_layer_sizes: vec![256, 256, 256],
-            // policy_layer_sizes: vec![16, 16, 16],
-            // critic_layer_sizes: vec![16, 16, 16],
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    // let config = LearnerConfig {
+    //     num_threads,
+    //     num_games_per_thread,
+    //     render: true,
+    //     exp_buffer_size: batch_size,
+    //     timesteps_per_save: 10_000_000,
+    //     collection_timesteps_overflow: 0,
+    //     check_update_frequency: 15,
+    //     collection_during_learn: false,
+    //     device: Device::cuda_if_available(),
+    //     ppo: PPOLearnerConfig {
+    //         batch_size,
+    //         mini_batch_size,
+    //         epochs: 3,
+    //         ent_coef: 0.01,
+    //         policy_lr: lr,
+    //         critic_lr: lr,
+    //         policy_layer_sizes: vec![256, 256, 256],
+    //         critic_layer_sizes: vec![256, 256, 256],
+    //         // policy_layer_sizes: vec![16, 16, 16],
+    //         // critic_layer_sizes: vec![16, 16, 16],
+    //         ..Default::default()
+    //     },
+    //     ..Default::default()
+    // };
 
-    let mut learner = Learner::new(create_env, step_callback, config);
-    learner.load();
-    learner.learn();
-    learner.save();
+    // let mut learner = Learner::new(create_env, step_callback, config);
+    // learner.load();
+    // learner.learn();
+    // learner.save();
+    // let _agent = run::<Autodiff<Rocm>>(512);
+    let _agent = run::<Autodiff<NdArray>>(512);
+}
+
+use burn::nn::{Initializer, Linear, LinearConfig};
+use burn::optim::AdamConfig;
+use burn::tensor::Tensor;
+use burn::tensor::activation::{relu, softmax};
+use burn::tensor::backend::{AutodiffBackend, Backend};
+use burn::{
+    backend::{Autodiff, NdArray, Rocm},
+    module::Module,
+};
+use rlgymppo::base::{Memory, Model};
+
+#[derive(Module, Debug)]
+pub struct Net<B: Backend> {
+    linear: Linear<B>,
+    linear_actor: Linear<B>,
+    linear_critic: Linear<B>,
+}
+
+impl<B: Backend> Net<B> {
+    pub fn new(input_size: usize, dense_size: usize, output_size: usize) -> Self {
+        let initializer = Initializer::XavierUniform { gain: 1.0 };
+        let device = B::Device::default();
+
+        Self {
+            linear: LinearConfig::new(input_size, dense_size)
+                .with_initializer(initializer.clone())
+                .init(&device),
+            linear_actor: LinearConfig::new(dense_size, output_size)
+                .with_initializer(initializer.clone())
+                .init(&device),
+            linear_critic: LinearConfig::new(dense_size, 1)
+                .with_initializer(initializer)
+                .init(&device),
+        }
+    }
+}
+
+impl<B: Backend> Model<B, Tensor<B, 2>, PPOOutput<B>, Tensor<B, 2>> for Net<B> {
+    fn forward(&self, input: Tensor<B, 2>) -> PPOOutput<B> {
+        let layer_0_output = relu(self.linear.forward(input));
+        let policies = softmax(self.linear_actor.forward(layer_0_output.clone()), 1);
+        let values = self.linear_critic.forward(layer_0_output);
+
+        PPOOutput::<B>::new(policies, values)
+    }
+
+    fn infer(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let layer_0_output = relu(self.linear.forward(input));
+        softmax(self.linear_actor.forward(layer_0_output), 1)
+    }
+}
+
+impl<B: Backend> PPOModel<B> for Net<B> {}
+
+type MyAgent<B> = PPO<B, Net<B>>;
+
+pub fn run<B: AutodiffBackend>(num_episodes: usize) -> impl Agent {
+    let env = create_env();
+    let obs_space = env.get_obs_space();
+    dbg!(obs_space);
+    let action_space = env.get_action_space();
+    dbg!(action_space);
+
+    let mut game = GameInstance::new(env, step_callback);
+
+    let mut rng = rand::rng();
+    let mut model = Net::<B>::new(obs_space, 64, action_space);
+    let config = PPOTrainingConfig::default();
+
+    let mut optimizer = AdamConfig::new()
+        .with_grad_clipping(config.clip_grad.clone())
+        .init();
+    let mut memory = Memory::<B, 50_000>::default();
+    for i in 0..num_episodes {
+        let mut episode_done = false;
+
+        let (mut state, mut obs) = game.reset();
+        while !episode_done {
+            let actions = MyAgent::react_with_model(&obs, &model, &mut rng);
+            let result = game.step(&state, &actions);
+
+            memory.push_batch(
+                &obs,
+                &result.obs,
+                &actions,
+                result.rewards,
+                result.is_terminal,
+            );
+
+            state = result.state;
+            obs = result.obs;
+            episode_done = result.is_terminal;
+        }
+    
+        println!("episode {i}/{num_episodes}:\n{}", game.get_metrics());
+        game.reset_metrics();
+
+        println!("training");
+        model = MyAgent::train(model, &memory, &mut optimizer, &config);
+        memory.clear();
+        println!("trained");
+    }
+
+    MyAgent::valid(model)
 }

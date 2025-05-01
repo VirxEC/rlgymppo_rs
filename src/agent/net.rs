@@ -47,7 +47,7 @@ impl<B: Backend> Net<B> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Module, Debug)]
 pub struct Actic<B: Backend> {
     pub actor: Net<B>,
     pub critic: Net<B>,

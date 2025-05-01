@@ -61,7 +61,8 @@ impl StateSetter<SharedInfo> for MyStateSetter {
 
         // random game mode, 1v1, 2v2, or 3v3
         let octane = CarConfig::octane();
-        for _ in 0..shared_info.rng.random_range(1u8..4) {
+        // for _ in 0..shared_info.rng.random_range(1u8..4) {
+        for _ in 0..2 {
             let _ = arena.pin_mut().add_car(Team::Blue, octane);
             let _ = arena.pin_mut().add_car(Team::Orange, octane);
         }
@@ -338,7 +339,8 @@ struct MyTerminal {
 
 impl Terminal<SharedInfo> for MyTerminal {
     fn reset(&mut self, _initial_state: &GameStateA, shared_info: &mut SharedInfo) {
-        self.episode_duration = shared_info.rng.random_range(2.0..5.0);
+        // self.episode_duration = shared_info.rng.random_range(2.0..5.0);
+        self.episode_duration = 2.0;
     }
 
     fn is_terminal(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> bool {
@@ -524,5 +526,8 @@ pub fn run<B: AutodiffBackend>() {
 
         println!("episode {i}:\n{metrics}");
         i += 1;
+        if i == 10 {
+            break;
+        }
     }
 }

@@ -8,7 +8,7 @@ use burn::LearningRate;
 use burn::module::AutodiffModule;
 use burn::optim::{GradientsParams, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{Tensor, TensorData, Transaction};
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use rand::{Rng, rng};
 
@@ -37,10 +37,15 @@ pub(crate) fn sample_actions_from_tensor<B: Backend, R: Rng>(
     rng: &mut R,
 ) -> Vec<usize> {
     let num_actions = output.shape().dims[0];
+    
+    let mut transaction = Transaction::default();
+    for data in output.iter_dim(0) {
+        transaction = transaction.register(data);
+    }
 
     let mut actions = Vec::with_capacity(num_actions);
-    for data in output.iter_dim(0) {
-        let prob = data.into_data().iter().collect::<Vec<f32>>();
+    for data in transaction.execute() {
+        let prob = data.into_vec::<f32>().unwrap();
         let dist = WeightedIndex::new(prob).unwrap();
 
         actions.push(dist.sample(rng));

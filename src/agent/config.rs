@@ -22,7 +22,7 @@ impl Default for PPOTrainingConfig {
             learning_rate: 3e-4,
             epochs: 2,
             batch_size: 50_000,
-            mini_batch_size: 5_000,
+            mini_batch_size: 20_000,
             clip_grad: Some(GradientClippingConfig::Norm(0.5)),
         }
     }

@@ -1,8 +1,10 @@
+use std::mem;
+
+use crate::utils::{AvgTracker, Report};
 use rlgym::{
     Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, StepResult, Terminal,
     Truncate, rocketsim_rs::glam_ext::GameStateA,
 };
-use crate::utils::{AvgTracker, Report};
 
 pub struct GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
@@ -33,7 +35,11 @@ where
     TRUNC: Truncate<SI>,
 {
     pub fn new(env: Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>, step_callback: C) -> Self {
-        Self { env, step_callback, metrics: Report::default() }
+        Self {
+            env,
+            step_callback,
+            metrics: Report::default(),
+        }
     }
 
     pub fn reset(&mut self) -> (GameStateA, FullObs) {
@@ -52,11 +58,7 @@ where
         result
     }
 
-    pub fn get_metrics(&self) -> &Report {
-        &self.metrics
-    }
-
-    pub fn reset_metrics(&mut self) {
-        self.metrics.clear();
+    pub fn get_metrics(&mut self) -> Report {
+        mem::take(&mut self.metrics)
     }
 }

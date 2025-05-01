@@ -1,9 +1,6 @@
-use rand::{Rng, rngs::ThreadRng};
+use rand::{Rng, SeedableRng, rngs::ThreadRng};
 use rlgymppo::{
-    agent::{
-        config::PPOTrainingConfig, model::{PPOModel, PPOOutput}, PPO
-    },
-    base::Agent,
+    agent::{PPO, config::PPOTrainingConfig, net::Actic},
     environment::rsim::GameInstance,
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
@@ -16,7 +13,7 @@ use rlgymppo::{
     },
     utils::{AvgTracker, Report},
 };
-use std::{num::NonZeroUsize, thread::available_parallelism};
+use std::{num::NonZeroUsize, thread::available_parallelism, time::Instant};
 
 struct SharedInfo {
     rng: ThreadRng,
@@ -89,6 +86,8 @@ impl MyObs {
     const BALL_OBS: usize = 9;
     const CAR_OBS: usize = 9;
 
+    const OBS_SPACE: usize = Self::BALL_OBS + Self::CAR_OBS * Self::ZERO_PADDING * 2;
+
     fn get_ball_obs(ball: &BallA) -> Vec<f32> {
         let mut obs_vec = Vec::with_capacity(Self::BALL_OBS);
         obs_vec.extend(ball.pos.to_array());
@@ -113,21 +112,20 @@ impl MyObs {
 }
 
 impl Obs<SharedInfo> for MyObs {
-    fn get_obs_space(&self, _agent_id: u32, _shared_info: &SharedInfo) -> usize {
-        Self::BALL_OBS + Self::CAR_OBS * Self::ZERO_PADDING * 2
+    fn get_obs_space(&self, _shared_info: &SharedInfo) -> usize {
+        Self::OBS_SPACE
     }
 
     fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
 
-    fn build_obs(&mut self, state: &GameStateA, shared_info: &mut SharedInfo) -> FullObs {
+    fn build_obs(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> FullObs {
         let mut obs = Vec::with_capacity(state.cars.len());
 
         let ball_obs = Self::get_ball_obs(&state.ball);
         let cars = Self::get_all_car_obs(&state.cars);
 
-        let full_obs = self.get_obs_space(0, shared_info);
         for current_car in &state.cars {
-            let mut obs_vec: Vec<f32> = Vec::with_capacity(full_obs);
+            let mut obs_vec: Vec<f32> = Vec::with_capacity(Self::OBS_SPACE);
             obs_vec.extend(&ball_obs);
 
             // current car's obs
@@ -167,7 +165,7 @@ impl Obs<SharedInfo> for MyObs {
                 obs_vec.extend(vec![0.0; Self::CAR_OBS]);
             }
 
-            assert_eq!(obs_vec.len(), full_obs);
+            assert_eq!(obs_vec.len(), Self::OBS_SPACE);
             obs.push(obs_vec);
         }
 
@@ -257,7 +255,7 @@ impl Action<SharedInfo> for MyAction {
         8
     }
 
-    fn get_action_space(&self, _agent_id: u32, _shared_info: &SharedInfo) -> usize {
+    fn get_action_space(&self, _shared_info: &SharedInfo) -> usize {
         self.actions_table.len()
     }
 
@@ -340,11 +338,11 @@ struct MyTerminal {
 
 impl Terminal<SharedInfo> for MyTerminal {
     fn reset(&mut self, _initial_state: &GameStateA, shared_info: &mut SharedInfo) {
-        self.episode_duration = shared_info.rng.random_range(0.0..5.0);
+        self.episode_duration = shared_info.rng.random_range(2.0..5.0);
     }
 
     fn is_terminal(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> bool {
-        let elapsed = state.tick_count as f32 / state.tick_rate / 120.0;
+        let elapsed = state.tick_count as f32 / state.tick_rate / 60.0;
 
         // reset after some minutes
         if elapsed < self.episode_duration {
@@ -446,67 +444,15 @@ fn main() {
     // learner.load();
     // learner.learn();
     // learner.save();
-    // let _agent = run::<Autodiff<Rocm>>(512);
-    let _agent = run::<Autodiff<NdArray>>(512);
+    run::<Autodiff<Vulkan>>();
 }
 
-use burn::nn::{Initializer, Linear, LinearConfig};
+use burn::backend::{Autodiff, Vulkan};
 use burn::optim::AdamConfig;
-use burn::tensor::Tensor;
-use burn::tensor::activation::{relu, softmax};
-use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::{
-    backend::{Autodiff, NdArray, Rocm},
-    module::Module,
-};
-use rlgymppo::base::{Memory, Model};
+use burn::tensor::backend::AutodiffBackend;
+use rlgymppo::base::Memory;
 
-#[derive(Module, Debug)]
-pub struct Net<B: Backend> {
-    linear: Linear<B>,
-    linear_actor: Linear<B>,
-    linear_critic: Linear<B>,
-}
-
-impl<B: Backend> Net<B> {
-    pub fn new(input_size: usize, dense_size: usize, output_size: usize) -> Self {
-        let initializer = Initializer::XavierUniform { gain: 1.0 };
-        let device = B::Device::default();
-
-        Self {
-            linear: LinearConfig::new(input_size, dense_size)
-                .with_initializer(initializer.clone())
-                .init(&device),
-            linear_actor: LinearConfig::new(dense_size, output_size)
-                .with_initializer(initializer.clone())
-                .init(&device),
-            linear_critic: LinearConfig::new(dense_size, 1)
-                .with_initializer(initializer)
-                .init(&device),
-        }
-    }
-}
-
-impl<B: Backend> Model<B, Tensor<B, 2>, PPOOutput<B>, Tensor<B, 2>> for Net<B> {
-    fn forward(&self, input: Tensor<B, 2>) -> PPOOutput<B> {
-        let layer_0_output = relu(self.linear.forward(input));
-        let policies = softmax(self.linear_actor.forward(layer_0_output.clone()), 1);
-        let values = self.linear_critic.forward(layer_0_output);
-
-        PPOOutput::<B>::new(policies, values)
-    }
-
-    fn infer(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let layer_0_output = relu(self.linear.forward(input));
-        softmax(self.linear_actor.forward(layer_0_output), 1)
-    }
-}
-
-impl<B: Backend> PPOModel<B> for Net<B> {}
-
-type MyAgent<B> = PPO<B, Net<B>>;
-
-pub fn run<B: AutodiffBackend>(num_episodes: usize) -> impl Agent {
+pub fn run<B: AutodiffBackend>() {
     let env = create_env();
     let obs_space = env.get_obs_space();
     dbg!(obs_space);
@@ -515,20 +461,34 @@ pub fn run<B: AutodiffBackend>(num_episodes: usize) -> impl Agent {
 
     let mut game = GameInstance::new(env, step_callback);
 
-    let mut rng = rand::rng();
-    let mut model = Net::<B>::new(obs_space, 64, action_space);
+    let device = B::Device::default();
+    let mut rng = rand::rngs::SmallRng::from_os_rng();
+    let mut model = Actic::<B>::new(
+        obs_space,
+        action_space,
+        vec![256, 256, 256, 256],
+        vec![256, 256, 256, 256],
+        &device,
+    );
     let config = PPOTrainingConfig::default();
 
-    let mut optimizer = AdamConfig::new()
+    let mut policy_optimizer = AdamConfig::new()
         .with_grad_clipping(config.clip_grad.clone())
         .init();
-    let mut memory = Memory::<B, 50_000>::default();
-    for i in 0..num_episodes {
-        let mut episode_done = false;
+    let mut value_optimizer = AdamConfig::new()
+        .with_grad_clipping(config.clip_grad.clone())
+        .init();
 
+    let mut memory = Memory::new(config.batch_size);
+
+    let mut i = 0;
+    loop {
+        let start = Instant::now();
+
+        let mut episode_done = false;
         let (mut state, mut obs) = game.reset();
         while !episode_done {
-            let actions = MyAgent::react_with_model(&obs, &model, &mut rng);
+            let actions = PPO::<B>::react_with_model(&obs, &model, &mut rng, &device);
             let result = game.step(&state, &actions);
 
             memory.push_batch(
@@ -537,21 +497,32 @@ pub fn run<B: AutodiffBackend>(num_episodes: usize) -> impl Agent {
                 &actions,
                 result.rewards,
                 result.is_terminal,
+                result.truncated,
             );
 
             state = result.state;
             obs = result.obs;
-            episode_done = result.is_terminal;
+            episode_done = result.is_terminal || result.truncated;
         }
-    
-        println!("episode {i}/{num_episodes}:\n{}", game.get_metrics());
-        game.reset_metrics();
 
-        println!("training");
-        model = MyAgent::train(model, &memory, &mut optimizer, &config);
+        let mut metrics = game.get_metrics();
+        let num_steps = memory.len() as f64;
+        metrics["Episode Length"] = num_steps.into();
+        metrics["Collected SPS"] = (num_steps / start.elapsed().as_secs_f64()).into();
+
+        model = PPO::<B>::train(
+            model,
+            &memory,
+            &mut policy_optimizer,
+            &mut value_optimizer,
+            &config,
+            &mut rng,
+            &device,
+        );
+        metrics["Overall SPS"] = (num_steps / start.elapsed().as_secs_f64()).into();
         memory.clear();
-        println!("trained");
-    }
 
-    MyAgent::valid(model)
+        println!("episode {i}:\n{metrics}");
+        i += 1;
+    }
 }

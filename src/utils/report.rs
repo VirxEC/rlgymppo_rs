@@ -1,9 +1,9 @@
+use crate::utils::AvgTracker;
 use ahash::HashMap;
 use std::{
     fmt,
     ops::{AddAssign, Index, IndexMut},
 };
-use crate::utils::AvgTracker;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Reportable {
@@ -23,7 +23,9 @@ macro_rules! reportable_from_primitive {
     };
 }
 
-reportable_from_primitive!(usize, u8, u16, u32, u64, u128, isize, i8, i16, i32, i64, i128, f32);
+reportable_from_primitive!(
+    usize, u8, u16, u32, u64, u128, isize, i8, i16, i32, i64, i128, f32
+);
 
 impl From<f64> for Reportable {
     fn from(val: f64) -> Self {

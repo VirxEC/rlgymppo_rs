@@ -1,4 +1,3 @@
-use crate::base::Model;
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 
@@ -12,5 +11,3 @@ impl<B: Backend> PPOOutput<B> {
         Self { policies, values }
     }
 }
-
-pub trait PPOModel<B: Backend>: Model<B, Tensor<B, 2>, PPOOutput<B>, Tensor<B, 2>> {}

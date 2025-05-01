@@ -1,27 +1,20 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{BasicOps, Tensor, TensorKind};
-use rand::Rng;
-use ringbuffer::{ConstGenericRingBuffer, RingBuffer};
-use std::marker::PhantomData;
+use ringbuffer::{AllocRingBuffer, RingBuffer};
 
 pub type MemoryIndices = Vec<usize>;
 
-pub fn sample_indices(indices: MemoryIndices, size: usize) -> MemoryIndices {
-    let mut rng = rand::rng();
-    let mut sample = Vec::<usize>::new();
-    for _ in 0..size {
-        unsafe {
-            let index = rng.random_range(0..indices.len());
-            sample.push(*indices.get_unchecked(index));
-        }
-    }
-
-    sample
+pub fn get_batch_1d<T: Copy>(data: &AllocRingBuffer<T>, indices: &MemoryIndices) -> Vec<T> {
+    indices
+        .iter()
+        .filter_map(|i| data.get(*i))
+        .copied()
+        .collect::<Vec<_>>()
 }
 
-pub fn get_batch<B: Backend, const CAP: usize, T, K: TensorKind<B> + BasicOps<B>>(
-    data: &ConstGenericRingBuffer<T, CAP>,
-    indices: &MemoryIndices,
+pub fn get_batch<B: Backend, T, K: TensorKind<B> + BasicOps<B>>(
+    data: &AllocRingBuffer<T>,
+    indices: &[usize],
     converter: impl Fn(&T) -> Tensor<B, 1, K>,
 ) -> Tensor<B, 2, K> {
     Tensor::cat(
@@ -35,29 +28,27 @@ pub fn get_batch<B: Backend, const CAP: usize, T, K: TensorKind<B> + BasicOps<B>
     .reshape([indices.len() as i32, -1])
 }
 
-pub struct Memory<B: Backend, const CAP: usize> {
-    state: ConstGenericRingBuffer<Vec<f32>, CAP>,
-    next_state: ConstGenericRingBuffer<Vec<f32>, CAP>,
-    action: ConstGenericRingBuffer<usize, CAP>,
-    reward: ConstGenericRingBuffer<f32, CAP>,
-    done: ConstGenericRingBuffer<bool, CAP>,
-    backend: PhantomData<B>,
+pub struct Memory {
+    state: AllocRingBuffer<Vec<f32>>,
+    next_state: AllocRingBuffer<Vec<f32>>,
+    action: AllocRingBuffer<usize>,
+    reward: AllocRingBuffer<f32>,
+    done: AllocRingBuffer<bool>,
+    truncated: AllocRingBuffer<bool>,
 }
 
-impl<B: Backend, const CAP: usize> Default for Memory<B, CAP> {
-    fn default() -> Self {
+impl Memory {
+    pub fn new(capacity: usize) -> Self {
         Self {
-            state: ConstGenericRingBuffer::new(),
-            next_state: ConstGenericRingBuffer::new(),
-            action: ConstGenericRingBuffer::new(),
-            reward: ConstGenericRingBuffer::new(),
-            done: ConstGenericRingBuffer::new(),
-            backend: PhantomData,
+            state: AllocRingBuffer::new(capacity),
+            next_state: AllocRingBuffer::new(capacity),
+            action: AllocRingBuffer::new(capacity),
+            reward: AllocRingBuffer::new(capacity),
+            done: AllocRingBuffer::new(capacity),
+            truncated: AllocRingBuffer::new(capacity),
         }
     }
-}
 
-impl<B: Backend, const CAP: usize> Memory<B, CAP> {
     pub fn push(
         &mut self,
         state: Vec<f32>,
@@ -65,12 +56,22 @@ impl<B: Backend, const CAP: usize> Memory<B, CAP> {
         action: usize,
         reward: f32,
         done: bool,
+        truncated: bool,
     ) {
+        #[cfg(debug_assertions)]
+        {
+            // ensure no NaN values
+            assert!(!state.iter().any(|&x| x.is_nan()));
+            assert!(!next_state.iter().any(|&x| x.is_nan()));
+            assert!(!reward.is_nan());
+        }
+
         self.state.push(state);
         self.next_state.push(next_state);
         self.action.push(action);
         self.reward.push(reward);
         self.done.push(done);
+        self.truncated.push(truncated);
     }
 
     pub fn push_batch(
@@ -80,6 +81,7 @@ impl<B: Backend, const CAP: usize> Memory<B, CAP> {
         action: &[usize],
         reward: Vec<f32>,
         done: bool,
+        truncated: bool,
     ) {
         let n = state.len();
         assert_eq!(n, next_state.len());
@@ -92,28 +94,33 @@ impl<B: Backend, const CAP: usize> Memory<B, CAP> {
                 action[i],
                 reward[i],
                 done,
+                truncated,
             );
         }
     }
 
-    pub fn states(&self) -> &ConstGenericRingBuffer<Vec<f32>, CAP> {
+    pub fn states(&self) -> &AllocRingBuffer<Vec<f32>> {
         &self.state
     }
 
-    pub fn next_states(&self) -> &ConstGenericRingBuffer<Vec<f32>, CAP> {
+    pub fn next_states(&self) -> &AllocRingBuffer<Vec<f32>> {
         &self.next_state
     }
 
-    pub fn actions(&self) -> &ConstGenericRingBuffer<usize, CAP> {
+    pub fn actions(&self) -> &AllocRingBuffer<usize> {
         &self.action
     }
 
-    pub fn rewards(&self) -> &ConstGenericRingBuffer<f32, CAP> {
+    pub fn rewards(&self) -> &AllocRingBuffer<f32> {
         &self.reward
     }
 
-    pub fn dones(&self) -> &ConstGenericRingBuffer<bool, CAP> {
+    pub fn dones(&self) -> &AllocRingBuffer<bool> {
         &self.done
+    }
+
+    pub fn truncateds(&self) -> &AllocRingBuffer<bool> {
+        &self.truncated
     }
 
     pub fn len(&self) -> usize {
@@ -130,5 +137,6 @@ impl<B: Backend, const CAP: usize> Memory<B, CAP> {
         self.action.clear();
         self.reward.clear();
         self.done.clear();
+        self.truncated.clear();
     }
 }

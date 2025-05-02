@@ -119,11 +119,25 @@ impl Report {
     }
 }
 
+impl Index<String> for Report {
+    type Output = Reportable;
+
+    fn index(&self, key: String) -> &Self::Output {
+        &self.data[&key]
+    }
+}
+
 impl Index<&str> for Report {
     type Output = Reportable;
 
     fn index(&self, key: &str) -> &Self::Output {
         &self.data[key]
+    }
+}
+
+impl IndexMut<String> for Report {
+    fn index_mut(&mut self, key: String) -> &mut Self::Output {
+        self.data.entry(key).or_default()
     }
 }
 
@@ -136,7 +150,15 @@ impl IndexMut<&str> for Report {
 impl AddAssign<&Report> for Report {
     fn add_assign(&mut self, other: &Report) {
         for (key, val) in other.data.iter() {
-            self[key] += *val;
+            self[key.as_str()] += *val;
+        }
+    }
+}
+
+impl AddAssign<Report> for Report {
+    fn add_assign(&mut self, other: Report) {
+        for (key, val) in other.data.into_iter() {
+            self[key] += val;
         }
     }
 }

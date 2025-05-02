@@ -55,7 +55,7 @@ impl<B: AutodiffBackend> PPO<B> {
             expected_returns,
             advantages,
         } = get_gae(
-            old_values.reshape([-1]).into_data().into_vec().unwrap(),
+            old_values.into_data().into_vec().unwrap(),
             get_batch_1d(memory.rewards(), &memory_indices),
             get_batch_1d(memory.dones(), &memory_indices),
             get_batch_1d(memory.truncateds(), &memory_indices),
@@ -153,14 +153,15 @@ fn get_gae<B: Backend>(
     lambda: f32,
     device: &B::Device,
 ) -> GAEOutput<B> {
-    let mut returns = vec![0.0; rewards.len()];
+    let num_samples = rewards.len();
+    let mut returns = vec![0.0; num_samples];
     let mut advantages = returns.clone();
 
     let mut last_val = 0.0;
     let mut running_return = 0.0;
     let mut running_advantage = 0.0;
 
-    for i in (0..rewards.len()).rev() {
+    for i in (0..num_samples).rev() {
         let reward = rewards[i];
         let not_done = f32::from(u8::from(not_dones[i]));
         let not_truncated = f32::from(u8::from(not_truncateds[i]));
@@ -175,7 +176,7 @@ fn get_gae<B: Backend>(
     }
 
     GAEOutput::new(
-        Tensor::<B, 1>::from_floats(returns.as_slice(), device).reshape([returns.len(), 1]),
-        Tensor::<B, 1>::from_floats(advantages.as_slice(), device).reshape([advantages.len(), 1]),
+        Tensor::<B, 2>::from_data(TensorData::new(returns, [num_samples, 1]), device),
+        Tensor::<B, 2>::from_data(TensorData::new(advantages, [num_samples, 1]), device),
     )
 }

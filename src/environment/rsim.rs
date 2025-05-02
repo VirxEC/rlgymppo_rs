@@ -8,7 +8,7 @@ use rlgym::{
 
 pub struct GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    C: Fn(&mut Report, &SI, &GameStateA),
+    C: Fn(&mut Report, &mut SI, &GameStateA),
     SS: StateSetter<SI>,
     SIP: SharedInfoProvider<SI>,
     OBS: Obs<SI>,
@@ -25,7 +25,7 @@ where
 impl<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
     GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    C: Fn(&mut Report, &SI, &GameStateA),
+    C: Fn(&mut Report, &mut SI, &GameStateA),
     SS: StateSetter<SI>,
     SIP: SharedInfoProvider<SI>,
     OBS: Obs<SI>,
@@ -48,7 +48,11 @@ where
 
     pub fn step(&mut self, game_state: &GameStateA, actions: &[ACT::Input]) -> StepResult {
         let result = self.env.step(game_state, actions);
-        (self.step_callback)(&mut self.metrics, self.env.shared_info(), game_state);
+        (self.step_callback)(
+            &mut self.metrics,
+            self.env.get_mut_shared_info(),
+            game_state,
+        );
 
         let num_players = result.rewards.len();
         let total_rew = result.rewards.iter().sum::<f32>() as f64;

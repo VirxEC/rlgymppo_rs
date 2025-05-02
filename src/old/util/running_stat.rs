@@ -1,5 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Stats {
+    cumulative_timesteps: u64,
+    cumulative_model_updates: u64,
+    epoch: u64,
+    return_stat: WelfordRunningStat,
+    // todo, for wandb metrics reporting
+    // run_id: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]
 pub struct WelfordRunningStat {
     running_mean: f64,

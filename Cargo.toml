@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.17.0", features = ["autodiff", "fusion"] }
+burn = { version = "0.17.0", features = ["autodiff"] }
 rlgym = { path = "../rlgym_rs" }
 ahash = "0.8.11"
 toml = { version = "0.8.19", features = ["preserve_order"] }
@@ -12,9 +12,6 @@ serde = { version = "1.0.208", features = ["derive"] }
 ringbuffer = "0.15.0"
 rand = "0.9.1"
 itertools = "0.14.0"
-
-[features]
-default = ["burn/ndarray", "burn/vulkan"]
 
 [profile.dev]
 opt-level = 1
@@ -25,3 +22,10 @@ opt-level = 3
 
 [profile.release]
 debug = true
+
+[patch.crates-io]
+cubecl = { path = "/root/cubecl/crates/cubecl" }
+
+[[example]]
+name = "generic"
+required-features = ["burn/ndarray", "burn/vulkan", "burn/rocm", "burn/router", "burn/fusion"]

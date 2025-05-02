@@ -19,16 +19,14 @@ use std::{mem, num::NonZeroUsize, thread::available_parallelism, time::Instant};
 
 struct SharedInfo {
     rng: SmallRng,
-    avg_dist_to_ball: AvgTracker,
-    avg_vel: AvgTracker,
+    metrics: Report,
 }
 
 impl Default for SharedInfo {
     fn default() -> Self {
         Self {
             rng: SmallRng::from_os_rng(),
-            avg_dist_to_ball: AvgTracker::default(),
-            avg_vel: AvgTracker::default(),
+            metrics: Report::default(),
         }
     }
 }
@@ -36,16 +34,13 @@ impl Default for SharedInfo {
 struct MySharedInfoProvider;
 
 impl SharedInfoProvider<SharedInfo> for MySharedInfoProvider {
-    fn reset(&mut self, _initial_state: &GameStateA, shared_info: &mut SharedInfo) {
-        shared_info.avg_dist_to_ball.reset();
-    }
+    fn reset(&mut self, _initial_state: &GameStateA, shared_info: &mut SharedInfo) {}
 
     fn apply(&mut self, game_state: &GameStateA, shared_info: &mut SharedInfo) {
         for car in &game_state.cars {
             let dist_to_ball = car.state.pos.distance(game_state.ball.pos);
-            shared_info.avg_dist_to_ball += dist_to_ball as f64;
-
-            shared_info.avg_vel += car.state.vel.length() as f64;
+            shared_info.metrics["Avg. dist to ball"] += dist_to_ball.into();
+            shared_info.metrics["Avg.velocity"] += car.state.vel.length().into();
         }
     }
 }
@@ -178,7 +173,7 @@ impl Obs<SharedInfo> for MyObs {
 
 struct MyAction {
     actions_table: Vec<CarControls>,
-    action_buffer: [(u32, CarControls); 8],
+    action_buffer: [(u32, CarControls); MyObs::ZERO_PADDING * 2],
 }
 
 impl Default for MyAction {
@@ -401,9 +396,9 @@ fn create_env() -> Env<
     )
 }
 
-fn step_callback(report: &mut Report, shared_info: &SharedInfo, _game_state: &GameStateA) {
-    report["Avg. distance to ball"] = shared_info.avg_dist_to_ball.into();
-    report["Avg. velocity"] = shared_info.avg_vel.into();
+fn step_callback(report: &mut Report, shared_info: &mut SharedInfo, _game_state: &GameStateA) {
+    *report += &shared_info.metrics;
+    shared_info.metrics.clear();
 }
 
 fn main() {
@@ -446,11 +441,12 @@ fn main() {
     // learner.load();
     // learner.learn();
     // learner.save();
-    run::<Autodiff<Vulkan>>();
+
+    run::<Autodiff<Router<(Rocm, Vulkan, Wgpu, NdArray)>>>();
 }
 
 use burn::{
-    backend::{Autodiff, Vulkan},
+    backend::{Autodiff, NdArray, Rocm, Router, Vulkan, Wgpu},
     module::{AutodiffModule, ModuleDisplayDefault},
     optim::AdamConfig,
     tensor::backend::AutodiffBackend,
@@ -468,7 +464,15 @@ pub fn run<B: AutodiffBackend>() {
 
     let device = B::Device::default();
     let mut rng = rand::rngs::SmallRng::from_os_rng();
-    let mut model = Actic::<B>::new(obs_space, action_space, vec![256], vec![256], &device);
+    let mut model = Actic::<B>::new(
+        obs_space,
+        action_space,
+        vec![256, 256, 256, 256],
+        vec![256, 256, 256, 256],
+        // vec![512, 512, 512, 512],
+        // vec![512, 512, 512, 512],
+        &device,
+    );
 
     println!("# parameters in actor: {}", model.actor.num_params());
     println!("# parameters in critic: {}", model.critic.num_params());
@@ -483,6 +487,8 @@ pub fn run<B: AutodiffBackend>() {
         .init();
 
     let mut memory = Memory::new(config.batch_size);
+
+    println!("Running for the first time. This might be slow at first...");
 
     let mut i = 0;
     loop {

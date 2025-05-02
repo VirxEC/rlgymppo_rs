@@ -2,8 +2,8 @@
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rlgymppo::{
-    backend::{Autodiff, NdArray, Rocm, Router, Wgpu},
     LearnerConfig, PpoLearnerConfig,
+    backend::{Autodiff, NdArray, Rocm, Router, Wgpu},
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     },
@@ -405,8 +405,11 @@ fn step_callback(report: &mut Report, shared_info: &mut SharedInfo, _game_state:
 fn main() {
     init(None, true);
 
-    // let num_threads = NonZeroUsize::new(1).unwrap();
-    // let num_threads = available_parallelism().unwrap();
+    // let num_threads = if cfg!(debug_assertions) {
+    //     NonZeroUsize::new(1).unwrap()
+    // } else {
+    //     available_parallelism().unwrap()
+    // };
     let mini_batch_size = 20000;
     let batch_size = mini_batch_size * 3;
     let lr = 3e-4;

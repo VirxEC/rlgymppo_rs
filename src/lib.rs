@@ -5,8 +5,8 @@ mod environment;
 
 pub mod utils;
 
-pub use burn::backend;
 pub use agent::config::PpoLearnerConfig;
+pub use burn::backend;
 pub use rlgym::{self, glam, rocketsim_rs};
 
 use agent::{Ppo, model::Actic};
@@ -246,6 +246,7 @@ where
             self.stats.cumulative_timesteps += memory.len() as u64;
             let num_steps = memory.len() as f64;
 
+            self.metrics.clear();
             let train_start = Instant::now();
             model = self.ppo.train(
                 model,
@@ -259,7 +260,6 @@ where
             let train_elapsed = train_start.elapsed().as_secs_f64();
             let overall_elapsed = collect_start.elapsed().as_secs_f64();
 
-            self.metrics.clear();
             self.metrics += self.batch_sim.get_metrics();
             self.metrics[".Episode Length"] = num_steps.into();
             self.metrics[".Collection time"] = collect_elapsed.into();

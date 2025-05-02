@@ -7,7 +7,7 @@ use crate::{
         model::{Actic, Net, PPOOutput},
     },
     base::{Memory, MemoryIndices, get_action_batch, get_batch_1d, get_states_batch},
-    utils::{Report, elementwise_min, update_parameters},
+    utils::{Report, elementwise_min, running_stat::Stats, update_parameters},
 };
 use burn::{
     nn::loss::{MseLoss, Reduction},
@@ -46,6 +46,7 @@ impl<B: AutodiffBackend> PPO<B> {
         memory: &Memory,
         rng: &mut R,
         metrics: &mut Report,
+        stats: &mut Stats,
     ) -> Actic<B> {
         let mut memory_indices = (0..memory.len()).collect::<MemoryIndices>();
         let PPOOutput {
@@ -138,6 +139,9 @@ impl<B: AutodiffBackend> PPO<B> {
                 );
             }
         }
+
+        stats.cumulative_epochs += self.config.epochs as u64;
+        stats.cumulative_model_updates += 1;
 
         let mini_batch_iters =
             1.max(memory.len() / self.config.mini_batch_size * self.config.epochs);

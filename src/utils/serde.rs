@@ -1,3 +1,4 @@
+use super::running_stat::Stats;
 use crate::agent::model::Actic;
 use burn::{
     prelude::*,
@@ -11,6 +12,7 @@ use std::{
 
 pub fn save_model<B: Backend, P: AsRef<Path>>(
     model: Actic<B>,
+    running_stats: &Stats,
     base_folder: P,
     limit: Option<usize>,
 ) {
@@ -24,6 +26,9 @@ pub fn save_model<B: Backend, P: AsRef<Path>>(
     model
         .save_file(base_folder.join("model"), &recorder)
         .unwrap();
+
+    let toml_str = toml::to_string(running_stats).unwrap();
+    fs::write(base_folder.join("stats.toml"), toml_str).unwrap();
 
     println!("Saved model to: {base_folder:?}");
 
@@ -57,11 +62,11 @@ pub fn load_latest_model<B: Backend, P: AsRef<Path>>(
     model: Actic<B>,
     base_folder: P,
     device: &B::Device,
-) -> Actic<B> {
+) -> (Actic<B>, Stats) {
     let base_folder = base_folder.as_ref();
     let Ok(folders) = base_folder.read_dir() else {
         println!("Failed to read directory: {:?}", base_folder.display());
-        return model;
+        return (model, Stats::default());
     };
 
     let Some(latest_folder) = folders
@@ -69,7 +74,7 @@ pub fn load_latest_model<B: Backend, P: AsRef<Path>>(
         .max_by_key(|entry| entry.file_name().to_str().unwrap().parse::<u64>().ok())
     else {
         println!("No valid folders found in: {:?}", base_folder.display());
-        return model;
+        return (model, Stats::default());
     };
 
     load_model(model, latest_folder.path(), device)
@@ -79,13 +84,19 @@ pub fn load_model<B: Backend, P: AsRef<Path>>(
     model: Actic<B>,
     file_path: P,
     device: &B::Device,
-) -> Actic<B> {
+) -> (Actic<B>, Stats) {
     let path = file_path.as_ref();
     assert!(path.exists(), "Model path does not exist: {path:?}");
-    println!("Loading model from: {path:?}");
 
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-    model
+    let model = model
         .load_file(path.join("model"), &recorder, device)
-        .unwrap()
+        .unwrap();
+
+    let toml_str = fs::read_to_string(path.join("stats.toml")).unwrap();
+    let stats: Stats = toml::from_str(&toml_str).unwrap();
+
+    println!("Loaded model from: {path:?}");
+
+    (model, stats)
 }

@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Stats {
-    cumulative_timesteps: u64,
-    cumulative_model_updates: u64,
-    epoch: u64,
-    return_stat: WelfordRunningStat,
+    pub cumulative_timesteps: u64,
+    pub cumulative_model_updates: u64,
+    pub cumulative_epochs: u64,
+    // return_stat: WelfordRunningStat,
     // todo, for wandb metrics reporting
     // run_id: String,
 }

@@ -511,8 +511,9 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
 
     let device = B::Device::default();
     let mut rng = SmallRng::from_os_rng();
-    let mut model = Actic::<B>::new(obs_space, action_space, vec![512; 4], vec![512; 4], &device);
-    model = load_latest_model(model, save_folder, &device);
+
+    let model = Actic::<B>::new(obs_space, action_space, vec![512; 4], vec![512; 4], &device);
+    let (mut model, mut stats) = load_latest_model(model, save_folder, &device);
 
     println!("# parameters in actor: {}", model.actor.num_params());
     println!("# parameters in critic: {}", model.critic.num_params());
@@ -539,9 +540,11 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
         let memory = batch_sim.run(model.valid());
         let collect_elapsed = collect_start.elapsed().as_secs_f64();
 
+        stats.cumulative_timesteps += memory.len() as u64;
         let num_steps = memory.len() as f64;
+
         let train_start = Instant::now();
-        model = ppo.train(model, memory, &mut rng, &mut metrics);
+        model = ppo.train(model, memory, &mut rng, &mut metrics, &mut stats);
         memory.clear();
 
         let train_elapsed = train_start.elapsed().as_secs_f64();
@@ -554,6 +557,9 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
         metrics[".Training time"] = train_elapsed.into();
         metrics[".Overall time"] = overall_elapsed.into();
         metrics[".Overall SPS"] = (num_steps / collect_start.elapsed().as_secs_f64()).into();
+        metrics[".Cumulative steps"] = stats.cumulative_timesteps.into();
+        metrics[".Cumulative epochs"] = stats.cumulative_epochs.into();
+        metrics[".Cumulative updates"] = stats.cumulative_model_updates.into();
 
         i += 1;
         println!("episode {i}:\n{metrics}");
@@ -566,7 +572,7 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
                 }
                 HumanInput::Save => {
                     println!("Saving model...");
-                    save_model(model.valid(), save_folder, None);
+                    save_model(model.valid(), &stats, save_folder, Some(2));
                 }
             }
         }
@@ -580,7 +586,7 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
 
     // Save the model
     println!("Saving model...");
-    save_model(model, save_folder, Some(1));
+    save_model(model, &stats, save_folder, None);
 
     println!("Exiting.")
 }

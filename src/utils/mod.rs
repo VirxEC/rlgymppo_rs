@@ -1,5 +1,6 @@
 mod avg_tracker;
 mod report;
+pub mod running_stat;
 pub mod serde;
 
 pub use avg_tracker::AvgTracker;

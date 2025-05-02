@@ -486,7 +486,6 @@ fn stdin_reader(s: Sender<HumanInput>) {
 use burn::{
     backend::{Autodiff, NdArray, Rocm, Router, Vulkan, Wgpu},
     module::{AutodiffModule, ModuleDisplayDefault},
-    optim::AdamConfig,
     tensor::backend::AutodiffBackend,
 };
 
@@ -512,24 +511,20 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
     println!("# parameters in actor: {}", model.actor.num_params());
     println!("# parameters in critic: {}", model.critic.num_params());
 
-    let mut policy_optimizer = AdamConfig::new()
-        .with_grad_clipping(config.clip_grad.clone())
-        .init();
-    let mut value_optimizer = AdamConfig::new()
-        .with_grad_clipping(config.clip_grad.clone())
-        .init();
-
     let mut batch_sim = BatchSim::new(
         create_env,
         step_callback,
         BatchSimConfig {
             num_games: 5,
             buffer_size: config.batch_size,
-            device: device.clone(),
         },
+        device.clone(),
     );
 
     println!("Running for the first time. This might be slow at first...");
+
+    let mut ppo = PPO::new(config, device);
+    let mut metrics = Report::default();
 
     let mut i = 0;
     'train: loop {
@@ -539,21 +534,13 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
 
         let num_steps = memory.len() as f64;
         let train_start = Instant::now();
-        model = PPO::<B>::train(
-            model,
-            memory,
-            &mut policy_optimizer,
-            &mut value_optimizer,
-            &config,
-            &mut rng,
-            &device,
-        );
+        model = ppo.train(model, memory, &mut rng, &mut metrics);
         memory.clear();
 
         let train_elapsed = train_start.elapsed().as_secs_f64();
         let overall_elapsed = collect_start.elapsed().as_secs_f64();
 
-        let mut metrics = batch_sim.get_metrics();
+        metrics += batch_sim.get_metrics();
         metrics[".Episode Length"] = num_steps.into();
         metrics[".Collection time"] = collect_elapsed.into();
         metrics[".Collected SPS"] = (num_steps / collect_elapsed).into();
@@ -561,8 +548,9 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
         metrics[".Overall time"] = overall_elapsed.into();
         metrics[".Overall SPS"] = (num_steps / collect_start.elapsed().as_secs_f64()).into();
 
-        println!("episode {i}:\n{metrics}");
         i += 1;
+        println!("episode {i}:\n{metrics}");
+        metrics.clear();
 
         println!("Press Q to quit...");
         for input in r.try_iter() {

@@ -1,8 +1,10 @@
+use crate::utils::{sample_actions_from_tensor, to_state_tensor_2d};
 use burn::{
     nn::{Initializer, Linear, LinearConfig},
     prelude::*,
     tensor::activation::{relu, softmax},
 };
+use rand::Rng;
 
 pub struct PPOOutput<B: Backend> {
     pub policies: Tensor<B, 2>,
@@ -107,5 +109,11 @@ impl<B: Backend> Actic<B> {
         }
 
         softmax(self.actor.layers[num_layers - 1].forward(input), 1).clamp(1e-11, 1.0)
+    }
+}
+
+impl<B: Backend> Actic<B> {
+    pub fn react<R: Rng>(&self, state: &[Vec<f32>], rng: &mut R, device: &B::Device) -> Vec<usize> {
+        sample_actions_from_tensor(self.infer(to_state_tensor_2d(state, device)), rng)
     }
 }

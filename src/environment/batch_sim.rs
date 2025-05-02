@@ -1,9 +1,5 @@
 use super::sim::GameInstance;
-use crate::{
-    agent::{PPO, model::Actic},
-    base::Memory,
-    utils::Report,
-};
+use crate::{agent::model::Actic, base::Memory, utils::Report};
 use burn::prelude::*;
 use rand::{SeedableRng, rngs::SmallRng};
 use rlgym::{
@@ -12,18 +8,16 @@ use rlgym::{
 };
 use std::mem;
 
-pub struct BatchSimConfig<B: Backend> {
+pub struct BatchSimConfig {
     pub num_games: usize,
     pub buffer_size: usize,
-    pub device: B::Device,
 }
 
-impl<B: Backend> Default for BatchSimConfig<B> {
+impl Default for BatchSimConfig {
     fn default() -> Self {
         Self {
             num_games: 5,
             buffer_size: 5_000,
-            device: B::Device::default(),
         }
     }
 }
@@ -43,8 +37,9 @@ where
     last_obs: Vec<Vec<f32>>,
     next_obs: Vec<Vec<f32>>,
     rng: SmallRng,
-    config: BatchSimConfig<B>,
+    config: BatchSimConfig,
     memory: Memory,
+    device: B::Device,
 }
 
 impl<B, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
@@ -60,7 +55,12 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    pub fn new<F>(create_env_fn: F, step_callback: C, config: BatchSimConfig<B>) -> Self
+    pub fn new<F>(
+        create_env_fn: F,
+        step_callback: C,
+        config: BatchSimConfig,
+        device: B::Device,
+    ) -> Self
     where
         F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
     {
@@ -81,13 +81,13 @@ where
             last_obs,
             games,
             config,
+            device,
         }
     }
 
     pub fn run(&mut self, model: Actic<B>) -> &mut Memory {
         while self.memory.len() < self.config.buffer_size {
-            let mut actions =
-                PPO::<B>::react(&self.last_obs, &model, &mut self.rng, &self.config.device);
+            let mut actions = model.react(&self.last_obs, &mut self.rng, &self.device);
 
             let mut start_idx = self.last_obs.len();
             for game in self.games.iter_mut().rev() {

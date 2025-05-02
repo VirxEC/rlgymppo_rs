@@ -7,47 +7,55 @@ use crate::{
         model::{Actic, Net, PPOOutput},
     },
     base::{Memory, MemoryIndices, get_action_batch, get_batch_1d, get_states_batch},
-    utils::{elementwise_min, sample_actions_from_tensor, to_state_tensor_2d, update_parameters},
+    utils::{Report, elementwise_min, update_parameters},
 };
 use burn::{
     nn::loss::{MseLoss, Reduction},
-    optim::Optimizer,
+    optim::{Adam, AdamConfig, adaptor::OptimizerAdaptor},
     prelude::*,
-    tensor::backend::AutodiffBackend,
+    tensor::{backend::AutodiffBackend, cast::ToElement},
 };
 use rand::{Rng, seq::SliceRandom};
-use std::marker::PhantomData;
 
-pub struct PPO<B: Backend> {
-    backend: PhantomData<B>,
+pub struct PPO<B: AutodiffBackend> {
+    config: PPOTrainingConfig,
+    policy_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
+    value_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
+    device: B::Device,
 }
 
-impl<B: Backend> PPO<B> {
-    pub fn react<R: Rng>(
-        state: &[Vec<f32>],
-        model: &Actic<B>,
-        rng: &mut R,
-        device: &B::Device,
-    ) -> Vec<usize> {
-        sample_actions_from_tensor(model.infer(to_state_tensor_2d(state, device)), rng)
+impl<B: AutodiffBackend> PPO<B> {
+    pub fn new(config: PPOTrainingConfig, device: B::Device) -> Self {
+        Self {
+            policy_optimizer: AdamConfig::new()
+                .with_grad_clipping(config.clip_grad.clone())
+                .init(),
+            value_optimizer: AdamConfig::new()
+                .with_grad_clipping(config.clip_grad.clone())
+                .init(),
+            config,
+            device,
+        }
     }
 }
 
 impl<B: AutodiffBackend> PPO<B> {
     pub fn train<R: Rng>(
+        &mut self,
         mut net: Actic<B>,
         memory: &Memory,
-        policy_optimizer: &mut (impl Optimizer<Net<B>, B> + Sized),
-        value_optimizer: &mut (impl Optimizer<Net<B>, B> + Sized),
-        config: &PPOTrainingConfig,
         rng: &mut R,
-        device: &B::Device,
+        metrics: &mut Report,
     ) -> Actic<B> {
         let mut memory_indices = (0..memory.len()).collect::<MemoryIndices>();
         let PPOOutput {
             policies: mut old_polices,
             values: mut old_values,
-        } = net.forward(get_states_batch(memory.states(), &memory_indices, device));
+        } = net.forward(get_states_batch(
+            memory.states(),
+            &memory_indices,
+            &self.device,
+        ));
         old_polices = old_polices.detach();
         old_values = old_values.detach();
 
@@ -59,23 +67,25 @@ impl<B: AutodiffBackend> PPO<B> {
             get_batch_1d(memory.rewards(), &memory_indices),
             get_batch_1d(memory.dones(), &memory_indices),
             get_batch_1d(memory.truncateds(), &memory_indices),
-            config.gamma,
-            config.lambda,
-            device,
+            self.config.gamma,
+            self.config.lambda,
+            &self.device,
         );
 
-        for _ in 0..config.epochs {
+        let mut mean_entropy = 0.0;
+        let mut mean_val_loss = 0.0;
+
+        for _ in 0..self.config.epochs {
             memory_indices.shuffle(rng);
 
-            for start_idx in (0..memory.len()).step_by(config.mini_batch_size) {
-                let end_idx = memory.len().min(start_idx + config.mini_batch_size);
+            for start_idx in (0..memory.len()).step_by(self.config.mini_batch_size) {
+                let end_idx = memory.len().min(start_idx + self.config.mini_batch_size);
                 let sample_indices = &memory_indices[start_idx..end_idx];
                 let batch_size_ratio = sample_indices.len() as f32 / memory.len() as f32;
 
-                let sample_indices_tensor = Tensor::from_ints(sample_indices, device);
-
-                let state_batch = get_states_batch(memory.states(), sample_indices, device);
-                let action_batch = get_action_batch(memory.actions(), sample_indices, device);
+                let sample_indices_tensor = Tensor::from_ints(sample_indices, &self.device);
+                let state_batch = get_states_batch(memory.states(), sample_indices, &self.device);
+                let action_batch = get_action_batch(memory.actions(), sample_indices, &self.device);
                 let old_policy_batch = old_polices.clone().select(0, sample_indices_tensor.clone());
                 let advantage_batch = advantages.clone().select(0, sample_indices_tensor.clone());
                 let expected_return_batch = expected_returns
@@ -94,7 +104,7 @@ impl<B: AutodiffBackend> PPO<B> {
                     .gather(1, action_batch);
                 let clipped_ratios = ratios
                     .clone()
-                    .clamp(1.0 - config.clip_range, 1.0 + config.clip_range);
+                    .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
 
                 let actor_loss = -elementwise_min(
                     ratios * advantage_batch.clone(),
@@ -102,29 +112,41 @@ impl<B: AutodiffBackend> PPO<B> {
                 )
                 .sum();
 
-                let policy_negative_entropy = -(policy_batch.clone().log() * policy_batch)
+                let entropy = (policy_batch.clone().log() * policy_batch)
                     .sum_dim(1)
                     .mean();
+                mean_entropy += entropy.clone().into_scalar().to_f32();
 
-                let ppo_loss =
-                    actor_loss + policy_negative_entropy.mul_scalar(config.entropy_coeff);
+                let ppo_loss = actor_loss - entropy.mul_scalar(self.config.entropy_coeff);
                 net.actor = update_parameters(
                     ppo_loss * batch_size_ratio,
                     net.actor,
-                    policy_optimizer,
-                    config.learning_rate.into(),
+                    &mut self.policy_optimizer,
+                    self.config.learning_rate.into(),
                 );
 
                 let critic_loss =
-                    MseLoss.forward(expected_return_batch, value_batch, Reduction::Sum);
+                    MseLoss.forward(expected_return_batch, value_batch, Reduction::Sum)
+                        * batch_size_ratio;
+                mean_val_loss += critic_loss.clone().into_scalar().to_f32();
+
                 net.critic = update_parameters(
-                    critic_loss * batch_size_ratio,
+                    critic_loss,
                     net.critic,
-                    value_optimizer,
-                    config.learning_rate.into(),
+                    &mut self.value_optimizer,
+                    self.config.learning_rate.into(),
                 );
             }
         }
+
+        let mini_batch_iters =
+            1.max(memory.len() / self.config.mini_batch_size * self.config.epochs);
+
+        mean_val_loss /= mini_batch_iters as f32;
+        mean_entropy /= mini_batch_iters as f32;
+
+        metrics[".Value Loss"] = mean_val_loss.into();
+        metrics[".Entropy"] = mean_entropy.into();
 
         net
     }

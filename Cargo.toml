@@ -13,6 +13,9 @@ ringbuffer = "0.15.0"
 rand = "0.9.1"
 itertools = "0.14.0"
 
+[features]
+examples = ["burn/ndarray", "burn/vulkan", "burn/rocm", "burn/router", "burn/fusion"]
+
 [profile.dev]
 opt-level = 1
 incremental = false
@@ -28,4 +31,4 @@ cubecl = { path = "/root/cubecl/crates/cubecl" }
 
 [[example]]
 name = "generic"
-required-features = ["burn/ndarray", "burn/vulkan", "burn/rocm", "burn/router", "burn/fusion"]
+required-features = ["examples"]

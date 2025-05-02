@@ -3,7 +3,7 @@
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rlgymppo::{
     agent::{PPO, config::PPOTrainingConfig, model::Actic},
-    environment::rsim::GameInstance,
+    environment::batch_sim::{BatchSim, BatchSimConfig},
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     },
@@ -15,7 +15,12 @@ use rlgymppo::{
     },
     utils::{AvgTracker, Report},
 };
-use std::{mem, num::NonZeroUsize, thread::available_parallelism, time::Instant};
+use std::{
+    io::{Read, stdin},
+    sync::mpsc::{Receiver, Sender, channel},
+    thread,
+    time::Instant,
+};
 
 struct SharedInfo {
     rng: SmallRng,
@@ -34,13 +39,15 @@ impl Default for SharedInfo {
 struct MySharedInfoProvider;
 
 impl SharedInfoProvider<SharedInfo> for MySharedInfoProvider {
-    fn reset(&mut self, _initial_state: &GameStateA, shared_info: &mut SharedInfo) {}
+    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
 
     fn apply(&mut self, game_state: &GameStateA, shared_info: &mut SharedInfo) {
         for car in &game_state.cars {
             let dist_to_ball = car.state.pos.distance(game_state.ball.pos);
-            shared_info.metrics["Avg. dist to ball"] += dist_to_ball.into();
-            shared_info.metrics["Avg.velocity"] += car.state.vel.length().into();
+            shared_info.metrics["Avg. dist to ball"] +=
+                AvgTracker::new(dist_to_ball as f64, 1).into();
+            shared_info.metrics["Avg. velocity"] +=
+                AvgTracker::new(car.state.vel.length() as f64, 1).into();
         }
     }
 }
@@ -58,7 +65,7 @@ impl StateSetter<SharedInfo> for MyStateSetter {
 
         // random game mode, 1v1, 2v2, or 3v3
         let octane = CarConfig::octane();
-        for _ in 0..2 {
+        for _ in 0..shared_info.rng.random_range(1..4) {
             let _ = arena.pin_mut().add_car(Team::Blue, octane);
             let _ = arena.pin_mut().add_car(Team::Orange, octane);
         }
@@ -442,7 +449,38 @@ fn main() {
     // learner.learn();
     // learner.save();
 
-    run::<Autodiff<Router<(Rocm, Vulkan, Wgpu, NdArray)>>>();
+    println!("Starting PPO training...");
+
+    let (s, r) = channel();
+
+    thread::spawn(move || {
+        stdin_reader(s);
+    });
+
+    run::<Autodiff<Router<(Rocm, Vulkan, Wgpu, NdArray)>>>(r);
+}
+
+enum HumanInput {
+    Save,
+    Quit,
+}
+
+fn stdin_reader(s: Sender<HumanInput>) {
+    let mut buffer = [0; 1];
+    while stdin().read_exact(&mut buffer).is_ok() {
+        match char::from(buffer[0]).to_ascii_lowercase() {
+            'q' => {
+                println!("Finishing iteration, saving, then exiting...");
+                s.send(HumanInput::Quit).unwrap();
+                return;
+            }
+            's' => {
+                println!("Saving model after this iteration...");
+                s.send(HumanInput::Save).unwrap();
+            }
+            _ => {}
+        }
+    }
 }
 
 use burn::{
@@ -451,33 +489,28 @@ use burn::{
     optim::AdamConfig,
     tensor::backend::AutodiffBackend,
 };
-use rlgymppo::base::Memory;
 
-pub fn run<B: AutodiffBackend>() {
+fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
     let env = create_env();
     let obs_space = env.get_obs_space();
     dbg!(obs_space);
     let action_space = env.get_action_space();
     dbg!(action_space);
 
-    let mut game = GameInstance::new(env, step_callback);
+    let config = PPOTrainingConfig {
+        learning_rate: 3e-4,
+        epochs: 2,
+        batch_size: 50_000,
+        mini_batch_size: 20_000,
+        ..Default::default()
+    };
 
     let device = B::Device::default();
     let mut rng = rand::rngs::SmallRng::from_os_rng();
-    let mut model = Actic::<B>::new(
-        obs_space,
-        action_space,
-        vec![256, 256, 256, 256],
-        vec![256, 256, 256, 256],
-        // vec![512, 512, 512, 512],
-        // vec![512, 512, 512, 512],
-        &device,
-    );
+    let mut model = Actic::<B>::new(obs_space, action_space, vec![512; 4], vec![512; 4], &device);
 
     println!("# parameters in actor: {}", model.actor.num_params());
     println!("# parameters in critic: {}", model.critic.num_params());
-
-    let config = PPOTrainingConfig::default();
 
     let mut policy_optimizer = AdamConfig::new()
         .with_grad_clipping(config.clip_grad.clone())
@@ -486,58 +519,66 @@ pub fn run<B: AutodiffBackend>() {
         .with_grad_clipping(config.clip_grad.clone())
         .init();
 
-    let mut memory = Memory::new(config.batch_size);
+    let mut batch_sim = BatchSim::new(
+        create_env,
+        step_callback,
+        BatchSimConfig {
+            num_games: 5,
+            buffer_size: config.batch_size,
+            device: device.clone(),
+        },
+    );
 
     println!("Running for the first time. This might be slow at first...");
 
     let mut i = 0;
-    loop {
-        let start = Instant::now();
+    'train: loop {
+        let collect_start = Instant::now();
+        let memory = batch_sim.run(model.valid());
+        let collect_elapsed = collect_start.elapsed().as_secs_f64();
 
-        let model_no_grad = model.valid();
-
-        let mut episode_done = false;
-        let (mut state, mut obs) = game.reset();
-        while !episode_done {
-            let actions = PPO::<B::InnerBackend>::react(&obs, &model_no_grad, &mut rng, &device);
-            let result = game.step(&state, &actions);
-
-            let old_obs = mem::replace(&mut obs, result.obs);
-
-            memory.push_batch(
-                old_obs,
-                &obs,
-                actions,
-                result.rewards,
-                result.is_terminal,
-                result.truncated,
-            );
-
-            state = result.state;
-            episode_done = result.is_terminal || result.truncated;
-        }
-
-        let mut metrics = game.get_metrics();
         let num_steps = memory.len() as f64;
-        metrics["Episode Length"] = num_steps.into();
-        metrics["Collected SPS"] = (num_steps / start.elapsed().as_secs_f64()).into();
-
+        let train_start = Instant::now();
         model = PPO::<B>::train(
             model,
-            &memory,
+            memory,
             &mut policy_optimizer,
             &mut value_optimizer,
             &config,
             &mut rng,
             &device,
         );
-        metrics["Overall SPS"] = (num_steps / start.elapsed().as_secs_f64()).into();
         memory.clear();
+
+        let train_elapsed = train_start.elapsed().as_secs_f64();
+        let overall_elapsed = collect_start.elapsed().as_secs_f64();
+
+        let mut metrics = batch_sim.get_metrics();
+        metrics[".Episode Length"] = num_steps.into();
+        metrics[".Collection time"] = collect_elapsed.into();
+        metrics[".Collected SPS"] = (num_steps / collect_elapsed).into();
+        metrics[".Training time"] = train_elapsed.into();
+        metrics[".Overall time"] = overall_elapsed.into();
+        metrics[".Overall SPS"] = (num_steps / collect_start.elapsed().as_secs_f64()).into();
 
         println!("episode {i}:\n{metrics}");
         i += 1;
-        if i == 10 {
-            break;
+
+        println!("Press Q to quit...");
+        for input in r.try_iter() {
+            match input {
+                HumanInput::Quit => {
+                    break 'train;
+                }
+                HumanInput::Save => {
+                    println!("Saving model...");
+                    // Save the model
+                }
+            }
         }
     }
+
+    // Save the model
+    println!("Saving model...");
+    println!("Exiting.")
 }

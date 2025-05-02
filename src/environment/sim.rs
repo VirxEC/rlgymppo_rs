@@ -1,10 +1,16 @@
-use std::mem;
-
 use crate::utils::{AvgTracker, Report};
 use rlgym::{
-    Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, StepResult, Terminal,
-    Truncate, rocketsim_rs::glam_ext::GameStateA,
+    Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
+    rocketsim_rs::glam_ext::GameStateA,
 };
+use std::mem;
+
+pub struct StepResult {
+    pub obs: FullObs,
+    pub rewards: Vec<f32>,
+    pub is_terminal: bool,
+    pub truncated: bool,
+}
 
 pub struct GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
@@ -19,6 +25,7 @@ where
 {
     env: Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
     step_callback: C,
+    last_state: GameStateA,
     metrics: Report,
 }
 
@@ -38,20 +45,30 @@ where
         Self {
             env,
             step_callback,
+            last_state: GameStateA::default(),
             metrics: Report::default(),
         }
     }
 
-    pub fn reset(&mut self) -> (GameStateA, FullObs) {
-        self.env.reset()
+    pub fn num_players(&self) -> usize {
+        self.last_state.cars.len()
     }
 
-    pub fn step(&mut self, game_state: &GameStateA, actions: &[ACT::Input]) -> StepResult {
-        let result = self.env.step(game_state, actions);
+    pub fn reset(&mut self) -> FullObs {
+        let (state, obs) = self.env.reset();
+        self.last_state = state;
+
+        obs
+    }
+
+    pub fn step(&mut self, actions: &[ACT::Input]) -> StepResult {
+        let result = self.env.step(&self.last_state, actions);
+        self.last_state = result.state;
+
         (self.step_callback)(
             &mut self.metrics,
             self.env.get_mut_shared_info(),
-            game_state,
+            &self.last_state,
         );
 
         let num_players = result.rewards.len();
@@ -59,7 +76,12 @@ where
 
         self.metrics["Avg. step reward"] += AvgTracker::new(total_rew, num_players as u64).into();
 
-        result
+        StepResult {
+            obs: result.obs,
+            rewards: result.rewards,
+            is_terminal: result.is_terminal,
+            truncated: result.truncated,
+        }
     }
 
     pub fn get_metrics(&mut self) -> Report {

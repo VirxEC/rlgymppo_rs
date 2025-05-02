@@ -92,10 +92,7 @@ pub struct Report {
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(
-            f,
-            "-------------------------Iteration report-------------------------"
-        )?;
+        writeln!(f, "{}Iteration report{}", "-".repeat(25), "-".repeat(25),)?;
         let mut items: Vec<_> = self.data.iter().collect();
         items.sort_unstable_by(|a, b| a.0.cmp(b.0));
 

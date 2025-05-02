@@ -8,6 +8,7 @@ use rlgym::{
 };
 use std::mem;
 
+#[derive(Clone, Copy)]
 pub struct BatchSimConfig {
     pub num_games: usize,
     pub buffer_size: usize,
@@ -64,6 +65,9 @@ where
     where
         F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
     {
+        assert_ne!(config.num_games, 0, "num_games must be greater than 0");
+        assert_ne!(config.buffer_size, 0, "buffer_size must be greater than 0");
+
         let mut games = Vec::with_capacity(config.num_games);
 
         let mut last_obs = Vec::with_capacity(config.num_games * 2);

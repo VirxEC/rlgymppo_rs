@@ -1,9 +1,9 @@
 #![recursion_limit = "256"]
 
+use burn::backend::{Autodiff, NdArray, Rocm, Router, Wgpu};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rlgymppo::{
-    agent::{config::PPOTrainingConfig, model::Actic},
-    environment::batch_sim::{BatchSim, BatchSimConfig},
+    LearnerConfig, PpoLearnerConfig,
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     },
@@ -13,16 +13,7 @@ use rlgymppo::{
         init,
         sim::{Arena, CarConfig, CarControls, Team},
     },
-    utils::{
-        AvgTracker, Report,
-        serde::{load_latest_model, save_model},
-    },
-};
-use std::{
-    io::{Read, stdin},
-    sync::mpsc::{Receiver, Sender, channel},
-    thread,
-    time::Instant,
+    utils::{AvgTracker, Report},
 };
 
 struct SharedInfo {
@@ -416,177 +407,30 @@ fn main() {
 
     // let num_threads = NonZeroUsize::new(1).unwrap();
     // let num_threads = available_parallelism().unwrap();
-    // let num_games_per_thread = NonZeroUsize::new(24).unwrap();
-    // let mini_batch_size = 2500;
-    // let batch_size = mini_batch_size * 30;
-    // let lr = 3e-4;
+    let mini_batch_size = 20000;
+    let batch_size = mini_batch_size * 3;
+    let lr = 3e-4;
 
-    // let config = LearnerConfig {
-    //     num_threads,
-    //     num_games_per_thread,
-    //     render: true,
-    //     exp_buffer_size: batch_size,
-    //     timesteps_per_save: 10_000_000,
-    //     collection_timesteps_overflow: 0,
-    //     check_update_frequency: 15,
-    //     collection_during_learn: false,
-    //     device: Device::cuda_if_available(),
-    //     ppo: PPOLearnerConfig {
-    //         batch_size,
-    //         mini_batch_size,
-    //         epochs: 3,
-    //         ent_coef: 0.01,
-    //         policy_lr: lr,
-    //         critic_lr: lr,
-    //         policy_layer_sizes: vec![256, 256, 256],
-    //         critic_layer_sizes: vec![256, 256, 256],
-    //         // policy_layer_sizes: vec![16, 16, 16],
-    //         // critic_layer_sizes: vec![16, 16, 16],
-    //         ..Default::default()
-    //     },
-    //     ..Default::default()
-    // };
-
-    // let mut learner = Learner::new(create_env, step_callback, config);
-    // learner.load();
-    // learner.learn();
-    // learner.save();
-
-    println!("Starting PPO training...");
-
-    let (s, r) = channel();
-
-    thread::spawn(move || {
-        stdin_reader(s);
-    });
-
-    run::<Autodiff<Router<(Rocm, Vulkan, Wgpu, NdArray)>>>(r);
-}
-
-enum HumanInput {
-    Save,
-    Quit,
-}
-
-fn stdin_reader(s: Sender<HumanInput>) {
-    let mut buffer = [0; 1];
-    while stdin().read_exact(&mut buffer).is_ok() {
-        match char::from(buffer[0]).to_ascii_lowercase() {
-            'q' => {
-                println!("Finishing iteration, saving, then exiting...");
-                s.send(HumanInput::Quit).unwrap();
-                return;
-            }
-            's' => {
-                println!("Saving model after this iteration...");
-                s.send(HumanInput::Save).unwrap();
-            }
-            _ => {}
-        }
-    }
-}
-
-use burn::{
-    backend::{Autodiff, NdArray, Rocm, Router, Vulkan, Wgpu},
-    module::{AutodiffModule, Module},
-    tensor::backend::AutodiffBackend,
-};
-
-fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
-    let save_folder = "checkpoints";
-
-    let env = create_env();
-    let obs_space = env.get_obs_space();
-    dbg!(obs_space);
-    let action_space = env.get_action_space();
-    dbg!(action_space);
-
-    let config = PPOTrainingConfig {
-        learning_rate: 3e-4,
-        epochs: 2,
-        batch_size: 50_000,
-        mini_batch_size: 20_000,
+    let config = LearnerConfig::<Autodiff<Router<(Rocm, Wgpu, NdArray)>>> {
+        // render: true,
+        // num_threads,
+        num_games_per_thread: 5,
+        exp_buffer_size: batch_size,
+        timesteps_per_save: 10_000_000,
+        checkpoints_limit: Some(3),
+        ppo: PpoLearnerConfig {
+            batch_size,
+            mini_batch_size,
+            epochs: 2,
+            learning_rate: lr,
+            ..Default::default()
+        },
+        policy_layer_sizes: vec![512; 4],
+        critic_layer_sizes: vec![512; 4],
         ..Default::default()
     };
 
-    let device = B::Device::default();
-    let mut rng = SmallRng::from_os_rng();
-
-    let model = Actic::<B>::new(obs_space, action_space, vec![512; 4], vec![512; 4], &device);
-    let (mut model, mut stats) = load_latest_model(model, save_folder, &device);
-
-    println!("# parameters in actor: {}", model.actor.num_params());
-    println!("# parameters in critic: {}", model.critic.num_params());
-
-    let mut batch_sim = BatchSim::new(
-        create_env,
-        step_callback,
-        BatchSimConfig {
-            num_games: 5,
-            buffer_size: config.batch_size,
-        },
-        device.clone(),
-    );
-
-    println!("Running for the first time. This might be slow at first...");
-    println!("Press Q to quit, and S to save then continue (must confirm by pressing enter)");
-
-    let mut ppo = config.init(device);
-    let mut metrics = Report::default();
-
-    let mut i = 0;
-    'train: loop {
-        let collect_start = Instant::now();
-        let memory = batch_sim.run(model.valid());
-        let collect_elapsed = collect_start.elapsed().as_secs_f64();
-
-        stats.cumulative_timesteps += memory.len() as u64;
-        let num_steps = memory.len() as f64;
-
-        let train_start = Instant::now();
-        model = ppo.train(model, memory, &mut rng, &mut metrics, &mut stats);
-        memory.clear();
-
-        let train_elapsed = train_start.elapsed().as_secs_f64();
-        let overall_elapsed = collect_start.elapsed().as_secs_f64();
-
-        metrics += batch_sim.get_metrics();
-        metrics[".Episode Length"] = num_steps.into();
-        metrics[".Collection time"] = collect_elapsed.into();
-        metrics[".Collected SPS"] = (num_steps / collect_elapsed).into();
-        metrics[".Training time"] = train_elapsed.into();
-        metrics[".Overall time"] = overall_elapsed.into();
-        metrics[".Overall SPS"] = (num_steps / collect_start.elapsed().as_secs_f64()).into();
-        metrics[".Cumulative steps"] = stats.cumulative_timesteps.into();
-        metrics[".Cumulative epochs"] = stats.cumulative_epochs.into();
-        metrics[".Cumulative updates"] = stats.cumulative_model_updates.into();
-
-        i += 1;
-        println!("episode {i}:\n{metrics}");
-        metrics.clear();
-
-        for input in r.try_iter() {
-            match input {
-                HumanInput::Quit => {
-                    break 'train;
-                }
-                HumanInput::Save => {
-                    println!("Saving model...");
-                    save_model(model.valid(), &stats, save_folder, Some(2));
-                }
-            }
-        }
-
-        if i % 10 == 0 {
-            println!(
-                "Press Q to quit, and S to save then continue (must confirm by pressing enter)"
-            );
-        }
-    }
-
-    // Save the model
-    println!("Saving model...");
-    save_model(model, &stats, save_folder, None);
-
-    println!("Exiting.")
+    let mut learner = config.init(create_env, step_callback);
+    learner.load();
+    learner.learn();
 }

@@ -16,6 +16,8 @@ pub fn save_model<B: Backend, P: AsRef<Path>>(
     base_folder: P,
     limit: Option<usize>,
 ) {
+    println!("Saving model...");
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

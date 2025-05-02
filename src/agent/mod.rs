@@ -3,7 +3,7 @@ pub mod model;
 
 use crate::{
     agent::{
-        config::PPOTrainingConfig,
+        config::PpoLearnerConfig,
         model::{Actic, Net, PPOOutput},
     },
     base::{Memory, MemoryIndices, get_action_batch, get_batch_1d, get_states_batch},
@@ -17,15 +17,15 @@ use burn::{
 };
 use rand::{Rng, seq::SliceRandom};
 
-pub struct PPO<B: AutodiffBackend> {
-    config: PPOTrainingConfig,
+pub struct Ppo<B: AutodiffBackend> {
+    config: PpoLearnerConfig,
     policy_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
     value_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
     device: B::Device,
 }
 
-impl<B: AutodiffBackend> PPO<B> {
-    pub fn new(config: PPOTrainingConfig, device: B::Device) -> Self {
+impl<B: AutodiffBackend> Ppo<B> {
+    pub fn new(config: PpoLearnerConfig, device: B::Device) -> Self {
         Self {
             policy_optimizer: AdamConfig::new()
                 .with_grad_clipping(config.clip_grad.clone())
@@ -39,7 +39,7 @@ impl<B: AutodiffBackend> PPO<B> {
     }
 }
 
-impl<B: AutodiffBackend> PPO<B> {
+impl<B: AutodiffBackend> Ppo<B> {
     pub fn train<R: Rng>(
         &mut self,
         mut net: Actic<B>,

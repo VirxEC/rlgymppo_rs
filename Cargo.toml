@@ -14,7 +14,21 @@ rand = "0.9.1"
 itertools = "0.14.0"
 
 [features]
-examples = ["burn/ndarray", "burn/vulkan", "burn/rocm", "burn/router", "burn/fusion"]
+default = ["router", "fusion"]
+
+# performance
+fusion = ["burn/fusion"]
+
+# multi-device
+router = ["burn/router"]
+
+# backends
+ndarray = ["burn/ndarray"]
+wgpu = ["burn/wgpu"]
+rocm = ["burn/rocm"]
+cuda = ["burn/cuda"]
+
+examples = ["ndarray", "wgpu", "rocm"]
 
 [profile.dev]
 opt-level = 1

@@ -1,8 +1,8 @@
 #![recursion_limit = "256"]
 
-use burn::backend::{Autodiff, NdArray, Rocm, Router, Wgpu};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rlgymppo::{
+    backend::{Autodiff, NdArray, Rocm, Router, Wgpu},
     LearnerConfig, PpoLearnerConfig,
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,

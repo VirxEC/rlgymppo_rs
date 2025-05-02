@@ -5,6 +5,7 @@ mod environment;
 
 pub mod utils;
 
+pub use burn::backend;
 pub use agent::config::PpoLearnerConfig;
 pub use rlgym::{self, glam, rocketsim_rs};
 

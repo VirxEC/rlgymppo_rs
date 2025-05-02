@@ -1,4 +1,6 @@
-use burn::grad_clipping::GradientClippingConfig;
+use burn::{grad_clipping::GradientClippingConfig, tensor::backend::AutodiffBackend};
+
+use super::PPO;
 
 pub struct PPOTrainingConfig {
     pub gamma: f32,
@@ -25,5 +27,11 @@ impl Default for PPOTrainingConfig {
             mini_batch_size: 20_000,
             clip_grad: Some(GradientClippingConfig::Norm(0.5)),
         }
+    }
+}
+
+impl PPOTrainingConfig {
+    pub fn init<B: AutodiffBackend>(self, device: B::Device) -> PPO<B> {
+        PPO::new(self, device)
     }
 }

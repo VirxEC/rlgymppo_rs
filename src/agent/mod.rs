@@ -112,12 +112,12 @@ impl<B: AutodiffBackend> PPO<B> {
                 )
                 .sum();
 
-                let entropy = (policy_batch.clone().log() * policy_batch)
+                let entropy = -(policy_batch.clone().log() * policy_batch)
                     .sum_dim(1)
                     .mean();
                 mean_entropy += entropy.clone().into_scalar().to_f32();
 
-                let ppo_loss = actor_loss - entropy.mul_scalar(self.config.entropy_coeff);
+                let ppo_loss = actor_loss + entropy.mul_scalar(self.config.entropy_coeff);
                 net.actor = update_parameters(
                     ppo_loss * batch_size_ratio,
                     net.actor,

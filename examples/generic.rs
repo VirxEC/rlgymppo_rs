@@ -2,7 +2,7 @@
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rlgymppo::{
-    agent::{PPO, config::PPOTrainingConfig, model::Actic},
+    agent::{config::PPOTrainingConfig, model::Actic},
     environment::batch_sim::{BatchSim, BatchSimConfig},
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
@@ -13,7 +13,10 @@ use rlgymppo::{
         init,
         sim::{Arena, CarConfig, CarControls, Team},
     },
-    utils::{AvgTracker, Report},
+    utils::{
+        AvgTracker, Report,
+        serde::{load_latest_model, save_model},
+    },
 };
 use std::{
     io::{Read, stdin},
@@ -485,11 +488,13 @@ fn stdin_reader(s: Sender<HumanInput>) {
 
 use burn::{
     backend::{Autodiff, NdArray, Rocm, Router, Vulkan, Wgpu},
-    module::{AutodiffModule, ModuleDisplayDefault},
+    module::{AutodiffModule, Module},
     tensor::backend::AutodiffBackend,
 };
 
 fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
+    let save_folder = "checkpoints";
+
     let env = create_env();
     let obs_space = env.get_obs_space();
     dbg!(obs_space);
@@ -505,8 +510,9 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
     };
 
     let device = B::Device::default();
-    let mut rng = rand::rngs::SmallRng::from_os_rng();
+    let mut rng = SmallRng::from_os_rng();
     let mut model = Actic::<B>::new(obs_space, action_space, vec![512; 4], vec![512; 4], &device);
+    model = load_latest_model(model, save_folder, &device);
 
     println!("# parameters in actor: {}", model.actor.num_params());
     println!("# parameters in critic: {}", model.critic.num_params());
@@ -522,8 +528,9 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
     );
 
     println!("Running for the first time. This might be slow at first...");
+    println!("Press Q to quit, and S to save then continue (must confirm by pressing enter)");
 
-    let mut ppo = PPO::new(config, device);
+    let mut ppo = config.init(device);
     let mut metrics = Report::default();
 
     let mut i = 0;
@@ -552,7 +559,6 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
         println!("episode {i}:\n{metrics}");
         metrics.clear();
 
-        println!("Press Q to quit...");
         for input in r.try_iter() {
             match input {
                 HumanInput::Quit => {
@@ -560,13 +566,21 @@ fn run<B: AutodiffBackend>(r: Receiver<HumanInput>) {
                 }
                 HumanInput::Save => {
                     println!("Saving model...");
-                    // Save the model
+                    save_model(model.valid(), save_folder, None);
                 }
             }
+        }
+
+        if i % 10 == 0 {
+            println!(
+                "Press Q to quit, and S to save then continue (must confirm by pressing enter)"
+            );
         }
     }
 
     // Save the model
     println!("Saving model...");
+    save_model(model, save_folder, Some(1));
+
     println!("Exiting.")
 }

@@ -66,7 +66,7 @@ impl StateSetter<SharedInfo> for MyStateSetter {
 
         arena
             .pin_mut()
-            .reset_to_random_kickoff(Some(shared_info.rng.random_range(-1000..1000)));
+            .reset_to_random_kickoff(Some(shared_info.rng.random()));
 
         let mut state = arena.pin_mut().get_game_state();
         for car in &mut state.cars {

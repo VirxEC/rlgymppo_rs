@@ -74,6 +74,13 @@ impl StateSetter<SharedInfo> for MyStateSetter {
             car.state.vel.y = shared_info.rng.random_range(-1300.0..1300.0);
         }
         arena.pin_mut().set_game_state(&state).unwrap();
+
+        arena.pin_mut().set_goal_scored_callback(
+            |arena, _, _| {
+                arena.reset_to_random_kickoff(None);
+            },
+            0,
+        );
     }
 }
 

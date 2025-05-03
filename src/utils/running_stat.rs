@@ -5,7 +5,7 @@ pub struct Stats {
     pub cumulative_timesteps: u64,
     pub cumulative_model_updates: u64,
     pub cumulative_epochs: u64,
-    // return_stat: WelfordRunningStat,
+    pub return_stat: WelfordRunningStat,
     // todo, for wandb metrics reporting
     // run_id: String,
 }
@@ -29,8 +29,8 @@ impl WelfordRunningStat {
         self.running_variance += delta * delta_n * current_count;
     }
 
-    pub fn increment(&mut self, samples: Vec<f32>, num: usize) {
-        for sample in samples.into_iter().take(num) {
+    pub fn increment(&mut self, samples: Vec<f32>) {
+        for sample in samples {
             self.update(sample as f64);
         }
     }

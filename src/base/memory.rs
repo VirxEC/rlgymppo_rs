@@ -4,12 +4,8 @@ use ringbuffer::{AllocRingBuffer, RingBuffer};
 
 pub type MemoryIndices = Vec<usize>;
 
-pub fn get_batch_1d<T: Copy>(data: &AllocRingBuffer<T>, indices: &MemoryIndices) -> Vec<T> {
-    indices
-        .iter()
-        .filter_map(|i| data.get(*i))
-        .copied()
-        .collect::<Vec<_>>()
+pub fn get_batch_1d<T: Copy>(data: &AllocRingBuffer<T>, indices: &[usize]) -> Vec<T> {
+    indices.iter().map(|i| data[*i]).collect::<Vec<_>>()
 }
 
 pub fn get_states_batch<B: Backend>(

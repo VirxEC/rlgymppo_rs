@@ -7,6 +7,8 @@ pub struct PpoLearnerConfig {
     pub lambda: f32,
     pub clip_range: f32,
     pub entropy_coeff: f32,
+    pub standardize_returns: bool,
+    pub max_returns_per_stats_increment: usize,
     pub clip_grad: Option<GradientClippingConfig>,
     /// Learning rate for the optimizer.
     pub learning_rate: f32,
@@ -26,6 +28,8 @@ impl Default for PpoLearnerConfig {
             lambda: 0.95,
             clip_range: 0.2,
             entropy_coeff: 0.01,
+            standardize_returns: true,
+            max_returns_per_stats_increment: 150,
             learning_rate: 3e-4,
             epochs: 4,
             batch_size: 60_000,

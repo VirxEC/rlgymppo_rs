@@ -81,6 +81,10 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub num_games_per_thread: usize,
     /// The size of the experience replay buffer.
     pub exp_buffer_size: usize,
+    /// The number of additional iterations (episodes) to run training for,
+    /// exiting after that.
+    /// `None` means run indefinitely.
+    pub num_additional_iterations: Option<u64>,
 }
 
 impl<B: AutodiffBackend> Default for LearnerConfig<B> {
@@ -95,6 +99,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             timesteps_per_save: 1_000_000,
             num_games_per_thread: 4,
             exp_buffer_size: 60_000,
+            num_additional_iterations: None,
         }
     }
 }
@@ -171,6 +176,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             checkpoints_limit: self.checkpoints_limit,
             timesteps_per_save: self.timesteps_per_save,
             last_save_timestep: 0,
+            num_additional_iterations: self.num_additional_iterations,
             batch_sim,
         }
     }
@@ -198,6 +204,7 @@ where
     checkpoints_limit: Option<usize>,
     timesteps_per_save: u64,
     last_save_timestep: u64,
+    num_additional_iterations: Option<u64>,
     batch_sim: BatchSim<B::InnerBackend, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
 }
 
@@ -237,9 +244,13 @@ where
         });
 
         println!("Running for the first time. This might be slow at first...");
-        println!("Press Q to quit, and S to save then continue (must confirm by pressing enter)\n");
+        println!("Press Q to quit, and S to quick save (must confirm by pressing enter)\n");
 
-        'train: loop {
+        let inital_cumulative_updates = self.stats.cumulative_model_updates;
+        'train: while self
+            .num_additional_iterations
+            .is_none_or(|n| self.stats.cumulative_model_updates - inital_cumulative_updates < n)
+        {
             let collect_start = Instant::now();
             let memory = self.batch_sim.run(model.valid());
             let collect_elapsed = collect_start.elapsed().as_secs_f64();
@@ -302,9 +313,7 @@ where
             }
 
             if self.stats.cumulative_model_updates % 10 == 0 {
-                println!(
-                    "Press Q to quit, and S to save then continue (must confirm by pressing enter)\n"
-                );
+                println!("Press Q to quit, and S to quick save (must confirm by pressing enter)\n");
             }
         }
 

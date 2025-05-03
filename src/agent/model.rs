@@ -1,4 +1,4 @@
-use crate::utils::{sample_actions_from_tensor, to_state_tensor_2d};
+use crate::utils::{argmax_actions, sample_actions, to_state_tensor_2d};
 use burn::{
     nn::{Initializer, Linear, LinearConfig},
     prelude::*,
@@ -58,6 +58,11 @@ impl<B: Backend> Net<B> {
     }
 }
 
+pub struct Reaction {
+    pub actions: Vec<usize>,
+    pub log_probs: Vec<f32>,
+}
+
 #[derive(Module, Debug)]
 pub struct Actic<B: Backend> {
     pub actor: Net<B>,
@@ -110,10 +115,27 @@ impl<B: Backend> Actic<B> {
 
         softmax(self.actor.layers[num_layers - 1].forward(input), 1).clamp(1e-11, 1.0)
     }
-}
 
-impl<B: Backend> Actic<B> {
-    pub fn react<R: Rng>(&self, state: &[Vec<f32>], rng: &mut R, device: &B::Device) -> Vec<usize> {
-        sample_actions_from_tensor(self.infer(to_state_tensor_2d(state, device)), rng)
+    pub fn react_deterministic(&self, state: &[Vec<f32>], device: &B::Device) -> Vec<usize> {
+        argmax_actions(self.infer(to_state_tensor_2d(state, device)))
+    }
+
+    pub fn react<R: Rng>(&self, state: &[Vec<f32>], rng: &mut R, device: &B::Device) -> Reaction {
+        let probs = self.infer(to_state_tensor_2d(state, device));
+
+        let actions = sample_actions(probs.clone(), rng);
+        let acts_ten = Tensor::from_data(
+            TensorData::new(
+                actions.iter().map(|x| *x as i32).collect::<Vec<_>>(),
+                [actions.len(), 1],
+            ),
+            device,
+        );
+        let log_probs = probs.gather(1, acts_ten).log();
+
+        Reaction {
+            actions,
+            log_probs: log_probs.into_data().into_vec().unwrap(),
+        }
     }
 }

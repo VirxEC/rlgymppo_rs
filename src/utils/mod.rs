@@ -11,7 +11,7 @@ use burn::{
     module::AutodiffModule,
     optim::{GradientsParams, Optimizer},
     prelude::*,
-    tensor::{Transaction, backend::AutodiffBackend},
+    tensor::{Transaction, backend::AutodiffBackend, cast::ToElement},
 };
 use rand::{
     Rng,
@@ -30,10 +30,7 @@ pub(crate) fn to_state_tensor_2d<B: Backend>(
     Tensor::from_data(TensorData::new(data, [state.len(), state[0].len()]), device)
 }
 
-pub(crate) fn sample_actions_from_tensor<B: Backend, R: Rng>(
-    output: Tensor<B, 2>,
-    rng: &mut R,
-) -> Vec<usize> {
+pub(crate) fn sample_actions<B: Backend, R: Rng>(output: Tensor<B, 2>, rng: &mut R) -> Vec<usize> {
     let num_actions = output.shape().dims[0];
 
     let mut transaction = Transaction::default();
@@ -51,6 +48,15 @@ pub(crate) fn sample_actions_from_tensor<B: Backend, R: Rng>(
 
     debug_assert_eq!(actions.len(), num_actions);
     actions
+}
+
+pub(crate) fn argmax_actions<B: Backend>(output: Tensor<B, 2>) -> Vec<usize> {
+    output
+        .argmax(1)
+        .into_data()
+        .iter::<B::IntElem>()
+        .map(|x| x.to_usize())
+        .collect()
 }
 
 pub(crate) fn elementwise_min<B: Backend, const D: usize>(

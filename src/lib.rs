@@ -238,6 +238,7 @@ where
 
         println!("Running for the first time. This might be slow at first...");
         println!("Press Q to quit, and S to save then continue (must confirm by pressing enter)\n");
+
         'train: loop {
             let collect_start = Instant::now();
             let memory = self.batch_sim.run(model.valid());
@@ -246,7 +247,6 @@ where
             self.stats.cumulative_timesteps += memory.len() as u64;
             let num_steps = memory.len() as f64;
 
-            self.metrics.clear();
             let train_start = Instant::now();
             model = self.ppo.train(
                 model,

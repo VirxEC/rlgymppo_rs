@@ -339,7 +339,8 @@ impl<B: AutodiffBackend> Learner<B> {
 
             // train the model
             let train_start = Instant::now();
-            self.model = self.ppo.learn(
+            let num_new_steps;
+            (self.model, num_new_steps) = self.ppo.learn(
                 self.model,
                 memory,
                 &mut self.rng,
@@ -350,14 +351,14 @@ impl<B: AutodiffBackend> Learner<B> {
             let learn_elapsed = train_start.elapsed().as_secs_f64();
             let overall_elapsed = collect_start.elapsed().as_secs_f64();
 
-            self.stats.cumulative_timesteps += memory.len() as u64;
-            let num_steps = memory.len() as f64;
-            metrics[".Episode length"] = num_steps.into();
+            self.stats.cumulative_timesteps += num_new_steps as u64;
+            metrics[".Episode length"] = num_new_steps.into();
             metrics[".Collection time"] = collect_elapsed.into();
-            metrics[".Collected SPS"] = (num_steps / collect_elapsed).into();
+            metrics[".Collected SPS"] = (num_new_steps as f64 / collect_elapsed).into();
             metrics[".Learning time"] = learn_elapsed.into();
             metrics[".Overall time"] = overall_elapsed.into();
-            metrics[".Overall SPS"] = (num_steps / collect_start.elapsed().as_secs_f64()).into();
+            metrics[".Overall SPS"] =
+                (num_new_steps as f64 / collect_start.elapsed().as_secs_f64()).into();
             metrics[".Cumulative steps"] = self.stats.cumulative_timesteps.into();
             metrics[".Cumulative epochs"] = self.stats.cumulative_epochs.into();
             metrics[".Cumulative updates"] = self.stats.cumulative_model_updates.into();

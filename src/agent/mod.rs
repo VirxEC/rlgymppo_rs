@@ -47,7 +47,7 @@ impl<B: AutodiffBackend> Ppo<B> {
         rng: &mut R,
         metrics: &mut Report,
         stats: &mut Stats,
-    ) -> Actic<B> {
+    ) -> (Actic<B>, usize) {
         let mut memory_indices = (0..memory.len()).collect::<Vec<_>>();
         let PPOOutput {
             policies: mut old_log_probs,
@@ -196,7 +196,7 @@ impl<B: AutodiffBackend> Ppo<B> {
         metrics[".Divergence"] = mean_divergence.into();
         metrics[".Clip fraction"] = mean_clip_fraction.into();
 
-        net
+        (net, self.config.batch_size)
     }
 }
 

@@ -78,7 +78,7 @@ impl<B: AutodiffBackend> Ppo<B> {
             self.config.gamma,
             self.config.lambda,
             return_std,
-            self.config.clip_range,
+            self.config.reward_clip_range,
             self.config.max_returns_per_stats_increment,
             &self.device,
         );
@@ -118,7 +118,7 @@ impl<B: AutodiffBackend> Ppo<B> {
                 } = net.forward(state_batch);
 
                 let log_prob = policy_batch.clone().log();
-                let entropy = (-(log_prob.clone() * policy_batch)).sum_dim(1).mean();
+                let entropy = -(log_prob.clone() * policy_batch).sum_dim(1).mean();
                 mean_entropy += entropy.clone().into_scalar().to_f32();
 
                 let action_log_prob = log_prob.gather(1, action_batch.clone());

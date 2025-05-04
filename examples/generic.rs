@@ -3,7 +3,7 @@
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rlgymppo::{
     LearnerConfig, PpoLearnerConfig,
-    backend::{Autodiff, NdArray, Rocm, Router, Wgpu},
+    backend::{Autodiff, NdArray, Router, Wgpu},
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     },
@@ -14,6 +14,10 @@ use rlgymppo::{
         sim::{Arena, CarConfig, CarControls, Team},
     },
     utils::{AvgTracker, Report},
+};
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    thread::available_parallelism,
 };
 
 struct SharedInfo {
@@ -51,18 +55,6 @@ struct MyStateSetter;
 impl StateSetter<SharedInfo> for MyStateSetter {
     fn apply(&mut self, arena: &mut UniquePtr<Arena>, shared_info: &mut SharedInfo) {
         arena.pin_mut().reset_tick_count();
-
-        // remove previous cars
-        for car_id in arena.pin_mut().get_cars() {
-            arena.pin_mut().remove_car(car_id).unwrap();
-        }
-
-        // random game mode, 1v1, 2v2, or 3v3
-        let octane = CarConfig::octane();
-        for _ in 0..shared_info.rng.random_range(1..4) {
-            let _ = arena.pin_mut().add_car(Team::Blue, octane);
-            let _ = arena.pin_mut().add_car(Team::Orange, octane);
-        }
 
         arena
             .pin_mut()
@@ -371,15 +363,21 @@ fn create_env() -> Env<
     MyTruncate,
     SharedInfo,
 > {
+    static GAME_ID: AtomicUsize = AtomicUsize::new(0);
+
     let mut arena = Arena::default_standard();
     arena
         .pin_mut()
         .set_goal_scored_callback(|arena, _, _| arena.reset_to_random_kickoff(None), 0);
 
-    // set the initial environment to the max number of cars
-    // this will help avoid errors during training
     let octane = CarConfig::octane();
-    for _ in 0..MyObs::ZERO_PADDING {
+
+    let game_id = GAME_ID.fetch_add(1, Ordering::SeqCst);
+
+    // pseudo-random game mode: 1v1, 2v2, 3v3
+    // using game id ensures an equal, predictable distribution of game modes
+    // it's not the best idea to change the number of players between episodes
+    for _ in 0..game_id % 3 {
         let _ = arena.pin_mut().add_car(Team::Blue, octane);
         let _ = arena.pin_mut().add_car(Team::Orange, octane);
     }
@@ -405,19 +403,14 @@ fn step_callback(report: &mut Report, shared_info: &mut SharedInfo, _game_state:
 fn main() {
     init(None, true);
 
-    // let num_threads = if cfg!(debug_assertions) {
-    //     NonZeroUsize::new(1).unwrap()
-    // } else {
-    //     available_parallelism().unwrap()
-    // };
     let mini_batch_size = 20000;
     let batch_size = mini_batch_size * 3;
     let lr = 3e-4;
 
-    let config = LearnerConfig::<Autodiff<Router<(Rocm, Wgpu, NdArray)>>> {
-        // render: true,
-        // num_threads,
-        num_games_per_thread: 5,
+    let config = LearnerConfig::<Autodiff<Router<(Wgpu, NdArray)>>> {
+        render: true,
+        num_threads: available_parallelism().unwrap().get(),
+        num_games_per_thread: 64,
         exp_buffer_size: batch_size,
         timesteps_per_save: 10_000_000,
         checkpoints_limit: Some(3),
@@ -428,8 +421,8 @@ fn main() {
             learning_rate: lr,
             ..Default::default()
         },
-        policy_layer_sizes: vec![512; 4],
-        critic_layer_sizes: vec![512; 4],
+        policy_layer_sizes: vec![256; 4],
+        critic_layer_sizes: vec![256; 4],
         ..Default::default()
     };
 

@@ -29,8 +29,6 @@ wgpu = ["burn/wgpu"]
 rocm = ["burn/rocm"]
 cuda = ["burn/cuda"]
 
-examples = ["ndarray", "wgpu", "rocm"]
-
 [profile.dev]
 opt-level = 1
 incremental = false
@@ -41,9 +39,6 @@ opt-level = 3
 [profile.release]
 debug = true
 
-[patch.crates-io]
-cubecl = { path = "/root/cubecl/crates/cubecl" }
-
 [[example]]
 name = "generic"
-required-features = ["examples"]
+required-features = ["ndarray", "wgpu"]

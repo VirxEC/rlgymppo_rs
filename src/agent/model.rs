@@ -4,7 +4,6 @@ use burn::{
     prelude::*,
     tensor::activation::{relu, softmax},
 };
-use rand::Rng;
 
 pub struct PPOOutput<B: Backend> {
     pub policies: Tensor<B, 2>,
@@ -21,6 +20,8 @@ impl<B: Backend> PPOOutput<B> {
 pub struct Net<B: Backend> {
     layers: Vec<Linear<B>>,
 }
+
+unsafe impl<B: Backend> Sync for Net<B> {}
 
 impl<B: Backend> Net<B> {
     fn new(
@@ -55,6 +56,23 @@ impl<B: Backend> Net<B> {
         );
 
         Self { layers }
+    }
+
+    pub fn infer(&self, mut input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let num_layers = self.layers.len();
+        for layer in &self.layers[..num_layers - 1] {
+            input = relu(layer.forward(input));
+        }
+
+        softmax(self.layers[num_layers - 1].forward(input), 1).clamp(1e-11, 1.0)
+    }
+
+    pub fn react_deterministic(&self, state: &[Vec<f32>], device: &B::Device) -> Vec<usize> {
+        argmax_actions(self.infer(to_state_tensor_2d(state, device)))
+    }
+
+    pub fn react(&self, state: &[Vec<f32>], device: &B::Device) -> Vec<usize> {
+        sample_actions(self.infer(to_state_tensor_2d(state, device)), device)
     }
 }
 
@@ -100,22 +118,5 @@ impl<B: Backend> Actic<B> {
         }
 
         PPOOutput::<B>::new(policies, critic_input)
-    }
-
-    pub fn infer(&self, mut input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let num_layers = self.actor.layers.len();
-        for layer in &self.actor.layers[..num_layers - 1] {
-            input = relu(layer.forward(input));
-        }
-
-        softmax(self.actor.layers[num_layers - 1].forward(input), 1).clamp(1e-11, 1.0)
-    }
-
-    pub fn react_deterministic(&self, state: &[Vec<f32>], device: &B::Device) -> Vec<usize> {
-        argmax_actions(self.infer(to_state_tensor_2d(state, device)))
-    }
-
-    pub fn react<R: Rng>(&self, state: &[Vec<f32>], rng: &mut R, device: &B::Device) -> Vec<usize> {
-        sample_actions(self.infer(to_state_tensor_2d(state, device)), rng)
     }
 }

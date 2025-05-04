@@ -1,6 +1,5 @@
-use burn::{grad_clipping::GradientClippingConfig, tensor::backend::AutodiffBackend};
-
 use super::Ppo;
+use burn::{grad_clipping::GradientClippingConfig, tensor::backend::AutodiffBackend};
 
 pub struct PpoLearnerConfig {
     pub gamma: f32,

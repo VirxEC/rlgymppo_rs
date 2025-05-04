@@ -3,7 +3,7 @@ use rlgym::{
     Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     rocketsim_rs::glam_ext::GameStateA,
 };
-use std::{mem, time::Duration};
+use std::time::Duration;
 
 pub struct StepResult {
     pub obs: FullObs,
@@ -100,7 +100,11 @@ where
         }
     }
 
-    pub fn get_metrics(&mut self) -> Report {
-        mem::take(&mut self.metrics)
+    pub fn get_metrics(&self) -> &Report {
+        &self.metrics
+    }
+
+    pub fn clear_metrics(&mut self) {
+        self.metrics.clear();
     }
 }

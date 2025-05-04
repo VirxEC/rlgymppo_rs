@@ -1,19 +1,19 @@
 use super::sim::GameInstance;
-use crate::{agent::model::Actic, utils::Report};
+use crate::{agent::model::Net, utils::Report};
 use burn::prelude::*;
-use rand::{SeedableRng, rngs::SmallRng};
+use parking_lot::{Condvar, Mutex};
 use rlgym::{
     Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     rocketsim_rs::glam_ext::GameStateA,
 };
 use std::{
-    sync::{Arc, Condvar, Mutex},
+    sync::Arc,
     thread::sleep,
     time::{Duration, Instant},
 };
 
 pub struct RendererControls<B: Backend> {
-    pub model: Option<Actic<B>>,
+    pub model: Option<Net<B>>,
     pub deterministic: bool,
     pub render: bool,
     pub quit: bool,
@@ -43,7 +43,6 @@ where
 {
     game: GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
     last_obs: Vec<Vec<f32>>,
-    rng: SmallRng,
     try_launch_exe: bool,
     controller: Arc<(Mutex<RendererControls<B>>, Condvar)>,
     device: B::Device,
@@ -72,7 +71,6 @@ where
         let last_obs = game.reset();
 
         Self {
-            rng: SmallRng::from_os_rng(),
             try_launch_exe,
             controller,
             last_obs,
@@ -92,17 +90,17 @@ where
         let (mut model, mut deterministic) = {
             let (controller, start_var) = &*self.controller;
 
-            let mut guard = controller.lock().unwrap();
+            let mut guard = controller.lock();
             if guard.quit {
                 return;
             }
 
             if guard.model.is_none() {
-                guard = start_var.wait(guard).unwrap();
+                start_var.wait(&mut guard);
             }
 
             while !guard.render {
-                guard = start_var.wait(guard).unwrap();
+                start_var.wait(&mut guard);
                 if guard.quit {
                     return;
                 }
@@ -134,7 +132,7 @@ where
             // it doesn't really matter for the render thread
             if now - last_controls_update_time >= controls_update_rate {
                 let (controller, start_var) = &*self.controller;
-                let mut guard = controller.lock().unwrap();
+                let mut guard = controller.lock();
 
                 if guard.quit {
                     break;
@@ -146,7 +144,7 @@ where
                 }
 
                 while !guard.render {
-                    guard = start_var.wait(guard).unwrap();
+                    start_var.wait(&mut guard);
                     if guard.quit {
                         return;
                     }
@@ -172,7 +170,7 @@ where
             let actions = if deterministic {
                 model.react_deterministic(&self.last_obs, &self.device)
             } else {
-                model.react(&self.last_obs, &mut self.rng, &self.device)
+                model.react(&self.last_obs, &self.device)
             };
             let result = self.game.step(&actions);
 

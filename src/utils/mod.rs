@@ -11,11 +11,7 @@ use burn::{
     module::AutodiffModule,
     optim::{GradientsParams, Optimizer},
     prelude::*,
-    tensor::{Transaction, backend::AutodiffBackend, cast::ToElement},
-};
-use rand::{
-    Rng,
-    distr::{Distribution, weighted::WeightedIndex},
+    tensor::{Distribution, backend::AutodiffBackend, cast::ToElement},
 };
 
 pub(crate) fn to_state_tensor_2d<B: Backend>(
@@ -30,24 +26,23 @@ pub(crate) fn to_state_tensor_2d<B: Backend>(
     Tensor::from_data(TensorData::new(data, [state.len(), state[0].len()]), device)
 }
 
-pub(crate) fn sample_actions<B: Backend, R: Rng>(output: Tensor<B, 2>, rng: &mut R) -> Vec<usize> {
-    let num_actions = output.shape().dims[0];
+pub(crate) fn sample_actions<B: Backend>(
+    action_probs: Tensor<B, 2>,
+    device: &B::Device,
+) -> Vec<usize> {
+    let shape = action_probs.shape().dims;
+    let n = shape[0];
 
-    let mut transaction = Transaction::default();
-    for data in output.iter_dim(0) {
-        transaction = transaction.register(data);
-    }
+    let u = Tensor::<B, 2>::random(shape, Distribution::Default, device);
+    let gumbel = u.log().neg().log().neg();
+    let noisy = action_probs.log() + gumbel;
+    let indices = noisy.argmax(1).reshape::<1, _>([n]);
 
-    let mut actions = Vec::with_capacity(num_actions);
-    for data in transaction.execute() {
-        let prob = data.into_vec::<f32>().unwrap();
-        let dist = WeightedIndex::new(prob).unwrap();
-
-        actions.push(dist.sample(rng));
-    }
-
-    debug_assert_eq!(actions.len(), num_actions);
-    actions
+    indices
+        .into_data()
+        .iter::<B::IntElem>()
+        .map(|x| x.to_usize())
+        .collect()
 }
 
 pub(crate) fn argmax_actions<B: Backend>(output: Tensor<B, 2>) -> Vec<usize> {

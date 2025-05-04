@@ -6,7 +6,7 @@ use crate::{
         config::PpoLearnerConfig,
         model::{Actic, Net, PPOOutput},
     },
-    base::{Memory, MemoryIndices, get_action_batch, get_batch_1d, get_states_batch},
+    base::{Memory, get_action_batch, get_batch_1d, get_states_batch},
     utils::{Report, elementwise_min, running_stat::Stats, update_parameters},
 };
 use burn::{
@@ -48,7 +48,7 @@ impl<B: AutodiffBackend> Ppo<B> {
         metrics: &mut Report,
         stats: &mut Stats,
     ) -> Actic<B> {
-        let mut memory_indices = (0..memory.len()).collect::<MemoryIndices>();
+        let mut memory_indices = (0..memory.len()).collect::<Vec<_>>();
         let PPOOutput {
             policies: mut old_log_probs,
             values: mut old_values,

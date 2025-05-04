@@ -85,7 +85,7 @@ impl Reportable {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Report {
     data: HashMap<String, Reportable>,
 }

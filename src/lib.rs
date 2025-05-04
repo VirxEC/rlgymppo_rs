@@ -15,9 +15,10 @@ use burn::{
     tensor::backend::AutodiffBackend,
 };
 use environment::{
-    batch_sim::{BatchSim, BatchSimConfig},
     render::{Renderer, RendererControls},
+    thread_sim::ThreadSim,
 };
+use parking_lot::{Condvar, Mutex};
 use rand::{SeedableRng, rngs::SmallRng};
 use rlgym::{
     Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
@@ -27,7 +28,7 @@ use std::{
     io::{Read, stdin},
     path::PathBuf,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc,
         mpsc::{Sender, channel},
     },
     thread::{self, JoinHandle},
@@ -93,6 +94,8 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub checkpoints_limit: Option<usize>,
     /// The number of timesteps to run before saving a checkpoint.
     pub timesteps_per_save: u64,
+    /// The number of threads to use for collecting data.
+    pub num_threads: usize,
     /// The number of games to run per thread.
     /// Increasing this will increase GPU utilization
     /// and the utilization of 1 cpu thread.
@@ -121,7 +124,8 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             critic_layer_sizes: vec![256; 2],
             checkpoints_limit: None,
             timesteps_per_save: 1_000_000,
-            num_games_per_thread: 4,
+            num_threads: 8,
+            num_games_per_thread: 32,
             exp_buffer_size: 60_000,
             num_additional_iterations: None,
             render: false,
@@ -135,7 +139,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         self,
         create_env: F,
         step_callback: C,
-    ) -> Learner<B, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
+    ) -> Learner<B>
     where
         F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         C: Fn(&mut Report, &mut SI, &GameStateA) + Clone + Send + 'static,
@@ -202,86 +206,56 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             })
         };
 
-        let batch_sim = BatchSim::new(
+        let thread_sim = ThreadSim::new(
             create_env,
             step_callback,
-            BatchSimConfig {
-                num_games: self.num_games_per_thread,
-                buffer_size: self.exp_buffer_size,
-            },
+            self.ppo.batch_size,
+            self.exp_buffer_size,
+            self.num_threads,
+            self.num_games_per_thread,
             self.device.clone(),
         );
 
         Learner {
             ppo: self.ppo.init(self.device.clone()),
             rng: SmallRng::from_os_rng(),
-            metrics: Report::default(),
             stats: Stats::default(),
             device: self.device,
-            model: Some(model),
+            model,
             checkpoints_folder: self.checkpoints_folder,
             checkpoints_limit: self.checkpoints_limit,
             timesteps_per_save: self.timesteps_per_save,
             last_save_timestep: 0,
             num_additional_iterations: self.num_additional_iterations,
             renderer_controls: renderer_controls.clone(),
-            renderer: Some(renderer),
-            batch_sim,
+            renderer,
+            collector: thread_sim,
         }
     }
 }
 
-pub struct Learner<B, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
-where
-    B: AutodiffBackend,
-    C: Fn(&mut Report, &mut SI, &GameStateA) + Clone,
-    SS: StateSetter<SI>,
-    SIP: SharedInfoProvider<SI>,
-    OBS: Obs<SI>,
-    ACT: Action<SI, Input = usize>,
-    REW: Reward<SI>,
-    TERM: Terminal<SI>,
-    TRUNC: Truncate<SI>,
-{
+pub struct Learner<B: AutodiffBackend> {
     ppo: Ppo<B>,
     rng: SmallRng,
-    metrics: Report,
     stats: Stats,
     device: B::Device,
-    model: Option<Actic<B>>,
+    model: Actic<B>,
     checkpoints_folder: PathBuf,
     checkpoints_limit: Option<usize>,
     timesteps_per_save: u64,
     last_save_timestep: u64,
     num_additional_iterations: Option<u64>,
     renderer_controls: Arc<(Mutex<RendererControls<B::InnerBackend>>, Condvar)>,
-    renderer: Option<JoinHandle<()>>,
-    batch_sim: BatchSim<B::InnerBackend, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
+    renderer: JoinHandle<()>,
+    collector: ThreadSim<B::InnerBackend>,
 }
 
-impl<B, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
-    Learner<B, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
-where
-    B: AutodiffBackend,
-    C: Fn(&mut Report, &mut SI, &GameStateA) + Clone,
-    SS: StateSetter<SI>,
-    SIP: SharedInfoProvider<SI>,
-    OBS: Obs<SI>,
-    ACT: Action<SI, Input = usize>,
-    REW: Reward<SI>,
-    TERM: Terminal<SI>,
-    TRUNC: Truncate<SI>,
-{
+impl<B: AutodiffBackend> Learner<B> {
     /// Load the previously saved model.
     /// Does nothing if the model can't be loaded, this is safe to call unconditionally.
     pub fn load(&mut self) {
-        let mut model = self
-            .model
-            .take()
-            .expect("load() can't be called after train()");
-
-        (model, self.stats) = load_latest_model(model, &self.checkpoints_folder, &self.device);
-        self.model = Some(model);
+        (self.model, self.stats) =
+            load_latest_model(self.model.clone(), &self.checkpoints_folder, &self.device);
     }
 
     fn print_controls_prompt() {
@@ -291,13 +265,7 @@ where
     }
 
     /// Train the model, and automatically saves it before exiting.
-    pub fn learn(&mut self) {
-        let mut model = self.model.take().expect("train() can only be called once");
-        let renderer = self
-            .renderer
-            .take()
-            .expect("train() can only be called once");
-
+    pub fn learn(mut self) {
         let (s, r) = channel();
 
         thread::spawn(move || {
@@ -314,53 +282,48 @@ where
         {
             let collect_start = Instant::now();
 
-            let nodiff_model = model.valid();
+            let nodiff_actor = self.model.actor.valid();
 
             // update the model the renderer is using
             {
                 let (controls, start_rendering) = &*self.renderer_controls;
-                let mut guard = controls.lock().unwrap();
-                guard.model = Some(nodiff_model.clone());
+                let mut guard = controls.lock();
+                guard.model = Some(nodiff_actor.clone());
                 drop(guard);
 
                 start_rendering.notify_all();
             }
 
             // collect steps
-            let memory = self.batch_sim.run(nodiff_model);
-
+            let (memory, mut metrics) = self.collector.run(nodiff_actor);
             let collect_elapsed = collect_start.elapsed().as_secs_f64();
 
-            self.stats.cumulative_timesteps += memory.len() as u64;
-            let num_steps = memory.len() as f64;
-
+            // train the model
             let train_start = Instant::now();
-            model = self.ppo.train(
-                model,
+            self.model = self.ppo.train(
+                self.model,
                 memory,
                 &mut self.rng,
-                &mut self.metrics,
+                &mut metrics,
                 &mut self.stats,
             );
-            memory.clear();
 
             let train_elapsed = train_start.elapsed().as_secs_f64();
             let overall_elapsed = collect_start.elapsed().as_secs_f64();
 
-            self.metrics += self.batch_sim.get_metrics();
-            self.metrics[".Episode Length"] = num_steps.into();
-            self.metrics[".Collection time"] = collect_elapsed.into();
-            self.metrics[".Collected SPS"] = (num_steps / collect_elapsed).into();
-            self.metrics[".Training time"] = train_elapsed.into();
-            self.metrics[".Overall time"] = overall_elapsed.into();
-            self.metrics[".Overall SPS"] =
-                (num_steps / collect_start.elapsed().as_secs_f64()).into();
-            self.metrics[".Cumulative steps"] = self.stats.cumulative_timesteps.into();
-            self.metrics[".Cumulative epochs"] = self.stats.cumulative_epochs.into();
-            self.metrics[".Cumulative updates"] = self.stats.cumulative_model_updates.into();
+            self.stats.cumulative_timesteps += memory.len() as u64;
+            let num_steps = memory.len() as f64;
+            metrics[".Episode Length"] = num_steps.into();
+            metrics[".Collection time"] = collect_elapsed.into();
+            metrics[".Collected SPS"] = (num_steps / collect_elapsed).into();
+            metrics[".Training time"] = train_elapsed.into();
+            metrics[".Overall time"] = overall_elapsed.into();
+            metrics[".Overall SPS"] = (num_steps / collect_start.elapsed().as_secs_f64()).into();
+            metrics[".Cumulative steps"] = self.stats.cumulative_timesteps.into();
+            metrics[".Cumulative epochs"] = self.stats.cumulative_epochs.into();
+            metrics[".Cumulative updates"] = self.stats.cumulative_model_updates.into();
 
-            println!("{}", self.metrics);
-            self.metrics.clear();
+            println!("{metrics}");
 
             for input in r.try_iter() {
                 match input {
@@ -369,7 +332,7 @@ where
                     }
                     HumanInput::Save => {
                         save_model(
-                            model.valid(),
+                            self.model.valid(),
                             &self.stats,
                             &self.checkpoints_folder,
                             self.checkpoints_limit,
@@ -377,7 +340,7 @@ where
                     }
                     HumanInput::ToggleRender => {
                         let (controls, start_renderer) = &*self.renderer_controls;
-                        let mut guard = controls.lock().unwrap();
+                        let mut guard = controls.lock();
                         let render = !guard.render;
                         guard.render = render;
                         drop(guard);
@@ -391,7 +354,7 @@ where
                     }
                     HumanInput::ToggleDeterministic => {
                         let (controls, _) = &*self.renderer_controls;
-                        let mut guard = controls.lock().unwrap();
+                        let mut guard = controls.lock();
                         guard.deterministic = !guard.deterministic;
                         println!("Rendering deterministic: {}", guard.deterministic);
                         drop(guard);
@@ -401,7 +364,7 @@ where
 
             if self.stats.cumulative_timesteps - self.last_save_timestep > self.timesteps_per_save {
                 save_model(
-                    model.valid(),
+                    self.model.valid(),
                     &self.stats,
                     &self.checkpoints_folder,
                     self.checkpoints_limit,
@@ -417,7 +380,7 @@ where
         {
             // Make render thread exit
             let (controls, start_renderer) = &*self.renderer_controls;
-            let mut guard = controls.lock().unwrap();
+            let mut guard = controls.lock();
             guard.quit = true;
             drop(guard);
 
@@ -426,14 +389,15 @@ where
         }
 
         save_model(
-            model,
+            self.model,
             &self.stats,
             &self.checkpoints_folder,
             self.checkpoints_limit,
         );
 
         println!("Waiting for threads to exit...");
-        renderer.join().unwrap();
+        self.renderer.join().unwrap();
+        self.collector.join();
 
         println!("Exiting.")
     }

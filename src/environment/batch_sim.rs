@@ -1,9 +1,5 @@
 use super::sim::GameInstance;
-use crate::{
-    agent::model::Net,
-    base::Memory,
-    utils::Report,
-};
+use crate::{agent::model::Net, base::Memory, utils::Report};
 use burn::prelude::*;
 use rlgym::{
     Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,

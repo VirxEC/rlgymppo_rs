@@ -264,6 +264,45 @@ impl<B: AutodiffBackend> Learner<B> {
         println!("!!! Must be confirmed by pressing enter. !!!\n");
     }
 
+    fn handle_input(&self, input: HumanInput) -> bool {
+        match input {
+            HumanInput::Quit => {
+                return false;
+            }
+            HumanInput::Save => {
+                save_model(
+                    self.model.valid(),
+                    &self.stats,
+                    &self.checkpoints_folder,
+                    self.checkpoints_limit,
+                );
+            }
+            HumanInput::ToggleRender => {
+                let (controls, start_renderer) = &*self.renderer_controls;
+                let mut guard = controls.lock();
+                let render = !guard.render;
+                guard.render = render;
+                drop(guard);
+
+                if render {
+                    println!("Starting renderer...");
+                    start_renderer.notify_all();
+                } else {
+                    println!("Stopping renderer...");
+                }
+            }
+            HumanInput::ToggleDeterministic => {
+                let (controls, _) = &*self.renderer_controls;
+                let mut guard = controls.lock();
+                guard.deterministic = !guard.deterministic;
+                println!("Rendering deterministic: {}", guard.deterministic);
+                drop(guard);
+            }
+        }
+
+        true
+    }
+
     /// Train the model, and automatically saves it before exiting.
     pub fn learn(mut self) {
         let (s, r) = channel();
@@ -313,7 +352,7 @@ impl<B: AutodiffBackend> Learner<B> {
 
             self.stats.cumulative_timesteps += memory.len() as u64;
             let num_steps = memory.len() as f64;
-            metrics[".Episode Length"] = num_steps.into();
+            metrics[".Episode length"] = num_steps.into();
             metrics[".Collection time"] = collect_elapsed.into();
             metrics[".Collected SPS"] = (num_steps / collect_elapsed).into();
             metrics[".Learning time"] = learn_elapsed.into();
@@ -326,39 +365,8 @@ impl<B: AutodiffBackend> Learner<B> {
             println!("{metrics}");
 
             for input in r.try_iter() {
-                match input {
-                    HumanInput::Quit => {
-                        break 'train;
-                    }
-                    HumanInput::Save => {
-                        save_model(
-                            self.model.valid(),
-                            &self.stats,
-                            &self.checkpoints_folder,
-                            self.checkpoints_limit,
-                        );
-                    }
-                    HumanInput::ToggleRender => {
-                        let (controls, start_renderer) = &*self.renderer_controls;
-                        let mut guard = controls.lock();
-                        let render = !guard.render;
-                        guard.render = render;
-                        drop(guard);
-
-                        if render {
-                            println!("Starting renderer...");
-                            start_renderer.notify_all();
-                        } else {
-                            println!("Stopping renderer...");
-                        }
-                    }
-                    HumanInput::ToggleDeterministic => {
-                        let (controls, _) = &*self.renderer_controls;
-                        let mut guard = controls.lock();
-                        guard.deterministic = !guard.deterministic;
-                        println!("Rendering deterministic: {}", guard.deterministic);
-                        drop(guard);
-                    }
+                if !self.handle_input(input) {
+                    break 'train;
                 }
             }
 
@@ -374,6 +382,59 @@ impl<B: AutodiffBackend> Learner<B> {
 
             if self.stats.cumulative_model_updates % 10 == 0 {
                 Self::print_controls_prompt();
+            }
+        }
+
+        {
+            // Make render thread exit
+            let (controls, start_renderer) = &*self.renderer_controls;
+            let mut guard = controls.lock();
+            guard.quit = true;
+            drop(guard);
+
+            // if render = false, this will wake the thread up to exit
+            start_renderer.notify_all();
+        }
+
+        save_model(
+            self.model,
+            &self.stats,
+            &self.checkpoints_folder,
+            self.checkpoints_limit,
+        );
+
+        println!("Waiting for threads to exit...");
+        self.renderer.join().unwrap();
+        self.collector.join();
+
+        println!("Exiting.")
+    }
+
+    /// Only run the renderer. Useful for debugging.
+    pub fn render(self) {
+        let (s, r) = channel();
+
+        thread::spawn(move || {
+            stdin_reader(s);
+        });
+
+        Self::print_controls_prompt();
+
+        let nodiff_actor = self.model.actor.valid();
+
+        // update the model the renderer is using
+        {
+            let (controls, start_rendering) = &*self.renderer_controls;
+            let mut guard = controls.lock();
+            guard.model = Some(nodiff_actor.clone());
+            drop(guard);
+
+            start_rendering.notify_all();
+        }
+
+        for input in r.iter() {
+            if !self.handle_input(input) {
+                break;
             }
         }
 

@@ -133,7 +133,11 @@ impl<B: AutodiffBackend> Ppo<B> {
                     let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff;
                     mean_divergence += kl_tensor.mean().detach().into_scalar().to_f32();
 
-                    let clip_fraction = (ratios.clone() - 1.0).abs().greater_elem(self.config.clip_range).float().mean();
+                    let clip_fraction = (ratios.clone() - 1.0)
+                        .abs()
+                        .greater_elem(self.config.clip_range)
+                        .float()
+                        .mean();
                     mean_clip_fraction += clip_fraction.into_scalar().to_f32();
                 }
 
@@ -178,7 +182,7 @@ impl<B: AutodiffBackend> Ppo<B> {
         metrics[".Value Loss"] = mean_val_loss.into();
         metrics[".Entropy"] = mean_entropy.into();
         metrics[".Divergence"] = mean_divergence.into();
-        metrics[".Clip Fraction"] = mean_clip_fraction.into();
+        metrics[".Clip fraction"] = mean_clip_fraction.into();
 
         net
     }

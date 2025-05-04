@@ -14,7 +14,10 @@ use burn::{
     module::{AutodiffModule, Module},
     tensor::backend::AutodiffBackend,
 };
-use environment::batch_sim::{BatchSim, BatchSimConfig};
+use environment::{
+    batch_sim::{BatchSim, BatchSimConfig},
+    render::{Renderer, RendererControls},
+};
 use rand::{SeedableRng, rngs::SmallRng};
 use rlgym::{
     Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
@@ -23,8 +26,11 @@ use rlgym::{
 use std::{
     io::{Read, stdin},
     path::PathBuf,
-    sync::mpsc::{Sender, channel},
-    thread,
+    sync::{
+        Arc, Condvar, Mutex,
+        mpsc::{Sender, channel},
+    },
+    thread::{self, JoinHandle},
     time::Instant,
 };
 use utils::{
@@ -36,6 +42,8 @@ use utils::{
 enum HumanInput {
     Save,
     Quit,
+    ToggleRender,
+    ToggleDeterministic,
 }
 
 fn stdin_reader(s: Sender<HumanInput>) {
@@ -50,6 +58,16 @@ fn stdin_reader(s: Sender<HumanInput>) {
             's' => {
                 println!("Saving model after this iteration...");
                 s.send(HumanInput::Save).unwrap();
+            }
+            'r' => {
+                println!("Renderer will be toggled after this iteration...");
+                s.send(HumanInput::ToggleRender).unwrap();
+            }
+            'd' => {
+                println!(
+                    "Toggling deterministic mode for the rendered model after this iteration..."
+                );
+                s.send(HumanInput::ToggleDeterministic).unwrap();
             }
             _ => {}
         }
@@ -85,6 +103,12 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// exiting after that.
     /// `None` means run indefinitely.
     pub num_additional_iterations: Option<u64>,
+    /// If true, one extra instance will be launched
+    /// and RLViser will be used to visualize training.
+    pub render: bool,
+    /// Whether to try to launch the rlviser executable.
+    /// If false, RLViser needs to be started manually.
+    pub try_launch_rlviser: bool,
 }
 
 impl<B: AutodiffBackend> Default for LearnerConfig<B> {
@@ -100,6 +124,8 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             num_games_per_thread: 4,
             exp_buffer_size: 60_000,
             num_additional_iterations: None,
+            render: false,
+            try_launch_rlviser: true,
         }
     }
 }
@@ -111,8 +137,8 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         step_callback: C,
     ) -> Learner<B, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
     where
-        F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
-        C: Fn(&mut Report, &mut SI, &GameStateA) + Clone,
+        F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        C: Fn(&mut Report, &mut SI, &GameStateA) + Clone + Send + 'static,
         SS: StateSetter<SI>,
         SIP: SharedInfoProvider<SI>,
         OBS: Obs<SI>,
@@ -155,6 +181,27 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         println!("# parameters in actor: {}", model.actor.num_params());
         println!("# parameters in critic: {}", model.critic.num_params());
 
+        let renderer_controls = Arc::new((
+            Mutex::new(RendererControls::new(self.render)),
+            Condvar::new(),
+        ));
+
+        let renderer = {
+            let create_env = create_env.clone();
+            let step_callback = step_callback.clone();
+            let renderer_controls = renderer_controls.clone();
+
+            thread::spawn(move || {
+                Renderer::new(
+                    (create_env)(),
+                    step_callback,
+                    self.try_launch_rlviser,
+                    renderer_controls,
+                )
+                .run();
+            })
+        };
+
         let batch_sim = BatchSim::new(
             create_env,
             step_callback,
@@ -177,6 +224,8 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             timesteps_per_save: self.timesteps_per_save,
             last_save_timestep: 0,
             num_additional_iterations: self.num_additional_iterations,
+            renderer_controls: renderer_controls.clone(),
+            renderer: Some(renderer),
             batch_sim,
         }
     }
@@ -205,6 +254,8 @@ where
     timesteps_per_save: u64,
     last_save_timestep: u64,
     num_additional_iterations: Option<u64>,
+    renderer_controls: Arc<(Mutex<RendererControls<B::InnerBackend>>, Condvar)>,
+    renderer: Option<JoinHandle<()>>,
     batch_sim: BatchSim<B::InnerBackend, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
 }
 
@@ -233,9 +284,19 @@ where
         self.model = Some(model);
     }
 
+    fn print_controls_prompt() {
+        println!("Press Q to quit, S to quick save, R to toggle rendering,");
+        println!("and D to toggle deterministic mode for the renderer.");
+        println!("!!! Must be confirmed by pressing enter. !!!\n");
+    }
+
     /// Train the model, and automatically saves it before exiting.
     pub fn learn(&mut self) {
         let mut model = self.model.take().expect("train() can only be called once");
+        let renderer = self
+            .renderer
+            .take()
+            .expect("train() can only be called once");
 
         let (s, r) = channel();
 
@@ -244,7 +305,7 @@ where
         });
 
         println!("Running for the first time. This might be slow at first...");
-        println!("Press Q to quit, and S to quick save (must confirm by pressing enter)\n");
+        Self::print_controls_prompt();
 
         let inital_cumulative_updates = self.stats.cumulative_model_updates;
         'train: while self
@@ -252,7 +313,22 @@ where
             .is_none_or(|n| self.stats.cumulative_model_updates - inital_cumulative_updates < n)
         {
             let collect_start = Instant::now();
-            let memory = self.batch_sim.run(model.valid());
+
+            let nodiff_model = model.valid();
+
+            // update the model the renderer is using
+            {
+                let (controls, start_rendering) = &*self.renderer_controls;
+                let mut guard = controls.lock().unwrap();
+                guard.model = Some(nodiff_model.clone());
+                drop(guard);
+
+                start_rendering.notify_all();
+            }
+
+            // collect steps
+            let memory = self.batch_sim.run(nodiff_model);
+
             let collect_elapsed = collect_start.elapsed().as_secs_f64();
 
             self.stats.cumulative_timesteps += memory.len() as u64;
@@ -299,6 +375,27 @@ where
                             self.checkpoints_limit,
                         );
                     }
+                    HumanInput::ToggleRender => {
+                        let (controls, start_renderer) = &*self.renderer_controls;
+                        let mut guard = controls.lock().unwrap();
+                        let render = !guard.render;
+                        guard.render = render;
+                        drop(guard);
+
+                        if render {
+                            println!("Starting renderer...");
+                            start_renderer.notify_all();
+                        } else {
+                            println!("Stopping renderer...");
+                        }
+                    }
+                    HumanInput::ToggleDeterministic => {
+                        let (controls, _) = &*self.renderer_controls;
+                        let mut guard = controls.lock().unwrap();
+                        guard.deterministic = !guard.deterministic;
+                        println!("Rendering deterministic: {}", guard.deterministic);
+                        drop(guard);
+                    }
                 }
             }
 
@@ -313,8 +410,19 @@ where
             }
 
             if self.stats.cumulative_model_updates % 10 == 0 {
-                println!("Press Q to quit, and S to quick save (must confirm by pressing enter)\n");
+                Self::print_controls_prompt();
             }
+        }
+
+        {
+            // Make render thread exit
+            let (controls, start_renderer) = &*self.renderer_controls;
+            let mut guard = controls.lock().unwrap();
+            guard.quit = true;
+            drop(guard);
+
+            // if render = false, this will wake the thread up to exit
+            start_renderer.notify_all();
         }
 
         save_model(
@@ -323,6 +431,9 @@ where
             &self.checkpoints_folder,
             self.checkpoints_limit,
         );
+
+        println!("Waiting for threads to exit...");
+        renderer.join().unwrap();
 
         println!("Exiting.")
     }

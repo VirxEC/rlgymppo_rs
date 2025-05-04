@@ -3,7 +3,7 @@ use rlgym::{
     Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     rocketsim_rs::glam_ext::GameStateA,
 };
-use std::mem;
+use std::{mem, time::Duration};
 
 pub struct StepResult {
     pub obs: FullObs,
@@ -48,6 +48,22 @@ where
             last_state: GameStateA::default(),
             metrics: Report::default(),
         }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.env.is_paused()
+    }
+
+    pub fn open_rlviser(&mut self, try_launch_exe: bool) {
+        self.env.enable_rendering(try_launch_exe);
+    }
+
+    pub fn close_rlviser(&mut self) {
+        self.env.stop_rendering();
+    }
+
+    pub fn handle_incoming_states(&mut self, tick_rate: &mut Duration) {
+        self.env.handle_incoming_states(tick_rate).unwrap();
     }
 
     pub fn num_players(&self) -> usize {

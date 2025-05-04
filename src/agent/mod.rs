@@ -49,16 +49,13 @@ impl<B: AutodiffBackend> Ppo<B> {
         stats: &mut Stats,
     ) -> (Actic<B>, usize) {
         let mut memory_indices = (0..memory.len()).collect::<Vec<_>>();
-        let PPOOutput {
-            policies: mut old_log_probs,
-            values: mut old_values,
-        } = net.forward(get_states_batch(
+        let PPOOutput { policies, values } = net.forward(get_states_batch(
             memory.states(),
             &memory_indices,
             &self.device,
         ));
-        old_log_probs = old_log_probs.log().detach();
-        old_values = old_values.detach();
+        let old_log_probs = policies.log().detach();
+        let old_values = values.detach();
 
         let return_std = if self.config.standardize_returns {
             stats.return_stat.get_std()
@@ -93,6 +90,8 @@ impl<B: AutodiffBackend> Ppo<B> {
         let mut mean_clip_fraction = 0.0;
 
         let max_memory_idx = memory.len() - memory.len() % self.config.batch_size;
+        let minibatch_ratio = self.config.mini_batch_size as f32 / self.config.batch_size as f32;
+
         for _ in 0..self.config.epochs {
             memory_indices.shuffle(rng);
 
@@ -102,7 +101,6 @@ impl<B: AutodiffBackend> Ppo<B> {
                 {
                     let end_idx = mini_start_idx + self.config.mini_batch_size;
                     let sample_indices = &memory_indices[mini_start_idx..end_idx];
-                    let batch_size_ratio = sample_indices.len() as f32 / memory.len() as f32;
 
                     let sample_indices_tensor = Tensor::from_ints(sample_indices, &self.device);
                     let state_batch =
@@ -159,7 +157,7 @@ impl<B: AutodiffBackend> Ppo<B> {
 
                     let ppo_loss = actor_loss - entropy.mul_scalar(self.config.entropy_coeff);
                     net.actor = update_parameters(
-                        ppo_loss * batch_size_ratio,
+                        ppo_loss * minibatch_ratio,
                         net.actor,
                         &mut self.policy_optimizer,
                         self.config.learning_rate.into(),
@@ -167,7 +165,7 @@ impl<B: AutodiffBackend> Ppo<B> {
 
                     let critic_loss =
                         MseLoss.forward(value_batch, target_vals_batch, Reduction::Sum)
-                            * batch_size_ratio;
+                            * minibatch_ratio;
                     mean_val_loss += critic_loss.clone().into_scalar().to_f32();
 
                     net.critic = update_parameters(

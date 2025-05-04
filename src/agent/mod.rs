@@ -198,8 +198,8 @@ struct GAEOutput<B: Backend> {
 fn get_gae<B: Backend>(
     values: Vec<f32>,
     rewards: Vec<f32>,
-    not_dones: Vec<bool>,
-    not_truncateds: Vec<bool>,
+    dones: Vec<bool>,
+    truncateds: Vec<bool>,
     gamma: f32,
     lambda: f32,
     return_std: f32,
@@ -222,11 +222,10 @@ fn get_gae<B: Backend>(
     let mut running_advantage = 0.0;
 
     for i in (0..num_samples).rev() {
-        let reward = rewards[i];
-        let not_done = f32::from(u8::from(not_dones[i]));
-        let not_truncated = f32::from(u8::from(not_truncateds[i]));
+        let not_done = f32::from(u8::from(!dones[i]));
+        let not_truncated = f32::from(u8::from(!truncateds[i]));
 
-        let mut norm_reward = reward * return_scale;
+        let mut norm_reward = rewards[i] * return_scale;
         if clip_range > 0.0 {
             norm_reward = norm_reward.clamp(-clip_range, clip_range);
         }
@@ -235,7 +234,7 @@ fn get_gae<B: Backend>(
         let delta = pred_ret - values[i];
         last_val = values[i];
 
-        last_return = reward + last_return * gamma * not_done * not_truncated;
+        last_return = rewards[i] + last_return * gamma * not_done * not_truncated;
         returns[i] = last_return;
 
         running_advantage = delta + gamma * lambda * not_done * not_truncated * running_advantage;

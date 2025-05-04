@@ -2,14 +2,14 @@ use super::sim::GameInstance;
 use crate::{
     agent::model::Net,
     base::Memory,
-    utils::{AvgTracker, Report},
+    utils::Report,
 };
 use burn::prelude::*;
 use rlgym::{
     Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     rocketsim_rs::glam_ext::GameStateA,
 };
-use std::{mem, time::Instant};
+use std::mem;
 
 pub struct BatchSim<B: Backend, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
@@ -74,11 +74,8 @@ where
     pub fn run(&mut self, model: &Net<B>, num_steps: usize) -> (Memory, Report) {
         let mut memory = Memory::with_capacity(num_steps);
 
-        let mut model_eval_secs = 0.0;
         while memory.len() < num_steps {
-            let start = Instant::now();
             let mut actions = model.react(&self.last_obs, &self.device);
-            model_eval_secs += start.elapsed().as_secs_f64();
 
             let mut start_idx = self.last_obs.len();
             for game in self.games.iter_mut().rev() {
@@ -107,7 +104,6 @@ where
             mem::swap(&mut self.last_obs, &mut self.next_obs);
         }
 
-        self.metrics[".Collection time (model)"] = AvgTracker::new(model_eval_secs, 1).into();
         (memory, self.get_metrics())
     }
 

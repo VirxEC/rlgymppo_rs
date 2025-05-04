@@ -40,7 +40,7 @@ impl<B: AutodiffBackend> Ppo<B> {
 }
 
 impl<B: AutodiffBackend> Ppo<B> {
-    pub fn train<R: Rng>(
+    pub fn learn<R: Rng>(
         &mut self,
         mut net: Actic<B>,
         memory: &Memory,
@@ -89,6 +89,8 @@ impl<B: AutodiffBackend> Ppo<B> {
 
         let mut mean_entropy = 0.0;
         let mut mean_val_loss = 0.0;
+        let mut mean_divergence = 0.0;
+        let mut mean_clip_fraction = 0.0;
 
         for _ in 0..self.config.epochs {
             memory_indices.shuffle(rng);
@@ -121,10 +123,19 @@ impl<B: AutodiffBackend> Ppo<B> {
 
                 let action_log_prob = log_prob.gather(1, action_batch.clone());
                 let old_log_prob = old_log_probs_batch.gather(1, action_batch);
-                let ratios = (action_log_prob - old_log_prob).exp();
+                let log_prob_diff = action_log_prob - old_log_prob;
+                let ratios = log_prob_diff.clone().exp();
                 let clipped_ratios = ratios
                     .clone()
                     .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
+
+                {
+                    let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff;
+                    mean_divergence += kl_tensor.mean().detach().into_scalar().to_f32();
+
+                    let clip_fraction = (ratios.clone() - 1.0).abs().greater_elem(self.config.clip_range).float().mean();
+                    mean_clip_fraction += clip_fraction.into_scalar().to_f32();
+                }
 
                 let actor_loss = -elementwise_min(
                     ratios * advantage_batch.clone(),
@@ -161,9 +172,13 @@ impl<B: AutodiffBackend> Ppo<B> {
 
         mean_val_loss /= mini_batch_iters as f32;
         mean_entropy /= mini_batch_iters as f32;
+        mean_divergence /= mini_batch_iters as f32;
+        mean_clip_fraction /= mini_batch_iters as f32;
 
         metrics[".Value Loss"] = mean_val_loss.into();
         metrics[".Entropy"] = mean_entropy.into();
+        metrics[".Divergence"] = mean_divergence.into();
+        metrics[".Clip Fraction"] = mean_clip_fraction.into();
 
         net
     }

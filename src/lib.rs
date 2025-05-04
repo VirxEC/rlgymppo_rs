@@ -300,7 +300,7 @@ impl<B: AutodiffBackend> Learner<B> {
 
             // train the model
             let train_start = Instant::now();
-            self.model = self.ppo.train(
+            self.model = self.ppo.learn(
                 self.model,
                 memory,
                 &mut self.rng,
@@ -308,7 +308,7 @@ impl<B: AutodiffBackend> Learner<B> {
                 &mut self.stats,
             );
 
-            let train_elapsed = train_start.elapsed().as_secs_f64();
+            let learn_elapsed = train_start.elapsed().as_secs_f64();
             let overall_elapsed = collect_start.elapsed().as_secs_f64();
 
             self.stats.cumulative_timesteps += memory.len() as u64;
@@ -316,7 +316,7 @@ impl<B: AutodiffBackend> Learner<B> {
             metrics[".Episode Length"] = num_steps.into();
             metrics[".Collection time"] = collect_elapsed.into();
             metrics[".Collected SPS"] = (num_steps / collect_elapsed).into();
-            metrics[".Training time"] = train_elapsed.into();
+            metrics[".Learning time"] = learn_elapsed.into();
             metrics[".Overall time"] = overall_elapsed.into();
             metrics[".Overall SPS"] = (num_steps / collect_start.elapsed().as_secs_f64()).into();
             metrics[".Cumulative steps"] = self.stats.cumulative_timesteps.into();

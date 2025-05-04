@@ -380,9 +380,7 @@ impl<B: AutodiffBackend> Learner<B> {
                 self.last_save_timestep = self.stats.cumulative_timesteps;
             }
 
-            if self.stats.cumulative_model_updates % 10 == 0 {
-                Self::print_controls_prompt();
-            }
+            Self::print_controls_prompt();
         }
 
         {

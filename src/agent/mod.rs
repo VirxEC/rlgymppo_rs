@@ -155,7 +155,7 @@ impl<B: AutodiffBackend> Ppo<B> {
                     )
                     .mean();
 
-                    let ppo_loss = actor_loss - entropy.mul_scalar(self.config.entropy_coeff);
+                    let ppo_loss = actor_loss - entropy * self.config.entropy_coeff;
                     net.actor = update_parameters(
                         ppo_loss * minibatch_ratio,
                         net.actor,
@@ -164,12 +164,11 @@ impl<B: AutodiffBackend> Ppo<B> {
                     );
 
                     let critic_loss =
-                        MseLoss.forward(value_batch, target_vals_batch, Reduction::Sum)
-                            * minibatch_ratio;
+                        MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
                     mean_val_loss += critic_loss.clone().into_scalar().to_f32();
 
                     net.critic = update_parameters(
-                        critic_loss,
+                        critic_loss * minibatch_ratio,
                         net.critic,
                         &mut self.value_optimizer,
                         self.config.learning_rate.into(),
@@ -178,16 +177,17 @@ impl<B: AutodiffBackend> Ppo<B> {
             }
         }
 
+        stats.cumulative_timesteps += self.config.batch_size as u64;
         stats.cumulative_epochs += self.config.epochs as u64;
         stats.cumulative_model_updates += 1;
 
         let mini_batch_iters =
-            1.max(memory.len() / self.config.mini_batch_size * self.config.epochs);
+            1.max(max_memory_idx / self.config.mini_batch_size * self.config.epochs) as f32;
 
-        mean_val_loss /= mini_batch_iters as f32;
-        mean_entropy /= mini_batch_iters as f32;
-        mean_divergence /= mini_batch_iters as f32;
-        mean_clip_fraction /= mini_batch_iters as f32;
+        mean_val_loss /= mini_batch_iters;
+        mean_entropy /= mini_batch_iters;
+        mean_divergence /= mini_batch_iters;
+        mean_clip_fraction /= mini_batch_iters;
 
         metrics[".Value Loss"] = mean_val_loss.into();
         metrics[".Entropy"] = mean_entropy.into();

@@ -92,79 +92,91 @@ impl<B: AutodiffBackend> Ppo<B> {
         let mut mean_divergence = 0.0;
         let mut mean_clip_fraction = 0.0;
 
+        let max_memory_idx = memory.len() - memory.len() % self.config.batch_size;
         for _ in 0..self.config.epochs {
             memory_indices.shuffle(rng);
 
-            for start_idx in (0..memory.len()).step_by(self.config.mini_batch_size) {
-                let end_idx = memory.len().min(start_idx + self.config.mini_batch_size);
-                let sample_indices = &memory_indices[start_idx..end_idx];
-                let batch_size_ratio = sample_indices.len() as f32 / memory.len() as f32;
-
-                let sample_indices_tensor = Tensor::from_ints(sample_indices, &self.device);
-                let state_batch = get_states_batch(memory.states(), sample_indices, &self.device);
-                let action_batch = get_action_batch(memory.actions(), sample_indices, &self.device);
-                let old_log_probs_batch = old_log_probs
-                    .clone()
-                    .select(0, sample_indices_tensor.clone());
-                let advantage_batch = advantages.clone().select(0, sample_indices_tensor.clone());
-                let target_vals_batch = target_vals
-                    .clone()
-                    .select(0, sample_indices_tensor)
-                    .detach();
-
-                let PPOOutput {
-                    policies: policy_batch,
-                    values: value_batch,
-                } = net.forward(state_batch);
-
-                let log_prob = policy_batch.clone().log();
-                let entropy = -(log_prob.clone() * policy_batch).sum_dim(1).mean();
-                mean_entropy += entropy.clone().into_scalar().to_f32();
-
-                let action_log_prob = log_prob.gather(1, action_batch.clone());
-                let old_log_prob = old_log_probs_batch.gather(1, action_batch);
-                let log_prob_diff = action_log_prob - old_log_prob;
-                let ratios = log_prob_diff.clone().exp();
-                let clipped_ratios = ratios
-                    .clone()
-                    .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
-
+            for start_idx in (0..max_memory_idx).step_by(self.config.batch_size) {
+                for mini_start_idx in (start_idx..start_idx + self.config.batch_size)
+                    .step_by(self.config.mini_batch_size)
                 {
-                    let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff;
-                    mean_divergence += kl_tensor.mean().detach().into_scalar().to_f32();
+                    let end_idx = mini_start_idx + self.config.mini_batch_size;
+                    let sample_indices = &memory_indices[mini_start_idx..end_idx];
+                    let batch_size_ratio = sample_indices.len() as f32 / memory.len() as f32;
 
-                    let clip_fraction = (ratios.clone() - 1.0)
-                        .abs()
-                        .greater_elem(self.config.clip_range)
-                        .float()
-                        .mean();
-                    mean_clip_fraction += clip_fraction.into_scalar().to_f32();
+                    let sample_indices_tensor = Tensor::from_ints(sample_indices, &self.device);
+                    let state_batch =
+                        get_states_batch(memory.states(), sample_indices, &self.device);
+                    let action_batch =
+                        get_action_batch(memory.actions(), sample_indices, &self.device);
+                    let old_log_probs_batch = old_log_probs
+                        .clone()
+                        .select(0, sample_indices_tensor.clone())
+                        .detach();
+                    let advantage_batch = advantages
+                        .clone()
+                        .select(0, sample_indices_tensor.clone())
+                        .detach();
+                    let target_vals_batch = target_vals
+                        .clone()
+                        .select(0, sample_indices_tensor)
+                        .detach();
+
+                    let PPOOutput {
+                        policies: policy_batch,
+                        values: value_batch,
+                    } = net.forward(state_batch);
+
+                    let log_prob = policy_batch.clone().log();
+                    let entropy = -(log_prob.clone() * policy_batch).sum_dim(1).mean();
+                    mean_entropy += entropy.clone().into_scalar().to_f32();
+
+                    let action_log_prob = log_prob.gather(1, action_batch.clone());
+                    let old_log_prob = old_log_probs_batch.gather(1, action_batch);
+                    let log_prob_diff = action_log_prob - old_log_prob;
+                    let ratios = log_prob_diff.clone().exp();
+                    let clipped_ratios = ratios
+                        .clone()
+                        .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
+
+                    {
+                        let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff;
+                        mean_divergence += kl_tensor.mean().detach().into_scalar().to_f32();
+
+                        let clip_fraction = (ratios.clone() - 1.0)
+                            .abs()
+                            .greater_elem(self.config.clip_range)
+                            .float()
+                            .mean();
+                        mean_clip_fraction += clip_fraction.into_scalar().to_f32();
+                    }
+
+                    let actor_loss = -elementwise_min(
+                        ratios * advantage_batch.clone(),
+                        clipped_ratios * advantage_batch,
+                    )
+                    .mean();
+
+                    let ppo_loss = actor_loss - entropy.mul_scalar(self.config.entropy_coeff);
+                    net.actor = update_parameters(
+                        ppo_loss * batch_size_ratio,
+                        net.actor,
+                        &mut self.policy_optimizer,
+                        self.config.learning_rate.into(),
+                    );
+
+                    let critic_loss =
+                        MseLoss.forward(value_batch, target_vals_batch, Reduction::Sum)
+                            * batch_size_ratio;
+                    mean_val_loss += critic_loss.clone().into_scalar().to_f32();
+
+                    net.critic = update_parameters(
+                        critic_loss,
+                        net.critic,
+                        &mut self.value_optimizer,
+                        self.config.learning_rate.into(),
+                    );
                 }
-
-                let actor_loss = -elementwise_min(
-                    ratios * advantage_batch.clone(),
-                    clipped_ratios * advantage_batch,
-                )
-                .sum();
-
-                let ppo_loss = actor_loss - entropy.mul_scalar(self.config.entropy_coeff);
-                net.actor = update_parameters(
-                    ppo_loss * batch_size_ratio,
-                    net.actor,
-                    &mut self.policy_optimizer,
-                    self.config.learning_rate.into(),
-                );
-
-                let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Sum)
-                    * batch_size_ratio;
-                mean_val_loss += critic_loss.clone().into_scalar().to_f32();
-
-                net.critic = update_parameters(
-                    critic_loss,
-                    net.critic,
-                    &mut self.value_optimizer,
-                    self.config.learning_rate.into(),
-                );
             }
         }
 
@@ -204,12 +216,12 @@ fn get_gae<B: Backend>(
     lambda: f32,
     return_std: f32,
     clip_range: f32,
-    num_returns: usize,
+    max_n_returns: usize,
     device: &B::Device,
 ) -> GAEOutput<B> {
-    let num_samples = rewards.len();
-    let mut target_vals = vec![0.0; num_samples];
-    let mut returns = vec![0.0; num_samples];
+    let n_returns = rewards.len();
+    let mut returns = vec![0.0; n_returns];
+    let mut target_vals = returns.clone();
     let mut advantages = returns.clone();
 
     let mut return_scale = 1.0 / return_std;
@@ -221,7 +233,7 @@ fn get_gae<B: Backend>(
     let mut last_val = 0.0;
     let mut running_advantage = 0.0;
 
-    for i in (0..num_samples).rev() {
+    for i in (0..n_returns).rev() {
         let not_done = f32::from(u8::from(!dones[i]));
         let not_truncated = f32::from(u8::from(!truncateds[i]));
 
@@ -243,16 +255,13 @@ fn get_gae<B: Backend>(
         target_vals[i] = last_val + running_advantage;
     }
 
-    returns.truncate(num_returns);
+    returns.truncate(max_n_returns);
     GAEOutput {
         returns,
         target_vals: Tensor::<B, 2>::from_data(
-            TensorData::new(target_vals, [num_samples, 1]),
+            TensorData::new(target_vals, [n_returns, 1]),
             device,
         ),
-        advantages: Tensor::<B, 2>::from_data(
-            TensorData::new(advantages, [num_samples, 1]),
-            device,
-        ),
+        advantages: Tensor::<B, 2>::from_data(TensorData::new(advantages, [n_returns, 1]), device),
     }
 }

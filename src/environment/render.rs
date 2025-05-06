@@ -116,18 +116,11 @@ where
         let mut next_time = Instant::now();
 
         loop {
-            // ensure real-time rendering
-            let now = Instant::now();
-            let wait_time = next_time - now;
-            if !wait_time.is_zero() {
-                sleep(wait_time);
-            }
-            next_time += tick_rate;
-
             // enables in-renderer state setting
             self.game.handle_incoming_states(&mut tick_rate);
 
             // check for model updates every now and then
+            let now = Instant::now();
             if now - last_controls_update_time >= controls_update_rate {
                 let (controller, start_var) = &*self.controller;
                 let mut guard = controller.lock();
@@ -157,6 +150,13 @@ where
             }
 
             if self.game.is_paused() && !is_first {
+                // don't loop too quickly if paused
+                let wait_time = next_time - Instant::now();
+                if !wait_time.is_zero() {
+                    sleep(wait_time);
+                }
+                next_time += tick_rate;
+
                 continue;
             }
 
@@ -170,6 +170,15 @@ where
             } else {
                 model.react(&self.last_obs, &self.device).0
             };
+
+            // ensure real-time rendering
+            // we get the action first to avoid stutters
+            let wait_time = next_time - Instant::now();
+            if !wait_time.is_zero() {
+                sleep(wait_time);
+            }
+            next_time += tick_rate;
+
             let result = self.game.step(&actions);
 
             self.last_obs = if result.is_terminal || result.truncated {

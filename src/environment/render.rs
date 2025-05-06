@@ -111,7 +111,7 @@ where
 
         let mut is_first = true;
         let mut last_controls_update_time = Instant::now();
-        let controls_update_rate = Duration::from_secs(10);
+        let controls_update_rate = Duration::from_secs(1);
         let mut tick_rate = Duration::from_secs_f32(ACT::get_tick_skip() as f32 / 120.);
         let mut next_time = Instant::now();
 

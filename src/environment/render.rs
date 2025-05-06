@@ -111,7 +111,7 @@ where
 
         let mut is_first = true;
         let mut last_controls_update_time = Instant::now();
-        let controls_update_rate = Duration::from_secs(1);
+        let controls_update_rate = Duration::from_secs(10);
         let mut tick_rate = Duration::from_secs_f32(ACT::get_tick_skip() as f32 / 120.);
         let mut next_time = Instant::now();
 
@@ -127,9 +127,7 @@ where
             // enables in-renderer state setting
             self.game.handle_incoming_states(&mut tick_rate);
 
-            // check for new controls every 15 iterations
-            // ~1s, assuming tick skip is 8
-            // it doesn't really matter for the render thread
+            // check for model updates every now and then
             if now - last_controls_update_time >= controls_update_rate {
                 let (controller, start_var) = &*self.controller;
                 let mut guard = controller.lock();
@@ -170,7 +168,7 @@ where
             let actions = if deterministic {
                 model.react_deterministic(&self.last_obs, &self.device)
             } else {
-                model.react(&self.last_obs, &self.device)
+                model.react(&self.last_obs, &self.device).0
             };
             let result = self.game.step(&actions);
 

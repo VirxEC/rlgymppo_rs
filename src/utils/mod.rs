@@ -11,7 +11,7 @@ use burn::{
     module::AutodiffModule,
     optim::{GradientsParams, Optimizer},
     prelude::*,
-    tensor::{Distribution, backend::AutodiffBackend, cast::ToElement},
+    tensor::{Distribution, Transaction, backend::AutodiffBackend, cast::ToElement},
 };
 
 pub(crate) fn to_state_tensor_2d<B: Backend>(
@@ -29,20 +29,27 @@ pub(crate) fn to_state_tensor_2d<B: Backend>(
 pub(crate) fn sample_actions<B: Backend>(
     action_probs: Tensor<B, 2>,
     device: &B::Device,
-) -> Vec<usize> {
+) -> (Vec<usize>, Vec<f32>) {
     let shape = action_probs.shape().dims;
-    let n = shape[0];
+    let log_probs = action_probs.log();
 
     let u = Tensor::<B, 2>::random(shape, Distribution::Default, device);
     let gumbel = u.log().neg().log().neg();
-    let noisy = action_probs.log() + gumbel;
-    let indices = noisy.argmax(1).reshape::<1, _>([n]);
+    let noisy = log_probs.clone() + gumbel;
+    let indices = noisy.argmax(1);
 
-    indices
-        .into_data()
-        .iter::<B::IntElem>()
-        .map(|x| x.to_usize())
-        .collect()
+    let transation = Transaction::default()
+        .register(log_probs.gather(1, indices.clone()))
+        .register(indices)
+        .execute();
+
+    (
+        transation[1]
+            .iter::<B::IntElem>()
+            .map(|x| x.to_usize())
+            .collect(),
+        transation[0].to_vec().unwrap(),
+    )
 }
 
 pub(crate) fn argmax_actions<B: Backend>(output: Tensor<B, 2>) -> Vec<usize> {

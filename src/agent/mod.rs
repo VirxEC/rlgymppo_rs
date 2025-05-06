@@ -6,7 +6,7 @@ use crate::{
         config::PpoLearnerConfig,
         model::{Actic, Net, PPOOutput},
     },
-    base::{Memory, get_action_batch, get_batch_1d, get_states_batch},
+    base::{Memory, get_action_batch, get_batch_1d, get_log_probs_batch, get_states_batch},
     utils::{Report, elementwise_min, running_stat::Stats, update_parameters},
 };
 use burn::{
@@ -28,9 +28,11 @@ impl<B: AutodiffBackend> Ppo<B> {
     pub fn new(config: PpoLearnerConfig, device: B::Device) -> Self {
         Self {
             policy_optimizer: AdamConfig::new()
+                .with_epsilon(1e-8)
                 .with_grad_clipping(config.clip_grad.clone())
                 .init(),
             value_optimizer: AdamConfig::new()
+                .with_epsilon(1e-8)
                 .with_grad_clipping(config.clip_grad.clone())
                 .init(),
             config,
@@ -49,13 +51,8 @@ impl<B: AutodiffBackend> Ppo<B> {
         stats: &mut Stats,
     ) -> (Actic<B>, usize) {
         let mut memory_indices = (0..memory.len()).collect::<Vec<_>>();
-        let PPOOutput { policies, values } = net.forward(get_states_batch(
-            memory.states(),
-            &memory_indices,
-            &self.device,
-        ));
-        let old_log_probs = policies.log().detach();
-        let old_values = values.detach();
+        let states: Tensor<B, 2> = get_states_batch(memory.states(), &memory_indices, &self.device);
+        let old_values = net.critic.infer(states).detach();
 
         let return_std = if self.config.standardize_returns {
             stats.return_stat.get_std()
@@ -86,94 +83,88 @@ impl<B: AutodiffBackend> Ppo<B> {
 
         let mut mean_entropy = 0.0;
         let mut mean_val_loss = 0.0;
-        let mut mean_divergence = 0.0;
         let mut mean_clip_fraction = 0.0;
+        // let mut mean_divergence = 0.0;
+        // let mut mean_ratio = 0.0;
 
-        let max_memory_idx = memory.len() - memory.len() % self.config.batch_size;
         let minibatch_ratio = self.config.mini_batch_size as f32 / self.config.batch_size as f32;
 
         for _ in 0..self.config.epochs {
             memory_indices.shuffle(rng);
 
-            for start_idx in (0..max_memory_idx).step_by(self.config.batch_size) {
-                for mini_start_idx in (start_idx..start_idx + self.config.batch_size)
-                    .step_by(self.config.mini_batch_size)
+            for start_idx in (0..self.config.batch_size).step_by(self.config.mini_batch_size) {
+                let end_idx = start_idx + self.config.mini_batch_size;
+                let sample_indices = &memory_indices[start_idx..end_idx];
+
+                let sample_indices_tensor = Tensor::from_ints(sample_indices, &self.device);
+                let state_batch = get_states_batch(memory.states(), sample_indices, &self.device);
+                let action_batch = get_action_batch(memory.actions(), sample_indices, &self.device);
+                let old_log_probs_batch =
+                    get_log_probs_batch(memory.log_probs(), sample_indices, &self.device);
+                let advantage_batch: Tensor<B, 2> = advantages
+                    .clone()
+                    .select(0, sample_indices_tensor.clone())
+                    .detach();
+                let target_vals_batch = target_vals
+                    .clone()
+                    .select(0, sample_indices_tensor)
+                    .detach();
+
+                let PPOOutput {
+                    policies: policy_batch,
+                    values: value_batch,
+                } = net.forward(state_batch);
+
+                let log_prob = policy_batch.clone().log();
+                let entropy = -(log_prob.clone() * policy_batch).sum_dim(1).mean();
+                mean_entropy += entropy.clone().into_scalar().to_f32();
+
+                let action_log_prob = log_prob.gather(1, action_batch.clone());
+                let log_prob_diff = action_log_prob - old_log_probs_batch;
+                let ratios = log_prob_diff.clone().exp();
+                // mean_ratio += ratios.clone().mean().detach().into_scalar().to_f32();
+
+                let clipped_ratios = ratios
+                    .clone()
+                    .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
+
                 {
-                    let end_idx = mini_start_idx + self.config.mini_batch_size;
-                    let sample_indices = &memory_indices[mini_start_idx..end_idx];
+                    // let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff;
+                    // mean_divergence += kl_tensor.mean().detach().into_scalar().to_f32();
 
-                    let sample_indices_tensor = Tensor::from_ints(sample_indices, &self.device);
-                    let state_batch =
-                        get_states_batch(memory.states(), sample_indices, &self.device);
-                    let action_batch =
-                        get_action_batch(memory.actions(), sample_indices, &self.device);
-                    let old_log_probs_batch = old_log_probs
-                        .clone()
-                        .select(0, sample_indices_tensor.clone())
-                        .detach();
-                    let advantage_batch = advantages
-                        .clone()
-                        .select(0, sample_indices_tensor.clone())
-                        .detach();
-                    let target_vals_batch = target_vals
-                        .clone()
-                        .select(0, sample_indices_tensor)
-                        .detach();
-
-                    let PPOOutput {
-                        policies: policy_batch,
-                        values: value_batch,
-                    } = net.forward(state_batch);
-
-                    let log_prob = policy_batch.clone().log();
-                    let entropy = -(log_prob.clone() * policy_batch).sum_dim(1).mean();
-                    mean_entropy += entropy.clone().into_scalar().to_f32();
-
-                    let action_log_prob = log_prob.gather(1, action_batch.clone());
-                    let old_log_prob = old_log_probs_batch.gather(1, action_batch);
-                    let log_prob_diff = action_log_prob - old_log_prob;
-                    let ratios = log_prob_diff.clone().exp();
-                    let clipped_ratios = ratios
-                        .clone()
-                        .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
-
-                    {
-                        let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff;
-                        mean_divergence += kl_tensor.mean().detach().into_scalar().to_f32();
-
-                        let clip_fraction = (ratios.clone() - 1.0)
-                            .abs()
-                            .greater_elem(self.config.clip_range)
-                            .float()
-                            .mean();
-                        mean_clip_fraction += clip_fraction.into_scalar().to_f32();
-                    }
-
-                    let actor_loss = -elementwise_min(
-                        ratios * advantage_batch.clone(),
-                        clipped_ratios * advantage_batch,
-                    )
-                    .mean();
-
-                    let ppo_loss = actor_loss - entropy * self.config.entropy_coeff;
-                    net.actor = update_parameters(
-                        ppo_loss * minibatch_ratio,
-                        net.actor,
-                        &mut self.policy_optimizer,
-                        self.config.learning_rate.into(),
-                    );
-
-                    let critic_loss =
-                        MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
-                    mean_val_loss += critic_loss.clone().into_scalar().to_f32();
-
-                    net.critic = update_parameters(
-                        critic_loss * minibatch_ratio,
-                        net.critic,
-                        &mut self.value_optimizer,
-                        self.config.learning_rate.into(),
-                    );
+                    let clip_fraction = (ratios.clone() - 1.0)
+                        .abs()
+                        .greater_elem(self.config.clip_range)
+                        .float()
+                        .mean();
+                    mean_clip_fraction += clip_fraction.detach().into_scalar().to_f32();
                 }
+
+                let actor_loss = -elementwise_min(
+                    ratios * advantage_batch.clone(),
+                    clipped_ratios * advantage_batch,
+                )
+                .mean();
+
+                let ppo_loss = actor_loss - entropy * self.config.entropy_coeff;
+                net.actor = update_parameters(
+                    ppo_loss * minibatch_ratio,
+                    net.actor,
+                    &mut self.policy_optimizer,
+                    self.config.learning_rate.into(),
+                );
+
+                let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
+                let loss = critic_loss.clone().detach().into_scalar().to_f32();
+                assert!(!loss.is_nan(), "Value loss is NaN: {loss}");
+                mean_val_loss += loss;
+
+                net.critic = update_parameters(
+                    critic_loss * minibatch_ratio,
+                    net.critic,
+                    &mut self.value_optimizer,
+                    self.config.learning_rate.into(),
+                );
             }
         }
 
@@ -182,17 +173,19 @@ impl<B: AutodiffBackend> Ppo<B> {
         stats.cumulative_model_updates += 1;
 
         let mini_batch_iters =
-            1.max(max_memory_idx / self.config.mini_batch_size * self.config.epochs) as f32;
+            1.max(self.config.batch_size / self.config.mini_batch_size * self.config.epochs) as f32;
 
         mean_val_loss /= mini_batch_iters;
         mean_entropy /= mini_batch_iters;
-        mean_divergence /= mini_batch_iters;
         mean_clip_fraction /= mini_batch_iters;
+        // mean_divergence /= mini_batch_iters;
+        // mean_ratio /= mini_batch_iters;
 
-        metrics[".Value Loss"] = mean_val_loss.into();
+        metrics[".Value loss"] = mean_val_loss.into();
         metrics[".Entropy"] = mean_entropy.into();
-        metrics[".Divergence"] = mean_divergence.into();
         metrics[".Clip fraction"] = mean_clip_fraction.into();
+        // metrics[".Divergence"] = mean_divergence.into();
+        // metrics[".Ratio"] = mean_ratio.into();
 
         (net, self.config.batch_size)
     }

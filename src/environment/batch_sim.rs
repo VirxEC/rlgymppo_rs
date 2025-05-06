@@ -5,7 +5,6 @@ use rlgym::{
     Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     rocketsim_rs::glam_ext::GameStateA,
 };
-use std::mem;
 
 pub struct BatchSim<B: Backend, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
 where
@@ -19,7 +18,6 @@ where
     TRUNC: Truncate<SI>,
 {
     games: Vec<GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>>,
-    last_obs: Vec<Vec<f32>>,
     next_obs: Vec<Vec<f32>>,
     metrics: Report,
     device: B::Device,
@@ -46,18 +44,17 @@ where
 
         let mut games = Vec::with_capacity(num_games);
 
-        let mut last_obs = Vec::with_capacity(num_games * 2);
+        let mut next_obs = Vec::with_capacity(num_games);
         for _ in 0..num_games {
             let env = create_env_fn();
             let mut game = GameInstance::new(env, step_callback.clone());
-            last_obs.extend(game.reset());
+            next_obs.extend(game.reset());
             games.push(game);
         }
 
         Self {
-            next_obs: Vec::with_capacity(last_obs.len()),
             metrics: Report::default(),
-            last_obs,
+            next_obs,
             games,
             device,
         }
@@ -71,22 +68,17 @@ where
         let mut memory = Memory::with_capacity(num_steps);
 
         while memory.len() < num_steps {
-            let mut actions = model.react(&self.last_obs, &self.device);
+            let (actions, log_probs) = model.react(&self.next_obs, &self.device);
 
-            let mut start_idx = self.last_obs.len();
+            let mut start_idx = self.next_obs.len();
+            memory.push_batch_part_1(self.next_obs.drain(..), log_probs);
+
             for game in self.games.iter_mut().rev() {
+                let end_idx = start_idx;
                 start_idx -= game.num_players();
-                let game_actions = actions.split_off(start_idx);
-                let result = game.step(&game_actions);
+                let result = game.step(&actions[start_idx..end_idx]);
 
-                memory.push_batch(
-                    self.last_obs.split_off(start_idx),
-                    game_actions,
-                    result.rewards,
-                    result.is_terminal,
-                    result.truncated,
-                );
-
+                memory.push_batch_part_2(result.rewards, result.is_terminal, result.truncated);
                 let obs = if result.is_terminal || result.truncated {
                     game.reset()
                 } else {
@@ -96,8 +88,8 @@ where
                 self.next_obs.extend(obs);
             }
 
+            memory.push_batch_part_3(actions);
             self.next_obs.reverse();
-            mem::swap(&mut self.last_obs, &mut self.next_obs);
         }
 
         (memory, self.get_metrics())

@@ -58,6 +58,15 @@ impl<B: Backend> Net<B> {
         Self { layers }
     }
 
+    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let mut output = input;
+        for layer in &self.layers {
+            output = layer.forward(output);
+        }
+
+        output
+    }
+
     pub fn infer(&self, mut input: Tensor<B, 2>) -> Tensor<B, 2> {
         let num_layers = self.layers.len();
         for layer in &self.layers[..num_layers - 1] {
@@ -71,7 +80,7 @@ impl<B: Backend> Net<B> {
         argmax_actions(self.infer(to_state_tensor_2d(state, device)))
     }
 
-    pub fn react(&self, state: &[Vec<f32>], device: &B::Device) -> Vec<usize> {
+    pub fn react(&self, state: &[Vec<f32>], device: &B::Device) -> (Vec<usize>, Vec<f32>) {
         sample_actions(self.infer(to_state_tensor_2d(state, device)), device)
     }
 }
@@ -99,24 +108,9 @@ impl<B: Backend> Actic<B> {
 
 impl<B: Backend> Actic<B> {
     pub fn forward(&self, input: Tensor<B, 2>) -> PPOOutput<B> {
-        let num_actor_layers = self.actor.layers.len();
+        let policies = self.actor.infer(input.clone());
+        let values = self.critic.forward(input);
 
-        let mut actor_input = input.clone();
-        for layer in &self.actor.layers[..num_actor_layers - 1] {
-            actor_input = relu(layer.forward(actor_input));
-        }
-
-        let policies = softmax(
-            self.actor.layers[num_actor_layers - 1].forward(actor_input),
-            1,
-        )
-        .clamp(1e-11, 1.0);
-
-        let mut critic_input = input;
-        for layer in &self.critic.layers {
-            critic_input = layer.forward(critic_input);
-        }
-
-        PPOOutput::<B>::new(policies, critic_input)
+        PPOOutput::<B>::new(policies, values)
     }
 }

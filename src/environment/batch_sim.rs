@@ -40,8 +40,6 @@ where
     where
         F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
     {
-        assert_ne!(num_games, 0, "num_games must be greater than 0");
-
         let mut games = Vec::with_capacity(num_games);
 
         let mut next_obs = Vec::with_capacity(num_games);

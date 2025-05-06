@@ -60,20 +60,16 @@ impl<B: Backend> Net<B> {
 
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         let mut output = input;
-        for layer in &self.layers {
-            output = layer.forward(output);
-        }
-
-        output
-    }
-
-    pub fn infer(&self, mut input: Tensor<B, 2>) -> Tensor<B, 2> {
         let num_layers = self.layers.len();
         for layer in &self.layers[..num_layers - 1] {
-            input = relu(layer.forward(input));
+            output = relu(layer.forward(output));
         }
 
-        softmax(self.layers[num_layers - 1].forward(input), 1).clamp(1e-11, 1.0)
+        self.layers[num_layers - 1].forward(output)
+    }
+
+    pub fn infer(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        softmax(self.forward(input), 1).clamp(1e-11, 1.0)
     }
 
     pub fn react_deterministic(&self, state: &[Vec<f32>], device: &B::Device) -> Vec<usize> {

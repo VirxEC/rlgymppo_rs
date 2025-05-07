@@ -139,6 +139,7 @@ where
                     if guard.quit {
                         return;
                     }
+                    next_time = Instant::now();
                 }
 
                 if let Some(new_model) = guard.model.take() {

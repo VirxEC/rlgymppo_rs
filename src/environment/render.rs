@@ -66,6 +66,7 @@ where
         step_callback: C,
         try_launch_exe: bool,
         controller: Arc<(Mutex<RendererControls<B>>, Condvar)>,
+        device: B::Device,
     ) -> Self {
         let mut game = GameInstance::new(env, step_callback.clone());
         let last_obs = game.reset();
@@ -75,7 +76,7 @@ where
             controller,
             last_obs,
             game,
-            device: B::Device::default(),
+            device,
         }
     }
 
@@ -106,7 +107,10 @@ where
                 }
             }
 
-            (guard.model.take().unwrap(), guard.deterministic)
+            (
+                guard.model.take().unwrap().to_device(&self.device),
+                guard.deterministic,
+            )
         };
 
         let mut is_first = true;
@@ -143,7 +147,7 @@ where
                 }
 
                 if let Some(new_model) = guard.model.take() {
-                    model = new_model;
+                    model = new_model.to_device(&self.device);
                 }
 
                 deterministic = guard.deterministic;

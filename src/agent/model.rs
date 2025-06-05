@@ -58,7 +58,7 @@ impl<B: Backend> Net<B> {
         Self { layers }
     }
 
-    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+    fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         let mut output = input;
         let num_layers = self.layers.len();
         for layer in &self.layers[..num_layers - 1] {

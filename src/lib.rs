@@ -85,6 +85,9 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// The device to use for training.
     /// Will default to the default device from the given backend.
     pub device: B::Device,
+    /// The device to use for rendering.
+    /// Will default to the default device from the given backend.
+    pub render_device: B::Device,
     /// The layer sizes for the policy network.
     pub policy_layer_sizes: Vec<usize>,
     /// The layer sizes for the critic network.
@@ -120,6 +123,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             ppo: PpoLearnerConfig::default(),
             checkpoints_folder: PathBuf::from("checkpoints"),
             device: B::Device::default(),
+            render_device: B::Device::default(),
             policy_layer_sizes: vec![256; 2],
             critic_layer_sizes: vec![256; 2],
             checkpoints_limit: None,
@@ -141,7 +145,10 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         step_callback: C,
     ) -> Learner<B>
     where
-        F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        F: Fn(Option<usize>) -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
+            + Clone
+            + Send
+            + 'static,
         C: Fn(&mut Report, &mut SI, &GameStateA) + Clone + Send + 'static,
         SS: StateSetter<SI>,
         SIP: SharedInfoProvider<SI>,
@@ -170,7 +177,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             "exp_buffer_size must be greater than or equal to ppo.batch_size"
         );
 
-        let env = (create_env)();
+        let env = (create_env)(None);
         let obs_space = env.get_obs_space();
         let action_space = env.get_action_space();
 
@@ -197,10 +204,11 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
 
             thread::spawn(move || {
                 Renderer::new(
-                    (create_env)(),
+                    (create_env)(None),
                     step_callback,
                     self.try_launch_rlviser,
                     renderer_controls,
+                    self.render_device,
                 )
                 .run();
             })

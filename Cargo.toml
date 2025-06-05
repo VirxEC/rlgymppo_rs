@@ -28,6 +28,8 @@ ndarray = ["burn/ndarray"]
 wgpu = ["burn/wgpu"]
 rocm = ["burn/rocm"]
 cuda = ["burn/cuda"]
+torch = ["burn/tch"]
+candle = ["burn/candle"]
 
 [profile.dev]
 opt-level = 1

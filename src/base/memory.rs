@@ -47,6 +47,19 @@ pub fn get_action_batch<B: Backend>(
     Tensor::from_data(TensorData::new(states, shape), device)
 }
 
+pub fn get_generic_batch<B: Backend>(
+    data: &[f32],
+    indices: &[usize],
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let mut states: Vec<f32> = Vec::with_capacity(indices.len());
+    for i in indices {
+        states.push(data[*i]);
+    }
+
+    Tensor::from_data(TensorData::new(states, [indices.len(), 1]), device)
+}
+
 #[derive(Clone)]
 pub struct Memory {
     states: AllocRingBuffer<Vec<f32>>,

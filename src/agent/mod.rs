@@ -6,7 +6,10 @@ use crate::{
         config::PpoLearnerConfig,
         model::{Actic, Net, PPOOutput},
     },
-    base::{Memory, get_action_batch, get_batch_1d, get_log_probs_batch, get_states_batch},
+    base::{
+        Memory, get_action_batch, get_batch_1d, get_generic_batch, get_log_probs_batch,
+        get_states_batch,
+    },
     utils::{Report, elementwise_min, running_stat::Stats, update_parameters},
 };
 use burn::{
@@ -50,9 +53,20 @@ impl<B: AutodiffBackend> Ppo<B> {
         metrics: &mut Report,
         stats: &mut Stats,
     ) -> (Actic<B>, usize) {
-        let mut memory_indices = (0..memory.len()).collect::<Vec<_>>();
-        let states: Tensor<B, 2> = get_states_batch(memory.states(), &memory_indices, &self.device);
-        let old_values = net.critic.infer(states).detach();
+        assert_eq!(self.config.batch_size % self.config.mini_batch_size, 0);
+
+        let mut memory_indices = (0..self.config.batch_size).collect::<Vec<_>>();
+        let mut old_values = Vec::with_capacity(self.config.batch_size);
+
+        for start_idx in (0..self.config.batch_size).step_by(self.config.mini_batch_size) {
+            let end_idx = start_idx + self.config.mini_batch_size;
+            let sample_indices = &memory_indices[start_idx..end_idx];
+
+            let states_batch: Tensor<B, 2> =
+                get_states_batch(memory.states(), sample_indices, &self.device);
+            let old_values_batch = net.critic.infer(states_batch).detach();
+            old_values.extend(old_values_batch.into_data().into_vec::<f32>().unwrap());
+        }
 
         let return_std = if self.config.standardize_returns {
             stats.return_stat.get_std()
@@ -65,7 +79,7 @@ impl<B: AutodiffBackend> Ppo<B> {
             target_vals,
             advantages,
         } = get_gae(
-            old_values.into_data().into_vec().unwrap(),
+            old_values,
             get_batch_1d(memory.rewards(), &memory_indices),
             get_batch_1d(memory.dones(), &memory_indices),
             get_batch_1d(memory.truncateds(), &memory_indices),
@@ -74,7 +88,6 @@ impl<B: AutodiffBackend> Ppo<B> {
             return_std,
             self.config.reward_clip_range,
             self.config.max_returns_per_stats_increment,
-            &self.device,
         );
 
         if self.config.standardize_returns {
@@ -96,19 +109,13 @@ impl<B: AutodiffBackend> Ppo<B> {
                 let end_idx = start_idx + self.config.mini_batch_size;
                 let sample_indices = &memory_indices[start_idx..end_idx];
 
-                let sample_indices_tensor = Tensor::from_ints(sample_indices, &self.device);
                 let state_batch = get_states_batch(memory.states(), sample_indices, &self.device);
                 let action_batch = get_action_batch(memory.actions(), sample_indices, &self.device);
                 let old_log_probs_batch =
                     get_log_probs_batch(memory.log_probs(), sample_indices, &self.device);
-                let advantage_batch: Tensor<B, 2> = advantages
-                    .clone()
-                    .select(0, sample_indices_tensor.clone())
-                    .detach();
-                let target_vals_batch = target_vals
-                    .clone()
-                    .select(0, sample_indices_tensor)
-                    .detach();
+                let advantage_batch = get_generic_batch(&advantages, sample_indices, &self.device);
+                let target_vals_batch =
+                    get_generic_batch(&target_vals, sample_indices, &self.device);
 
                 let PPOOutput {
                     policies: policy_batch,
@@ -191,14 +198,14 @@ impl<B: AutodiffBackend> Ppo<B> {
     }
 }
 
-struct GAEOutput<B: Backend> {
+struct GAEOutput {
     returns: Vec<f32>,
-    target_vals: Tensor<B, 2>,
-    advantages: Tensor<B, 2>,
+    target_vals: Vec<f32>,
+    advantages: Vec<f32>,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn get_gae<B: Backend>(
+fn get_gae(
     values: Vec<f32>,
     rewards: Vec<f32>,
     dones: Vec<bool>,
@@ -208,9 +215,8 @@ fn get_gae<B: Backend>(
     return_std: f32,
     clip_range: f32,
     max_n_returns: usize,
-    device: &B::Device,
-) -> GAEOutput<B> {
-    let n_returns = rewards.len();
+) -> GAEOutput {
+    let n_returns = values.len();
     let mut returns = vec![0.0; n_returns];
     let mut target_vals = returns.clone();
     let mut advantages = returns.clone();
@@ -225,8 +231,8 @@ fn get_gae<B: Backend>(
     let mut running_advantage = 0.0;
 
     for i in (0..n_returns).rev() {
-        let not_done = f32::from(u8::from(!dones[i]));
-        let not_truncated = f32::from(u8::from(!truncateds[i]));
+        let not_done = f32::from(!dones[i]);
+        let not_truncated = f32::from(!truncateds[i]);
 
         let mut norm_reward = rewards[i] * return_scale;
         if clip_range > 0.0 {
@@ -249,10 +255,7 @@ fn get_gae<B: Backend>(
     returns.truncate(max_n_returns);
     GAEOutput {
         returns,
-        target_vals: Tensor::<B, 2>::from_data(
-            TensorData::new(target_vals, [n_returns, 1]),
-            device,
-        ),
-        advantages: Tensor::<B, 2>::from_data(TensorData::new(advantages, [n_returns, 1]), device),
+        target_vals,
+        advantages,
     }
 }

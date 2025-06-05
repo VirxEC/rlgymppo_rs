@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+use itertools::repeat_n;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rlgymppo::{
     LearnerConfig, PpoLearnerConfig,
@@ -15,10 +16,7 @@ use rlgymppo::{
     },
     utils::{AvgTracker, Report},
 };
-use std::{
-    sync::atomic::{AtomicUsize, Ordering},
-    thread::available_parallelism,
-};
+use std::thread::available_parallelism;
 
 struct SharedInfo {
     rng: SmallRng,
@@ -138,7 +136,7 @@ impl Obs<SharedInfo> for MyObs {
 
             // zero padding
             for _ in 0..Self::ZERO_PADDING - num_teammates - 1 {
-                obs_vec.extend(vec![0.0; Self::CAR_OBS]);
+                obs_vec.extend(repeat_n(0.0, Self::CAR_OBS));
             }
 
             // opponent's obs
@@ -152,7 +150,7 @@ impl Obs<SharedInfo> for MyObs {
 
             // zero padding
             for _ in 0..Self::ZERO_PADDING - num_opponents {
-                obs_vec.extend(vec![0.0; Self::CAR_OBS]);
+                obs_vec.extend(repeat_n(0.0, Self::CAR_OBS));
             }
 
             assert_eq!(obs_vec.len(), Self::OBS_SPACE);
@@ -353,7 +351,9 @@ impl Truncate<SharedInfo> for MyTruncate {
     }
 }
 
-fn create_env() -> Env<
+fn create_env(
+    game_id: Option<usize>,
+) -> Env<
     MyStateSetter,
     MySharedInfoProvider,
     MyObs,
@@ -363,7 +363,10 @@ fn create_env() -> Env<
     MyTruncate,
     SharedInfo,
 > {
-    static GAME_ID: AtomicUsize = AtomicUsize::new(0);
+    // `game_id` is None for the game used to calculate the policy obs/action space,
+    // as well as for the renderer.
+    // Otherwise, every env gets a unique id starting from 0 and incrementing by 1.
+    let game_id = game_id.unwrap_or(0);
 
     let mut arena = Arena::default_standard();
     arena
@@ -371,8 +374,6 @@ fn create_env() -> Env<
         .set_goal_scored_callback(|arena, _, _| arena.reset_to_random_kickoff(None), 0);
 
     let octane = CarConfig::octane();
-
-    let game_id = GAME_ID.fetch_add(1, Ordering::SeqCst);
 
     // pseudo-random game mode: 1v1, 2v2, 3v3
     // using game id ensures an equal, predictable distribution of game modes
@@ -407,6 +408,8 @@ fn main() {
     let batch_size = mini_batch_size * 3;
     let lr = 3e-4;
 
+    // Router will fallback to NdArray if Wgpu is not available
+    // Realistically more useful for using CUDA and falling back to NdArray
     let config = LearnerConfig::<Autodiff<Router<(Wgpu, NdArray)>>> {
         render: true,
         num_threads: available_parallelism().unwrap().get(),

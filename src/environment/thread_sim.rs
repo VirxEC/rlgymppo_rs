@@ -39,13 +39,16 @@ impl<B: Backend> ThreadSim<B> {
         step_callback: C,
         batch_size: usize,
         exp_buffer_size: usize,
-        num_games: usize,
+        num_threads: usize,
         num_games_per_thread: usize,
         device: B::Device,
     ) -> Self
     where
         B: Backend,
-        F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        F: Fn(Option<usize>) -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
+            + Clone
+            + Send
+            + 'static,
         C: Fn(&mut Report, &mut SI, &GameStateA) + Clone + Send + 'static,
         SS: StateSetter<SI>,
         SIP: SharedInfoProvider<SI>,
@@ -58,11 +61,11 @@ impl<B: Backend> ThreadSim<B> {
         let (pc_sender, pc_recv) = channel();
         let (sender, recv) = channel();
 
-        let mut threads = Vec::with_capacity(num_games);
+        let mut threads = Vec::with_capacity(num_threads);
         let data_request = DataRequest::default();
-        let thread_controls = Arc::new((RwLock::new(data_request), Barrier::new(num_games + 1)));
+        let thread_controls = Arc::new((RwLock::new(data_request), Barrier::new(num_threads + 1)));
 
-        for _ in 0..num_games {
+        for i in 0..num_threads {
             let pc_sender = pc_sender.clone();
             let sender = sender.clone();
             let create_env_fn = create_env_fn.clone();
@@ -71,21 +74,26 @@ impl<B: Backend> ThreadSim<B> {
             let thread_controls = thread_controls.clone();
 
             let thread = thread::spawn(move || {
-                let mut batch_sim =
-                    BatchSim::new(create_env_fn, step_callback, num_games_per_thread, device);
+                let mut batch_sim = BatchSim::new(
+                    create_env_fn,
+                    step_callback,
+                    i,
+                    num_games_per_thread,
+                    device,
+                );
 
                 pc_sender.send(batch_sim.num_players()).unwrap();
 
                 loop {
                     thread_controls.1.wait();
                     let request = thread_controls.0.read();
-                    let Some(model) = request.model.clone() else {
+                    let Some(model) = &request.model else {
                         break;
                     };
 
                     let steps_per_player = batch_size.div_ceil(request.total_num_players);
                     let (memory, metrics) =
-                        batch_sim.run(&model, steps_per_player * batch_sim.num_players());
+                        batch_sim.run(model, steps_per_player * batch_sim.num_players());
 
                     sender.send(DataResponse { memory, metrics }).unwrap();
                 }
@@ -94,7 +102,7 @@ impl<B: Backend> ThreadSim<B> {
         }
 
         let mut total_num_players = 0;
-        for _ in 0..num_games {
+        for _ in 0..num_threads {
             total_num_players += pc_recv.recv().unwrap();
         }
 

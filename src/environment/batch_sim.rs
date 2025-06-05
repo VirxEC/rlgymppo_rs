@@ -36,15 +36,21 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    pub fn new<F>(create_env_fn: F, step_callback: C, num_games: usize, device: B::Device) -> Self
+    pub fn new<F>(
+        create_env_fn: F,
+        step_callback: C,
+        thread_num: usize,
+        num_games: usize,
+        device: B::Device,
+    ) -> Self
     where
-        F: Fn() -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
+        F: Fn(Option<usize>) -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
     {
         let mut games = Vec::with_capacity(num_games);
 
         let mut next_obs = Vec::with_capacity(num_games);
-        for _ in 0..num_games {
-            let env = create_env_fn();
+        for i in 0..num_games {
+            let env = create_env_fn(Some(thread_num * i));
             let mut game = GameInstance::new(env, step_callback.clone());
             next_obs.extend(game.reset());
             games.push(game);

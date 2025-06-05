@@ -53,20 +53,12 @@ impl<B: AutodiffBackend> Ppo<B> {
         metrics: &mut Report,
         stats: &mut Stats,
     ) -> (Actic<B>, usize) {
-        assert_eq!(self.config.batch_size % self.config.mini_batch_size, 0);
-
         let mut memory_indices = (0..self.config.batch_size).collect::<Vec<_>>();
-        let mut old_values = Vec::with_capacity(self.config.batch_size);
 
-        for start_idx in (0..self.config.batch_size).step_by(self.config.mini_batch_size) {
-            let end_idx = start_idx + self.config.mini_batch_size;
-            let sample_indices = &memory_indices[start_idx..end_idx];
-
-            let states_batch: Tensor<B, 2> =
-                get_states_batch(memory.states(), sample_indices, &self.device);
-            let old_values_batch = net.critic.infer(states_batch).detach();
-            old_values.extend(old_values_batch.into_data().into_vec::<f32>().unwrap());
-        }
+        let states_batch: Tensor<B, 2> =
+            get_states_batch(memory.states(), &memory_indices, &self.device);
+        let old_values_batch = net.critic.infer(states_batch).detach();
+        let old_values = old_values_batch.into_data().into_vec::<f32>().unwrap();
 
         let return_std = if self.config.standardize_returns {
             stats.return_stat.get_std()

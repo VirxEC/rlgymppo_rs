@@ -87,13 +87,13 @@ impl<B: Backend> ThreadSim<B> {
                 loop {
                     thread_controls.1.wait();
                     let request = thread_controls.0.read();
-                    let Some(model) = &request.model else {
+                    let Some(model) = request.model.clone() else {
                         break;
                     };
 
                     let steps_per_player = batch_size.div_ceil(request.total_num_players);
                     let (memory, metrics) =
-                        batch_sim.run(model, steps_per_player * batch_sim.num_players());
+                        batch_sim.run(&model, steps_per_player * batch_sim.num_players());
 
                     sender.send(DataResponse { memory, metrics }).unwrap();
                 }

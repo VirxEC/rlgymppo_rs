@@ -92,6 +92,8 @@ impl<B: Backend> ThreadSim<B> {
                     };
 
                     let steps_per_player = batch_size.div_ceil(request.total_num_players);
+                    drop(request);
+
                     let (memory, metrics) =
                         batch_sim.run(&model, steps_per_player * batch_sim.num_players());
 

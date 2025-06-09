@@ -115,6 +115,9 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// Whether to try to launch the rlviser executable.
     /// If false, RLViser needs to be started manually.
     pub try_launch_rlviser: bool,
+    /// The name of the project to use for logging to wandb.
+    /// If None, metrics will not be logged to wandb.
+    pub wandb_project_name: Option<String>,
 }
 
 impl<B: AutodiffBackend> Default for LearnerConfig<B> {
@@ -134,6 +137,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             num_additional_iterations: None,
             render: false,
             try_launch_rlviser: true,
+            wandb_project_name: None,
         }
     }
 }
@@ -230,6 +234,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             stats: Stats::default(),
             device: self.device,
             model,
+            wandb_project_name: self.wandb_project_name,
             checkpoints_folder: self.checkpoints_folder,
             checkpoints_limit: self.checkpoints_limit,
             timesteps_per_save: self.timesteps_per_save,
@@ -248,6 +253,7 @@ pub struct Learner<B: AutodiffBackend> {
     stats: Stats,
     device: B::Device,
     model: Actic<B>,
+    wandb_project_name: Option<String>,
     checkpoints_folder: PathBuf,
     checkpoints_limit: Option<usize>,
     timesteps_per_save: u64,
@@ -313,6 +319,26 @@ impl<B: AutodiffBackend> Learner<B> {
 
     /// Train the model, and automatically saves it before exiting.
     pub fn learn(mut self) {
+        #[cfg(not(feature = "wandb"))]
+        assert_eq!(
+            self.wandb_project_name, None,
+            "'wandb' feature is not enabled, but wandb_project_name is set. \
+             Enable the 'wandb' feature in Cargo.toml to use Weights & Biases logging."
+        );
+
+        #[cfg(feature = "wandb")]
+        let mut wandb = if self.wandb_project_name.is_some() {
+            Some(
+                wandb::init(
+                    self.wandb_project_name.clone(),
+                    Some(wandb::settings::Settings::default()),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+
         let (s, r) = channel();
 
         thread::spawn(move || {
@@ -370,6 +396,11 @@ impl<B: AutodiffBackend> Learner<B> {
             metrics[".Cumulative epochs"] = self.stats.cumulative_epochs.into();
             metrics[".Cumulative updates"] = self.stats.cumulative_model_updates.into();
 
+            #[cfg(feature = "wandb")]
+            if let Some(wandb) = wandb.as_mut() {
+                metrics.report_wandb(wandb);
+            }
+
             println!("{metrics}");
 
             for input in r.try_iter() {
@@ -409,11 +440,16 @@ impl<B: AutodiffBackend> Learner<B> {
             self.checkpoints_limit,
         );
 
+        #[cfg(feature = "wandb")]
+        if let Some(mut wandb) = wandb {
+            wandb.finish();
+        }
+
         println!("Waiting for threads to exit...");
         self.renderer.join().unwrap();
         self.collector.join();
 
-        println!("Exiting.")
+        println!("Done.")
     }
 
     /// Only run the renderer. Useful for debugging.
@@ -466,6 +502,6 @@ impl<B: AutodiffBackend> Learner<B> {
         self.renderer.join().unwrap();
         self.collector.join();
 
-        println!("Exiting.")
+        println!("Done.")
     }
 }

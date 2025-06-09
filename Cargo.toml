@@ -4,18 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.17.0", features = ["autodiff"] }
+burn = { version = "0.17.1", features = ["autodiff"] }
 rlgym = { path = "../rlgym_rs" }
 ahash = "0.8.11"
-toml = { version = "0.8.19", features = ["preserve_order"] }
+toml = { version = "0.8.23", features = ["preserve_order"] }
 serde = { version = "1.0.208", features = ["derive"] }
 ringbuffer = "0.15.0"
 rand = "0.9.1"
 itertools = "0.14.0"
-parking_lot = "0.12.3"
+parking_lot = "0.12.4"
+wandb = { git = "https://github.com/wandb/wandb.git", tag="v0.18.7", optional = true }
 
 [features]
 default = ["router", "fusion"]
+wandb = ["dep:wandb"]
 
 # performance
 fusion = ["burn/fusion"]

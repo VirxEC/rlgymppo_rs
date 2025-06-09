@@ -1,5 +1,5 @@
 use crate::utils::AvgTracker;
-use ahash::HashMap;
+use ahash::AHashMap;
 use std::{
     fmt,
     ops::{AddAssign, Index, IndexMut},
@@ -7,7 +7,8 @@ use std::{
 
 #[derive(Debug, Clone, Copy)]
 pub enum Reportable {
-    Val(f64),
+    Float(f64),
+    Int(i64),
     Avg(AvgTracker),
 }
 
@@ -16,7 +17,7 @@ macro_rules! reportable_from_primitive {
         $(
             impl From<$t> for Reportable {
                 fn from(val: $t) -> Self {
-                    Reportable::Val(val as f64)
+                    Reportable::Int(val as i64)
                 }
             }
         )*
@@ -24,12 +25,18 @@ macro_rules! reportable_from_primitive {
 }
 
 reportable_from_primitive!(
-    usize, u8, u16, u32, u64, u128, isize, i8, i16, i32, i64, i128, f32
+    usize, u8, u16, u32, u64, u128, isize, i8, i16, i32, i64, i128
 );
 
 impl From<f64> for Reportable {
     fn from(val: f64) -> Self {
-        Reportable::Val(val)
+        Reportable::Float(val)
+    }
+}
+
+impl From<f32> for Reportable {
+    fn from(val: f32) -> Self {
+        Reportable::Float(val as f64)
     }
 }
 
@@ -41,14 +48,15 @@ impl From<AvgTracker> for Reportable {
 
 impl Default for Reportable {
     fn default() -> Self {
-        Reportable::Val(0.0)
+        Reportable::Float(0.0)
     }
 }
 
 impl AddAssign<Reportable> for Reportable {
     fn add_assign(&mut self, other: Reportable) {
         match (self, other) {
-            (Reportable::Val(a), Reportable::Val(b)) => *a += b,
+            (Reportable::Float(a), Reportable::Float(b)) => *a += b,
+            (Reportable::Int(a), Reportable::Int(b)) => *a += b,
             (Reportable::Avg(a), Reportable::Avg(b)) => *a += b,
             (a, b) => *a = b,
         }
@@ -56,38 +64,52 @@ impl AddAssign<Reportable> for Reportable {
 }
 
 impl Reportable {
-    pub fn as_val(&self) -> f64 {
+    pub fn as_float(&self) -> f64 {
         match self {
-            Reportable::Val(val) => *val,
-            Reportable::Avg(_) => unreachable!("Expected Val, got Avg"),
+            Reportable::Float(val) => *val,
+            _ => unreachable!("Expected Val, got Avg"),
+        }
+    }
+
+    pub fn as_int(&self) -> i64 {
+        match self {
+            Reportable::Int(val) => *val,
+            _ => unreachable!("Expected Int, got Float"),
         }
     }
 
     pub fn as_avg(&self) -> AvgTracker {
         match self {
             Reportable::Avg(avg) => *avg,
-            Reportable::Val(_) => unreachable!("Expected Avg, got Val"),
+            _ => unreachable!("Expected Avg, got Val"),
         }
     }
 
-    pub fn as_val_mut(&mut self) -> &mut f64 {
+    pub fn as_float_mut(&mut self) -> &mut f64 {
         match self {
-            Reportable::Val(val) => val,
-            Reportable::Avg(_) => unreachable!("Expected Val, got Avg"),
+            Reportable::Float(val) => val,
+            _ => unreachable!("Expected Val, got Avg"),
+        }
+    }
+
+    pub fn as_int_mut(&mut self) -> &mut i64 {
+        match self {
+            Reportable::Int(val) => val,
+            _ => unreachable!("Expected Int, got Float"),
         }
     }
 
     pub fn as_avg_mut(&mut self) -> &mut AvgTracker {
         match self {
             Reportable::Avg(avg) => avg,
-            Reportable::Val(_) => unreachable!("Expected Avg, got Val"),
+            _ => unreachable!("Expected Avg, got Val"),
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Report {
-    data: HashMap<String, Reportable>,
+    data: AHashMap<String, Reportable>,
 }
 
 impl fmt::Display for Report {
@@ -98,8 +120,9 @@ impl fmt::Display for Report {
 
         for (key, val) in items {
             match val {
-                Reportable::Val(val) => writeln!(f, "\t{}: {}", key, val)?,
-                Reportable::Avg(avg) => writeln!(f, "\t{}: {}", key, avg.get())?,
+                Reportable::Float(val) => writeln!(f, "\t{key}: {val}")?,
+                Reportable::Int(val) => writeln!(f, "\t{key}: {val}")?,
+                Reportable::Avg(avg) => writeln!(f, "\t{key}: {}", avg.get())?,
             }
         }
         Ok(())
@@ -107,6 +130,29 @@ impl fmt::Display for Report {
 }
 
 impl Report {
+    #[cfg(feature = "wandb")]
+    pub fn report_wandb(&self, wandb: &mut wandb::run::Run) {
+        use wandb::run::Value;
+
+        let mut data = std::collections::HashMap::new();
+
+        for (key, val) in &self.data {
+            match val {
+                Reportable::Float(v) => {
+                    data.insert(key.clone(), Value::Float(*v));
+                }
+                Reportable::Int(v) => {
+                    data.insert(key.clone(), Value::Float(*v as f64));
+                }
+                Reportable::Avg(avg) => {
+                    data.insert(key.clone(), Value::Float(avg.get()));
+                }
+            }
+        }
+
+        wandb.log(data);
+    }
+
     pub fn remove(&mut self, key: &str) {
         self.data.remove(key);
     }

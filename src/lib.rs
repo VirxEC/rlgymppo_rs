@@ -327,14 +327,29 @@ impl<B: AutodiffBackend> Learner<B> {
         );
 
         #[cfg(feature = "wandb")]
-        let mut wandb = if self.wandb_project_name.is_some() {
-            Some(
-                wandb::init(
-                    self.wandb_project_name.clone(),
-                    Some(wandb::settings::Settings::default()),
-                )
-                .unwrap(),
-            )
+        let mut wandb = if let Some(project_name) = self.wandb_project_name.as_ref() {
+            use crate::utils::running_stat::WandbRun;
+
+            let mut settings = wandb::settings::Settings::default();
+            settings.set_project(project_name.clone());
+
+            let run = if let Some(wandb_run) = self.stats.wandb_run.as_ref() {
+                settings.proto.entity = Some(wandb_run.entity.clone());
+
+                let sess = wandb::session::Session::new(settings).unwrap();
+                sess.init_run(Some(wandb_run.run_id.clone())).unwrap()
+            } else {
+                let sess = wandb::session::Session::new(settings).unwrap();
+                let run = sess.init_run(None).unwrap();
+                self.stats.wandb_run = Some(WandbRun {
+                    run_id: run.settings.proto.run_id.as_ref().unwrap().clone(),
+                    entity: run.settings.proto.entity.as_ref().unwrap().clone(),
+                });
+
+                run
+            };
+
+            Some(run)
         } else {
             None
         };

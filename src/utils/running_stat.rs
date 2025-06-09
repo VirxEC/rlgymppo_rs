@@ -17,21 +17,18 @@ pub struct Stats {
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]
 pub struct WelfordRunningStat {
-    running_mean: f64,
-    running_variance: f64,
-    count: usize,
+    mean: f64,
+    mean_sqr: f64,
+    count: u64,
 }
 
 impl WelfordRunningStat {
     fn update(&mut self, sample: f64) {
-        let current_count = self.count as f64;
         self.count += 1;
-
-        let delta = sample - self.running_mean;
-        let delta_n = delta / self.count as f64;
-
-        self.running_mean += delta_n;
-        self.running_variance += delta * delta_n * current_count;
+        let delta = sample - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta_2 = sample - self.mean;
+        self.mean_sqr += delta * delta_2;
     }
 
     pub fn increment(&mut self, samples: Vec<f32>) {
@@ -45,7 +42,7 @@ impl WelfordRunningStat {
             return 1.0;
         }
 
-        let cur_var = self.running_variance / (self.count - 1) as f64;
+        let cur_var = self.mean_sqr / (self.count - 1) as f64;
         if cur_var == 0.0 {
             1.0
         } else {

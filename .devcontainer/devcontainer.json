@@ -1,0 +1,28 @@
+{
+  "name": "rocm-6700xt-pytorch-rust",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  "runArgs": [
+    "--device=/dev/kfd",
+    "--device=/dev/dri",
+    "--group-add=video",
+    "--ipc=host",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt=seccomp=unconfined",
+    "--shm-size=8G",
+
+    // RDNA2 performance stability tuning
+    "--ulimit=memlock=-1",
+    "--ulimit=stack=67108864"
+  ],
+
+  "workspaceFolder": "/workspace",
+  "remoteUser": "root",
+
+  "customizations": {
+    "zed": {}
+  }
+}

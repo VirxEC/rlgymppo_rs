@@ -2,7 +2,7 @@
   "name": "rocm-6700xt-pytorch-rust",
   "build": {
     "dockerfile": "Dockerfile",
-    "context": ".."
+    "context": "..",
   },
 
   "runArgs": [
@@ -16,13 +16,10 @@
 
     // RDNA2 performance stability tuning
     "--ulimit=memlock=-1",
-    "--ulimit=stack=67108864"
+    "--ulimit=stack=67108864",
   ],
 
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
   "workspaceFolder": "/workspace",
   "remoteUser": "root",
-
-  "customizations": {
-    "zed": {}
-  }
 }

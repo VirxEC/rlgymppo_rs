@@ -4,15 +4,13 @@ pub(crate) mod running_stat;
 pub(crate) mod serde;
 
 pub use avg_tracker::AvgTracker;
-pub use report::{Report, Reportable};
-
 use burn::{
-    LearningRate,
     module::AutodiffModule,
-    optim::{GradientsParams, Optimizer},
+    optim::{GradientsParams, LearningRate, Optimizer},
     prelude::*,
     tensor::{Distribution, Transaction, backend::AutodiffBackend, cast::ToElement},
 };
+pub use report::{Report, Reportable};
 
 pub(crate) fn to_state_tensor_2d<B: Backend>(
     state: &[Vec<f32>],

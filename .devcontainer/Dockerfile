@@ -1,13 +1,10 @@
-FROM rocm/pytorch:rocm6.3_ubuntu24.04_py3.12_pytorch_release_2.4.0
+FROM rocm/pytorch:rocm7.2.3_ubuntu24.04_py3.12_pytorch_release_2.9.1
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # 6700xt fix
 ENV HSA_OVERRIDE_GFX_VERSION=10.3.0
-
-# ROCm / PyTorch performance tuning (RDNA2 relevant)
 ENV HIP_VISIBLE_DEVICES=0
-ENV PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 ENV PYTORCH_ROCM_ARCH=gfx1030
 
 # BLAS acceleration
@@ -22,9 +19,10 @@ ENV AMD_SERIALIZE_KERNEL=0
 
 # tch-rs uses system PyTorch backend
 ENV LIBTORCH_USE_PYTORCH=1
+ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
 # Library path fixes (ROCm + PyTorch runtime)
-ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH
 
 WORKDIR /workspace
 
@@ -43,10 +41,10 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-RUN rustup toolchain install stable && \
+RUN rustup toolchain install beta && \
     rustup toolchain install nightly && \
-    rustup default stable && \
-    rustup component add rustfmt --toolchain nightly && \
-    rustup component add clippy
+    rustup default beta
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 CMD ["/bin/bash"]

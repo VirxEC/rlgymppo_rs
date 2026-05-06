@@ -1,9 +1,9 @@
-use crate::utils::{AvgTracker, Report};
 use rlgym::{
     Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
-    rocketsim_rs::glam_ext::GameStateA,
+    rocketsim::{ArenaState, GameMode},
 };
-use std::time::Duration;
+
+use crate::utils::{AvgTracker, Report};
 
 pub struct StepResult {
     pub obs: FullObs,
@@ -12,58 +12,45 @@ pub struct StepResult {
     pub truncated: bool,
 }
 
-pub struct GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
+pub struct GameInstance<C, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    C: Fn(&mut Report, &mut SI, &GameStateA),
+    C: Fn(&mut Report, &mut SI, &ArenaState),
     SS: StateSetter<SI>,
-    SIP: SharedInfoProvider<SI>,
+    SI: SharedInfoProvider,
     OBS: Obs<SI>,
     ACT: Action<SI>,
     REW: Reward<SI>,
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    env: Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
+    env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
     step_callback: C,
-    last_state: GameStateA,
+    last_state: ArenaState,
     metrics: Report,
 }
 
-impl<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
-    GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<C, SS, OBS, ACT, REW, TERM, TRUNC, SI> GameInstance<C, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    C: Fn(&mut Report, &mut SI, &GameStateA),
+    C: Fn(&mut Report, &mut SI, &ArenaState),
     SS: StateSetter<SI>,
-    SIP: SharedInfoProvider<SI>,
+    SI: SharedInfoProvider,
     OBS: Obs<SI>,
     ACT: Action<SI>,
     REW: Reward<SI>,
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    pub fn new(env: Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>, step_callback: C) -> Self {
+    pub fn new(env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>, step_callback: C) -> Self {
         Self {
             env,
             step_callback,
-            last_state: GameStateA::default(),
+            last_state: ArenaState::new_empty(GameMode::Soccar),
             metrics: Report::default(),
         }
     }
 
-    pub fn is_paused(&self) -> bool {
-        self.env.is_paused()
-    }
-
-    pub fn open_rlviser(&mut self, try_launch_exe: bool) {
-        self.env.enable_rendering(try_launch_exe);
-    }
-
-    pub fn close_rlviser(&mut self) {
-        self.env.stop_rendering();
-    }
-
-    pub fn handle_incoming_states(&mut self, tick_rate: &mut Duration) {
-        self.env.handle_incoming_states(tick_rate).unwrap();
+    pub fn do_rendering(&mut self) {
+        self.env.do_rendering()
     }
 
     pub fn num_players(&self) -> usize {

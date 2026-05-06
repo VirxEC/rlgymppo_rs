@@ -1,6 +1,14 @@
 pub mod config;
 pub mod model;
 
+use burn::{
+    nn::loss::{MseLoss, Reduction},
+    optim::{Adam, AdamConfig, adaptor::OptimizerAdaptor},
+    prelude::*,
+    tensor::{backend::AutodiffBackend, cast::ToElement},
+};
+use rand::{Rng, seq::SliceRandom};
+
 use crate::{
     agent::{
         config::PpoLearnerConfig,
@@ -12,13 +20,6 @@ use crate::{
     },
     utils::{Report, elementwise_min, running_stat::Stats, update_parameters},
 };
-use burn::{
-    nn::loss::{MseLoss, Reduction},
-    optim::{Adam, AdamConfig, adaptor::OptimizerAdaptor},
-    prelude::*,
-    tensor::{backend::AutodiffBackend, cast::ToElement},
-};
-use rand::{Rng, seq::SliceRandom};
 
 pub struct Ppo<B: AutodiffBackend> {
     config: PpoLearnerConfig,

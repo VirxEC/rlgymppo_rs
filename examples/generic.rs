@@ -1,49 +1,48 @@
 #![recursion_limit = "256"]
 
+use burn::backend::{LibTorch, libtorch::LibTorchDevice};
 use itertools::repeat_n;
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
+use rlgym::rocketsim::init_from_default;
 use rlgymppo::{
     LearnerConfig, PpoLearnerConfig,
-    backend::{Autodiff, NdArray, Router, Wgpu},
+    backend::Autodiff,
     rlgym::{
         Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
     },
-    rocketsim_rs::{
-        cxx::UniquePtr,
-        glam_ext::{BallA, CarInfoA, GameStateA},
-        init,
-        sim::{Arena, CarConfig, CarControls, Team},
+    rocketsim::{
+        Arena, ArenaState, BallState, CarBodyConfig, CarControls, CarInfo, CarState, GameMode,
+        Team, consts,
     },
     utils::{AvgTracker, Report},
 };
-use std::thread::available_parallelism;
 
 struct SharedInfo {
     rng: SmallRng,
+    start_tick: u64,
     metrics: Report,
 }
 
 impl Default for SharedInfo {
     fn default() -> Self {
         Self {
-            rng: SmallRng::from_os_rng(),
+            rng: SmallRng::seed_from_u64(0),
+            start_tick: 0,
             metrics: Report::default(),
         }
     }
 }
 
-struct MySharedInfoProvider;
+impl SharedInfoProvider for SharedInfo {
+    fn reset(&mut self, initial_state: &ArenaState) {
+        self.start_tick = initial_state.tick_count;
+    }
 
-impl SharedInfoProvider<SharedInfo> for MySharedInfoProvider {
-    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
-
-    fn apply(&mut self, game_state: &GameStateA, shared_info: &mut SharedInfo) {
-        for car in &game_state.cars {
-            let dist_to_ball = car.state.pos.distance(game_state.ball.pos);
-            shared_info.metrics["Avg. dist to ball"] +=
-                AvgTracker::new(dist_to_ball as f64, 1).into();
-            shared_info.metrics["Avg. velocity"] +=
-                AvgTracker::new(car.state.vel.length() as f64, 1).into();
+    fn update(&mut self, game_state: &ArenaState) {
+        for (_, state) in &game_state.cars {
+            let dist_to_ball = state.pos.distance(game_state.ball.pos);
+            self.metrics["Avg. dist to ball"] += AvgTracker::new(dist_to_ball as f64, 1).into();
+            self.metrics["Avg. velocity"] += AvgTracker::new(state.vel.length() as f64, 1).into();
         }
     }
 }
@@ -51,19 +50,15 @@ impl SharedInfoProvider<SharedInfo> for MySharedInfoProvider {
 struct MyStateSetter;
 
 impl StateSetter<SharedInfo> for MyStateSetter {
-    fn apply(&mut self, arena: &mut UniquePtr<Arena>, shared_info: &mut SharedInfo) {
-        arena.pin_mut().reset_tick_count();
+    fn apply(&mut self, arena: &mut Arena, shared_info: &mut SharedInfo) {
+        arena.reset_to_random_kickoff(Some(shared_info.rng.random()));
 
-        arena
-            .pin_mut()
-            .reset_to_random_kickoff(Some(shared_info.rng.random()));
-
-        let mut state = arena.pin_mut().get_game_state();
-        for car in &mut state.cars {
-            car.state.vel.x = shared_info.rng.random_range(-1300.0..1300.0);
-            car.state.vel.y = shared_info.rng.random_range(-1300.0..1300.0);
+        let mut state = arena.get_arena_state();
+        for (info, state) in &mut state.cars {
+            state.vel.x = shared_info.rng.random_range(-1300.0..1300.0);
+            state.vel.y = shared_info.rng.random_range(-1300.0..1300.0);
+            arena.set_car_state(info.idx, *state);
         }
-        arena.pin_mut().set_game_state(&state).unwrap();
     }
 }
 
@@ -72,28 +67,38 @@ struct MyObs;
 impl MyObs {
     const ZERO_PADDING: usize = 3;
     const BALL_OBS: usize = 9;
-    const CAR_OBS: usize = 9;
+    const CAR_OBS: usize = 16;
 
     const OBS_SPACE: usize = Self::BALL_OBS + Self::CAR_OBS * Self::ZERO_PADDING * 2;
 
-    fn get_ball_obs(ball: &BallA) -> Vec<f32> {
+    fn get_ball_obs(ball: &BallState) -> Vec<f32> {
         let mut obs_vec = Vec::with_capacity(Self::BALL_OBS);
         obs_vec.extend(ball.pos.to_array());
         obs_vec.extend(ball.vel.to_array());
         obs_vec.extend(ball.ang_vel.to_array());
 
+        assert_eq!(obs_vec.len(), Self::BALL_OBS);
         obs_vec
     }
 
-    fn get_all_car_obs(cars: &[CarInfoA]) -> Vec<(u32, Team, Vec<f32>)> {
+    fn get_all_car_obs(cars: &[(CarInfo, CarState)]) -> Vec<(usize, Team, Vec<f32>)> {
         cars.iter()
-            .map(|car| {
-                let mut obs_vec = Vec::with_capacity(Self::CAR_OBS);
-                obs_vec.extend(car.state.pos.to_array());
-                obs_vec.extend(car.state.vel.to_array());
-                obs_vec.extend(car.state.ang_vel.to_array());
+            .map(|(info, state)| {
+                if state.is_demoed {
+                    let obs_vec = vec![0.0; Self::CAR_OBS];
+                    return (info.idx, info.team, obs_vec);
+                }
 
-                (car.id, car.team, obs_vec)
+                let mut obs_vec = Vec::with_capacity(Self::CAR_OBS);
+                obs_vec.extend(state.pos.to_array());
+                obs_vec.extend(state.vel.to_array());
+                obs_vec.extend(state.ang_vel.to_array());
+                obs_vec.extend(state.rot_mat.x_axis.to_array());
+                obs_vec.extend(state.rot_mat.z_axis.to_array());
+                obs_vec.push(state.boost);
+
+                assert_eq!(obs_vec.len(), Self::CAR_OBS);
+                (info.idx, info.team, obs_vec)
             })
             .collect()
     }
@@ -104,15 +109,15 @@ impl Obs<SharedInfo> for MyObs {
         Self::OBS_SPACE
     }
 
-    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
+    fn reset(&mut self, _initial_state: &ArenaState, _shared_info: &mut SharedInfo) {}
 
-    fn build_obs(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> FullObs {
+    fn build_obs(&mut self, state: &ArenaState, _shared_info: &mut SharedInfo) -> FullObs {
         let mut obs = Vec::with_capacity(state.cars.len());
 
         let ball_obs = Self::get_ball_obs(&state.ball);
         let cars = Self::get_all_car_obs(&state.cars);
 
-        for current_car in &state.cars {
+        for (current_car, _) in &state.cars {
             let mut obs_vec: Vec<f32> = Vec::with_capacity(Self::OBS_SPACE);
             obs_vec.extend(&ball_obs);
 
@@ -120,7 +125,7 @@ impl Obs<SharedInfo> for MyObs {
             obs_vec.extend(
                 &cars
                     .iter()
-                    .find(|(car_id, _, _)| *car_id == current_car.id)
+                    .find(|(car_id, _, _)| *car_id == current_car.idx)
                     .unwrap()
                     .2,
             );
@@ -128,7 +133,7 @@ impl Obs<SharedInfo> for MyObs {
             // teammate's obs
             let mut num_teammates = 0;
             for (car_id, team, obs) in &cars {
-                if *team == current_car.team && *car_id != current_car.id {
+                if *team == current_car.team && *car_id != current_car.idx {
                     obs_vec.extend(obs);
                     num_teammates += 1;
                 }
@@ -164,7 +169,7 @@ impl Obs<SharedInfo> for MyObs {
 
 struct MyAction {
     actions_table: Vec<CarControls>,
-    action_buffer: [(u32, CarControls); MyObs::ZERO_PADDING * 2],
+    action_buffer: [(usize, CarControls); MyObs::ZERO_PADDING * 2],
 }
 
 impl Default for MyAction {
@@ -239,7 +244,7 @@ impl Default for MyAction {
 impl Action<SharedInfo> for MyAction {
     type Input = usize;
 
-    fn get_tick_skip() -> u32 {
+    fn get_tick_skip() -> u8 {
         8
     }
 
@@ -247,43 +252,55 @@ impl Action<SharedInfo> for MyAction {
         self.actions_table.len()
     }
 
-    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
+    fn reset(&mut self, _initial_state: &ArenaState, _shared_info: &mut SharedInfo) {}
 
     fn parse_actions(
         &mut self,
         actions: &[usize],
-        state: &GameStateA,
+        state: &ArenaState,
         _shared_info: &mut SharedInfo,
-    ) -> &[(u32, CarControls)] {
-        for ((buf, car), action) in self.action_buffer.iter_mut().zip(&state.cars).zip(actions) {
-            *buf = (car.id, self.actions_table[*action]);
+    ) -> &[(usize, CarControls)] {
+        for ((buf, (info, _)), action) in
+            self.action_buffer.iter_mut().zip(&state.cars).zip(actions)
+        {
+            *buf = (info.idx, self.actions_table[*action]);
         }
 
         &self.action_buffer[..state.cars.len()]
     }
 }
 
-struct CombinedReward {
-    rewards: Vec<Box<dyn Reward<SharedInfo>>>,
+struct WeightedReward {
+    func: Box<dyn Reward<SharedInfo>>,
+    weight: f32,
 }
 
-impl CombinedReward {
-    fn new(rewards: Vec<Box<dyn Reward<SharedInfo>>>) -> Self {
-        Self { rewards }
-    }
+struct CombinedWeightedRewards {
+    rewards: Box<[WeightedReward]>,
 }
 
-impl Reward<SharedInfo> for CombinedReward {
-    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
+macro_rules! new_rewards {
+    ($(($reward:expr, $weight:expr)),* $(,)?) => {
+        CombinedWeightedRewards {
+            rewards: vec![$(WeightedReward {
+                func: Box::new($reward) as Box<dyn Reward<SharedInfo>>,
+                weight: $weight
+            }),*].into_boxed_slice(),
+        }
+    };
+}
 
-    fn get_rewards(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> Vec<f32> {
+impl Reward<SharedInfo> for CombinedWeightedRewards {
+    fn reset(&mut self, _initial_state: &ArenaState, _shared_info: &mut SharedInfo) {}
+
+    fn get_rewards(&mut self, state: &ArenaState, shared_info: &mut SharedInfo) -> Vec<f32> {
         let mut rewards: Vec<f32> = vec![0.0; state.cars.len()];
 
-        for reward_fn in &mut self.rewards {
-            let mut fn_rewards = reward_fn.get_rewards(state, _shared_info);
+        for reward in &mut self.rewards {
+            let fn_rewards = reward.func.get_rewards(state, shared_info);
 
-            for (i, reward) in fn_rewards.drain(..).enumerate() {
-                rewards[i] += reward;
+            for (total, extra) in rewards.iter_mut().zip(fn_rewards) {
+                *total += extra * reward.weight;
             }
         }
 
@@ -291,46 +308,110 @@ impl Reward<SharedInfo> for CombinedReward {
     }
 }
 
-struct DistanceToBall;
+pub struct FaceBallReward;
 
-impl Reward<SharedInfo> for DistanceToBall {
-    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
+impl FaceBallReward {
+    fn get_reward(car: &CarState, ball: &BallState) -> f32 {
+        if car.is_demoed {
+            return 0.0;
+        }
 
-    fn get_rewards(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> Vec<f32> {
+        let car_to_ball = (ball.pos - car.pos).normalize();
+        car.rot_mat.x_axis.dot(car_to_ball)
+    }
+}
+
+impl Reward<SharedInfo> for FaceBallReward {
+    fn reset(&mut self, _initial_state: &ArenaState, _shared_info: &mut SharedInfo) {}
+
+    fn get_rewards(&mut self, state: &ArenaState, _shared_info: &mut SharedInfo) -> Vec<f32> {
         state
             .cars
             .iter()
-            .map(|car| -car.state.pos.distance(state.ball.pos) / 12000.)
+            .map(|(_, car)| Self::get_reward(car, &state.ball))
             .collect()
     }
 }
 
-struct VelocityReward;
+pub struct VelocityToBallReward;
 
-impl Reward<SharedInfo> for VelocityReward {
-    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
+impl VelocityToBallReward {
+    fn get_reward(car: &CarState, ball: &BallState) -> f32 {
+        if car.is_demoed {
+            return 0.0;
+        }
 
-    fn get_rewards(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> Vec<f32> {
+        let car_to_ball_norm = (ball.pos - car.pos).normalize_or_zero();
+        let car_to_ball_dot = car.vel.dot(car_to_ball_norm);
+
+        car_to_ball_dot / 2300.0
+    }
+}
+
+impl Reward<SharedInfo> for VelocityToBallReward {
+    fn reset(&mut self, _initial_state: &ArenaState, _shared_info: &mut SharedInfo) {}
+
+    fn get_rewards(&mut self, state: &ArenaState, _shared_info: &mut SharedInfo) -> Vec<f32> {
         state
             .cars
             .iter()
-            .map(|car| car.state.vel.length() / 2300.)
+            .map(|(_, car)| Self::get_reward(car, &state.ball))
             .collect()
+    }
+}
+
+struct OnGoal;
+
+fn ball_within_hoops_goal_xy_margin_eq(x: f32, y: f32) -> f32 {
+    const SCALE_Y: f32 = 0.9;
+    const OFFSET_Y: f32 = 2770.0;
+    const RADIUS_SQ: f32 = 716.0 * 716.0;
+
+    let dy = y.abs() * SCALE_Y - OFFSET_Y;
+    let dist_sq = x * x + dy * dy;
+    dist_sq - RADIUS_SQ
+}
+
+impl Terminal<SharedInfo> for OnGoal {
+    fn reset(&mut self, _initial_state: &ArenaState, _shared_info: &mut SharedInfo) {}
+
+    fn is_terminal(&mut self, state: &ArenaState, _shared_info: &mut SharedInfo) -> bool {
+        match state.game_mode() {
+            GameMode::Soccar | GameMode::Heatseeker | GameMode::Snowday => {
+                state.ball.pos.y.abs()
+                    > consts::goal::SOCCAR_GOAL_SCORE_BASE_THRESHOLD_Y
+                        + consts::ball::get_radius(state.game_mode())
+            }
+            GameMode::Hoops => {
+                if state.ball.pos.z < consts::goal::HOOPS_GOAL_SCORE_THRESHOLD_Z {
+                    ball_within_hoops_goal_xy_margin_eq(state.ball.pos.x, state.ball.pos.y) < 0.0
+                } else {
+                    false
+                }
+            }
+            GameMode::Dropshot => {
+                state.ball.pos.z < -consts::ball::get_radius(state.game_mode()) * 1.75
+            }
+            GameMode::TheVoid => false,
+        }
     }
 }
 
 #[derive(Default)]
-struct MyTerminal {
+struct EpisodeDurationMax {
     episode_duration: f32,
 }
 
-impl Terminal<SharedInfo> for MyTerminal {
-    fn reset(&mut self, _initial_state: &GameStateA, shared_info: &mut SharedInfo) {
+impl Truncate<SharedInfo> for EpisodeDurationMax {
+    fn reset(&mut self, _initial_state: &ArenaState, shared_info: &mut SharedInfo) {
         self.episode_duration = shared_info.rng.random_range(2.0..5.0);
     }
 
-    fn is_terminal(&mut self, state: &GameStateA, _shared_info: &mut SharedInfo) -> bool {
-        let elapsed = state.tick_count as f32 / state.tick_rate / 60.0;
+    fn should_truncate(&mut self, state: &ArenaState, shared_info: &mut SharedInfo) -> bool {
+        const SECS_TO_MIN: f32 = 1.0 / 60.0;
+
+        let elapsed =
+            (state.tick_count - shared_info.start_tick) as f32 * consts::TICK_TIME * SECS_TO_MIN;
 
         // reset after some minutes
         if elapsed < self.episode_duration {
@@ -341,26 +422,15 @@ impl Terminal<SharedInfo> for MyTerminal {
     }
 }
 
-struct MyTruncate;
-
-impl Truncate<SharedInfo> for MyTruncate {
-    fn reset(&mut self, _initial_state: &GameStateA, _shared_info: &mut SharedInfo) {}
-
-    fn should_truncate(&mut self, _state: &GameStateA, _shared_info: &mut SharedInfo) -> bool {
-        false
-    }
-}
-
 fn create_env(
     game_id: Option<usize>,
 ) -> Env<
     MyStateSetter,
-    MySharedInfoProvider,
     MyObs,
     MyAction,
-    CombinedReward,
-    MyTerminal,
-    MyTruncate,
+    CombinedWeightedRewards,
+    OnGoal,
+    EpisodeDurationMax,
     SharedInfo,
 > {
     // `game_id` is None for the game used to calculate the policy obs/action space,
@@ -368,51 +438,45 @@ fn create_env(
     // Otherwise, every env gets a unique id starting from 0 and incrementing by 1.
     let game_id = game_id.unwrap_or(0);
 
-    let mut arena = Arena::default_standard();
-    arena
-        .pin_mut()
-        .set_goal_scored_callback(|arena, _, _| arena.reset_to_random_kickoff(None), 0);
-
-    let octane = CarConfig::octane();
+    let mut arena = Arena::new(GameMode::Soccar);
 
     // pseudo-random game mode: 1v1, 2v2, 3v3
     // using game id ensures an equal, predictable distribution of game modes
     // it's not the best idea to change the number of players between episodes
-    for _ in 0..game_id % 3 {
-        let _ = arena.pin_mut().add_car(Team::Blue, octane);
-        let _ = arena.pin_mut().add_car(Team::Orange, octane);
+    for _ in 0..=game_id % 3 {
+        arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
+        arena.add_car(Team::Orange, CarBodyConfig::OCTANE);
     }
 
     Env::new(
         arena,
         MyStateSetter,
-        MySharedInfoProvider,
         MyObs,
         MyAction::default(),
-        CombinedReward::new(vec![Box::new(VelocityReward), Box::new(DistanceToBall)]),
-        MyTerminal::default(),
-        MyTruncate,
+        new_rewards![(VelocityToBallReward, 1.0), (FaceBallReward, 0.2)],
+        OnGoal,
+        EpisodeDurationMax::default(),
         SharedInfo::default(),
     )
 }
 
-fn step_callback(report: &mut Report, shared_info: &mut SharedInfo, _game_state: &GameStateA) {
+fn step_callback(report: &mut Report, shared_info: &mut SharedInfo, _game_state: &ArenaState) {
     *report += &shared_info.metrics;
     shared_info.metrics.clear();
 }
 
 fn main() {
-    init(None, true);
+    init_from_default(cfg!(not(debug_assertions))).unwrap();
 
-    let mini_batch_size = 20000;
-    let batch_size = mini_batch_size * 3;
+    let mini_batch_size = 50_000;
+    let batch_size = mini_batch_size * 4;
     let lr = 3e-4;
 
     // Router will fallback to NdArray if Wgpu is not available
     // Realistically more useful for using CUDA and falling back to NdArray
-    let config = LearnerConfig::<Autodiff<Router<(Wgpu, NdArray)>>> {
-        render: true,
-        num_threads: available_parallelism().unwrap().get(),
+    let config = LearnerConfig::<Autodiff<LibTorch>> {
+        render: false,
+        num_threads: 12,
         num_games_per_thread: 64,
         exp_buffer_size: batch_size,
         timesteps_per_save: 10_000_000,
@@ -420,12 +484,13 @@ fn main() {
         ppo: PpoLearnerConfig {
             batch_size,
             mini_batch_size,
-            epochs: 2,
+            epochs: 1,
             learning_rate: lr,
             ..Default::default()
         },
         policy_layer_sizes: vec![256; 4],
-        critic_layer_sizes: vec![256; 4],
+        critic_layer_sizes: vec![1024; 4],
+        device: LibTorchDevice::Cuda(0),
         ..Default::default()
     };
 

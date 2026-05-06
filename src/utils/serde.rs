@@ -1,14 +1,16 @@
-use super::running_stat::Stats;
-use crate::agent::model::Actic;
-use burn::{
-    prelude::*,
-    record::{FullPrecisionSettings, NamedMpkGzFileRecorder},
-};
 use std::{
     fs,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use burn::{
+    prelude::*,
+    record::{FullPrecisionSettings, NamedMpkGzFileRecorder},
+};
+
+use super::running_stat::Stats;
+use crate::agent::model::Actic;
 
 pub fn save_model<B: Backend, P: AsRef<Path>>(
     model: Actic<B>,

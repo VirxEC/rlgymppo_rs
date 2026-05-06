@@ -5,25 +5,6 @@ mod environment;
 
 pub mod utils;
 
-pub use agent::config::PpoLearnerConfig;
-pub use burn::backend;
-pub use rlgym::{self, glam, rocketsim_rs};
-
-use agent::{Ppo, model::Actic};
-use burn::{
-    module::{AutodiffModule, Module},
-    tensor::backend::AutodiffBackend,
-};
-use environment::{
-    render::{Renderer, RendererControls},
-    thread_sim::ThreadSim,
-};
-use parking_lot::{Condvar, Mutex};
-use rand::{SeedableRng, rngs::SmallRng};
-use rlgym::{
-    Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
-    rocketsim_rs::glam_ext::GameStateA,
-};
 use std::{
     io::{Read, stdin},
     path::PathBuf,
@@ -33,6 +14,25 @@ use std::{
     },
     thread::{self, JoinHandle},
     time::Instant,
+};
+
+pub use agent::config::PpoLearnerConfig;
+use agent::{Ppo, model::Actic};
+pub use burn::backend;
+use burn::{
+    module::{AutodiffModule, Module},
+    tensor::backend::AutodiffBackend,
+};
+use environment::{
+    render::{Renderer, RendererControls},
+    thread_sim::ThreadSim,
+};
+use parking_lot::{Condvar, Mutex};
+use rand::{SeedableRng, rng, rngs::SmallRng};
+pub use rlgym::{self, rocketsim};
+use rlgym::{
+    Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
+    rocketsim::ArenaState,
 };
 use utils::{
     Report,
@@ -109,12 +109,9 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// exiting after that.
     /// `None` means run indefinitely.
     pub num_additional_iterations: Option<u64>,
-    /// If true, one extra instance will be launched
-    /// and RLViser will be used to visualize training.
+    /// If true, one extra instance will be launched to visualize training.
+    /// RocketSim's built-in renderer is used for visualization.
     pub render: bool,
-    /// Whether to try to launch the rlviser executable.
-    /// If false, RLViser needs to be started manually.
-    pub try_launch_rlviser: bool,
     /// The name of the project to use for logging to wandb.
     /// If None, metrics will not be logged to wandb.
     pub wandb_project_name: Option<String>,
@@ -136,26 +133,22 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             exp_buffer_size: 60_000,
             num_additional_iterations: None,
             render: false,
-            try_launch_rlviser: true,
             wandb_project_name: None,
         }
     }
 }
 
 impl<B: AutodiffBackend> LearnerConfig<B> {
-    pub fn init<F, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>(
+    pub fn init<F, C, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         self,
         create_env: F,
         step_callback: C,
     ) -> Learner<B>
     where
-        F: Fn(Option<usize>) -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
-            + Clone
-            + Send
-            + 'static,
-        C: Fn(&mut Report, &mut SI, &GameStateA) + Clone + Send + 'static,
+        F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        C: Fn(&mut Report, &mut SI, &ArenaState) + Clone + Send + 'static,
         SS: StateSetter<SI>,
-        SIP: SharedInfoProvider<SI>,
+        SI: SharedInfoProvider,
         OBS: Obs<SI>,
         ACT: Action<SI, Input = usize>,
         REW: Reward<SI>,
@@ -210,7 +203,6 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
                 Renderer::new(
                     (create_env)(None),
                     step_callback,
-                    self.try_launch_rlviser,
                     renderer_controls,
                     self.render_device,
                 )
@@ -230,7 +222,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
 
         Learner {
             ppo: self.ppo.init(self.device.clone()),
-            rng: SmallRng::from_os_rng(),
+            rng: SmallRng::from_rng(&mut rng()),
             stats: Stats::default(),
             device: self.device,
             model,

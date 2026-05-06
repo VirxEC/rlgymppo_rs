@@ -1,9 +1,11 @@
-use crate::utils::AvgTracker;
-use ahash::AHashMap;
 use std::{
     fmt,
     ops::{AddAssign, Index, IndexMut},
 };
+
+use ahash::AHashMap;
+
+use crate::utils::AvgTracker;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Reportable {

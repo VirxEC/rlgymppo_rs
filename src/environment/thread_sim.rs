@@ -1,11 +1,3 @@
-use super::batch_sim::BatchSim;
-use crate::{agent::model::Net, base::Memory, utils::Report};
-use burn::prelude::Backend;
-use parking_lot::RwLock;
-use rlgym::{
-    Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
-    rocketsim_rs::glam_ext::GameStateA,
-};
 use std::{
     sync::{
         Arc, Barrier,
@@ -13,6 +5,16 @@ use std::{
     },
     thread,
 };
+
+use burn::prelude::Backend;
+use parking_lot::RwLock;
+use rlgym::{
+    Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
+    rocketsim::ArenaState,
+};
+
+use super::batch_sim::BatchSim;
+use crate::{agent::model::Net, base::Memory, utils::Report};
 
 #[derive(Default)]
 pub struct DataRequest<B: Backend> {
@@ -34,7 +36,7 @@ pub struct ThreadSim<B: Backend> {
 }
 
 impl<B: Backend> ThreadSim<B> {
-    pub fn new<F, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>(
+    pub fn new<F, C, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         create_env_fn: F,
         step_callback: C,
         batch_size: usize,
@@ -45,13 +47,10 @@ impl<B: Backend> ThreadSim<B> {
     ) -> Self
     where
         B: Backend,
-        F: Fn(Option<usize>) -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
-            + Clone
-            + Send
-            + 'static,
-        C: Fn(&mut Report, &mut SI, &GameStateA) + Clone + Send + 'static,
+        F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        C: Fn(&mut Report, &mut SI, &ArenaState) + Clone + Send + 'static,
         SS: StateSetter<SI>,
-        SIP: SharedInfoProvider<SI>,
+        SI: SharedInfoProvider,
         OBS: Obs<SI>,
         ACT: Action<SI, Input = usize>,
         REW: Reward<SI>,

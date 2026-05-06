@@ -1,35 +1,35 @@
-use super::sim::GameInstance;
-use crate::{agent::model::Net, base::Memory, utils::Report};
 use burn::prelude::*;
 use rlgym::{
     Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
-    rocketsim_rs::glam_ext::GameStateA,
+    rocketsim::ArenaState,
 };
 
-pub struct BatchSim<B: Backend, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
+use super::sim::GameInstance;
+use crate::{agent::model::Net, base::Memory, utils::Report};
+
+pub struct BatchSim<B: Backend, C, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    C: Fn(&mut Report, &mut SI, &GameStateA),
+    C: Fn(&mut Report, &mut SI, &ArenaState),
     SS: StateSetter<SI>,
-    SIP: SharedInfoProvider<SI>,
+    SI: SharedInfoProvider,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
     REW: Reward<SI>,
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    games: Vec<GameInstance<C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>>,
+    games: Vec<GameInstance<C, SS, OBS, ACT, REW, TERM, TRUNC, SI>>,
     next_obs: Vec<Vec<f32>>,
     metrics: Report,
     device: B::Device,
 }
 
-impl<B, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
-    BatchSim<B, C, SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<B, C, SS, OBS, ACT, REW, TERM, TRUNC, SI> BatchSim<B, C, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     B: Backend,
-    C: Fn(&mut Report, &mut SI, &GameStateA) + Clone,
+    C: Fn(&mut Report, &mut SI, &ArenaState) + Clone,
     SS: StateSetter<SI>,
-    SIP: SharedInfoProvider<SI>,
+    SI: SharedInfoProvider,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
     REW: Reward<SI>,
@@ -44,7 +44,7 @@ where
         device: B::Device,
     ) -> Self
     where
-        F: Fn(Option<usize>) -> Env<SS, SIP, OBS, ACT, REW, TERM, TRUNC, SI>,
+        F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
     {
         let mut games = Vec::with_capacity(num_games);
 

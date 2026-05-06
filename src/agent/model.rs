@@ -1,9 +1,10 @@
-use crate::utils::{argmax_actions, sample_actions, to_state_tensor_2d};
 use burn::{
     nn::{Initializer, Linear, LinearConfig},
     prelude::*,
     tensor::activation::{relu, softmax},
 };
+
+use crate::utils::{argmax_actions, sample_actions, to_state_tensor_2d};
 
 pub struct PPOOutput<B: Backend> {
     pub policies: Tensor<B, 2>,

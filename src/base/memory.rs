@@ -1,6 +1,7 @@
+use std::iter;
+
 use burn::prelude::*;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
-use std::iter;
 
 pub fn get_batch_1d<T: Copy>(data: &AllocRingBuffer<T>, indices: &[usize]) -> Vec<T> {
     indices.iter().map(|i| data[*i]).collect::<Vec<_>>()

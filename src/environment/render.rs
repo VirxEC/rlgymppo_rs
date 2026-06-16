@@ -12,10 +12,10 @@ use rlgym::{
 };
 
 use super::sim::GameInstance;
-use crate::{agent::model::Net, utils::Report};
+use crate::{agent::model::Actic, utils::Report};
 
 pub struct RendererControls<B: Backend> {
-    pub model: Option<Net<B>>,
+    pub model: Option<Actic<B>>,
     pub deterministic: bool,
     pub render: bool,
     pub quit: bool,

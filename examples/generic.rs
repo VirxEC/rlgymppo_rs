@@ -368,7 +368,7 @@ fn main() {
     init_from_default(cfg!(not(debug_assertions))).unwrap();
 
     let mini_batch_size = 20_000;
-    let batch_size = mini_batch_size * 2;
+    let batch_size = mini_batch_size * 3;
     let lr = 2e-4;
 
     // Router will fallback to NdArray if Wgpu is not available
@@ -377,7 +377,6 @@ fn main() {
         render: false,
         num_threads: 8,
         num_games_per_thread: 256,
-        exp_buffer_size: batch_size,
         timesteps_per_save: 10_000_000,
         checkpoints_limit: Some(10),
         ppo: PpoLearnerConfig {
@@ -385,10 +384,12 @@ fn main() {
             mini_batch_size,
             epochs: 1,
             learning_rate: lr,
+            entropy_scale: 0.035,
             ..Default::default()
         },
-        policy_layer_sizes: vec![256; 4],
-        critic_layer_sizes: vec![512; 4],
+        shared_head_layer_sizes: vec![512],
+        policy_layer_sizes: vec![256; 2],
+        critic_layer_sizes: vec![512; 3],
         device: LibTorchDevice::Cuda(0),
         ..Default::default()
     };

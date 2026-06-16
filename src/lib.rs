@@ -94,6 +94,9 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub critic_layer_sizes: Vec<usize>,
     /// Apply LayerNorm after every hidden linear layer.
     pub use_layer_norm: bool,
+    /// Layer sizes for the shared feature extractor (empty = no shared head).
+    /// When set, the actor and critic take their input from this head's output.
+    pub shared_head_layer_sizes: Vec<usize>,
     /// The maximum number of checkpoints to keep.
     /// If None, all checkpoints will be kept.
     pub checkpoints_limit: Option<usize>,
@@ -105,8 +108,7 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// Increasing this will increase GPU utilization
     /// and the utilization of 1 cpu thread.
     pub num_games_per_thread: usize,
-    /// The size of the experience replay buffer.
-    pub exp_buffer_size: usize,
+
     /// The number of additional iterations (episodes) to run training for,
     /// exiting after that.
     /// `None` means run indefinitely.
@@ -129,11 +131,12 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             policy_layer_sizes: vec![256; 2],
             critic_layer_sizes: vec![256; 2],
             use_layer_norm: true,
+            shared_head_layer_sizes: vec![256],
             checkpoints_limit: None,
             timesteps_per_save: 1_000_000,
             num_threads: 8,
-            num_games_per_thread: 32,
-            exp_buffer_size: 60_000,
+            num_games_per_thread: 256,
+
             num_additional_iterations: None,
             render: false,
             wandb_project_name: None,
@@ -172,11 +175,6 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             self.timesteps_per_save, 0,
             "timesteps_per_save must not be 0"
         );
-        assert!(
-            self.exp_buffer_size >= self.ppo.batch_size,
-            "exp_buffer_size must be greater than or equal to ppo.batch_size"
-        );
-
         let env = (create_env)(None);
         let obs_space = env.get_obs_space();
         let action_space = env.get_action_space();
@@ -186,10 +184,14 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             action_space,
             self.policy_layer_sizes,
             self.critic_layer_sizes,
+            &self.shared_head_layer_sizes,
             &self.device,
             self.use_layer_norm,
         );
 
+        if let Some(ref head) = model.shared_head {
+            println!("# parameters in shared head: {}", head.num_params());
+        }
         println!("# parameters in actor: {}", model.actor.num_params());
         println!("# parameters in critic: {}", model.critic.num_params());
 
@@ -218,7 +220,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             create_env,
             step_callback,
             self.ppo.batch_size,
-            self.exp_buffer_size,
+            self.ppo.overbatching,
             self.num_threads,
             self.num_games_per_thread,
             self.device.clone(),
@@ -366,20 +368,20 @@ impl<B: AutodiffBackend> Learner<B> {
         {
             let collect_start = Instant::now();
 
-            let nodiff_actor = self.model.actor.valid();
+            let nodiff_model = self.model.valid();
 
             // update the model the renderer is using
             {
                 let (controls, start_rendering) = &*self.renderer_controls;
                 let mut guard = controls.lock();
-                guard.model = Some(nodiff_actor.clone());
+                guard.model = Some(nodiff_model.clone());
                 drop(guard);
 
                 start_rendering.notify_all();
             }
 
             // collect steps
-            let (memory, mut metrics) = self.collector.run(nodiff_actor);
+            let (memory, mut metrics) = self.collector.run(nodiff_model);
             let collect_elapsed = collect_start.elapsed().as_secs_f64();
 
             // train the model
@@ -473,13 +475,13 @@ impl<B: AutodiffBackend> Learner<B> {
 
         Self::print_controls_prompt();
 
-        let nodiff_actor = self.model.actor.valid();
+        let nodiff_model = self.model.valid();
 
         // update the model the renderer is using
         {
             let (controls, start_rendering) = &*self.renderer_controls;
             let mut guard = controls.lock();
-            guard.model = Some(nodiff_actor.clone());
+            guard.model = Some(nodiff_model.clone());
             drop(guard);
 
             start_rendering.notify_all();

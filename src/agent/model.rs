@@ -23,23 +23,32 @@ pub struct Net<B: Backend> {
     /// LayerNorm applied after each hidden linear layer (before activation).
     /// Empty when layer normalization is disabled.
     layer_norms: Vec<LayerNorm<B>>,
+    /// Whether the last linear layer is a dedicated output layer (no norm, no activation).
+    /// `false` for the shared head, whose last layer IS a hidden layer.
+    #[module(skip)]
+    has_output_layer: bool,
 }
 
 unsafe impl<B: Backend> Sync for Net<B> {}
 
 impl<B: Backend> Net<B> {
+    /// `add_output_layer`: when `true` (default), a final Linear(last_hidden, output_size)
+    /// is appended.  When `false` the network ends after the last hidden layer; `output_size`
+    /// is ignored (used for the shared head, which produces features not logits/values).
     fn new(
         input_size: usize,
         output_size: usize,
         layer_sizes: Vec<usize>,
         device: &B::Device,
         add_layer_norm: bool,
+        add_output_layer: bool,
     ) -> Self {
         assert_ne!(layer_sizes.len(), 0);
 
         let initializer = Initializer::XavierUniform { gain: 1.0 };
 
-        let mut linear_layers = Vec::with_capacity(layer_sizes.len() + 2);
+        let num_linears = layer_sizes.len() + if add_output_layer { 1 } else { 0 };
+        let mut linear_layers = Vec::with_capacity(num_linears);
         let mut layer_norms = if add_layer_norm {
             Vec::with_capacity(layer_sizes.len())
         } else {
@@ -60,11 +69,13 @@ impl<B: Backend> Net<B> {
             );
         }
 
-        linear_layers.push(
-            LinearConfig::new(layer_sizes[layer_sizes.len() - 1], output_size)
-                .with_initializer(initializer.clone())
-                .init(device),
-        );
+        if add_output_layer {
+            linear_layers.push(
+                LinearConfig::new(layer_sizes[layer_sizes.len() - 1], output_size)
+                    .with_initializer(initializer.clone())
+                    .init(device),
+            );
+        }
 
         if add_layer_norm {
             for &size in &layer_sizes {
@@ -75,12 +86,19 @@ impl<B: Backend> Net<B> {
         Self {
             linear_layers,
             layer_norms,
+            has_output_layer: add_output_layer,
         }
     }
 
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         let mut output = input;
-        let num_hidden = self.linear_layers.len() - 1;
+
+        let num_hidden = if self.has_output_layer {
+            self.linear_layers.len() - 1
+        } else {
+            self.linear_layers.len()
+        };
+
         for (i, layer) in self.linear_layers[..num_hidden].iter().enumerate() {
             output = layer.forward(output);
             if let Some(norm) = self.layer_norms.get(i) {
@@ -89,7 +107,11 @@ impl<B: Backend> Net<B> {
             output = relu(output);
         }
 
-        self.linear_layers[num_hidden].forward(output)
+        if self.has_output_layer {
+            self.linear_layers[num_hidden].forward(output)
+        } else {
+            output
+        }
     }
 
     /// `mask` is an optional [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
@@ -130,37 +152,92 @@ impl<B: Backend> Net<B> {
 
 #[derive(Module, Debug)]
 pub struct Actic<B: Backend> {
+    /// Optional feature extractor shared between the actor and critic.
+    /// When present, raw observations flow through `shared_head` before
+    /// being passed to both `actor` and `critic`.
+    pub shared_head: Option<Net<B>>,
     pub actor: Net<B>,
     pub critic: Net<B>,
 }
 
 impl<B: Backend> Actic<B> {
+    /// When `shared_head_layer_sizes` is non-empty, a shared feature extractor is
+    /// created.  The actor and critic then take the shared head's last hidden size
+    /// as their input dimension instead of `input_size`.
     pub fn new(
         input_size: usize,
         output_size: usize,
         actor_layers: Vec<usize>,
         critic_layers: Vec<usize>,
+        shared_head_layer_sizes: &[usize],
         device: &B::Device,
         add_layer_norm: bool,
     ) -> Self {
-        Self {
-            actor: Net::new(
+        let (head, actor_input) = if shared_head_layer_sizes.is_empty() {
+            (None, input_size)
+        } else {
+            let shared = Net::new(
                 input_size,
+                0,
+                shared_head_layer_sizes.to_vec(),
+                device,
+                add_layer_norm,
+                false, // no output layer – just features
+            );
+            let feat_size = *shared_head_layer_sizes.last().unwrap();
+            (Some(shared), feat_size)
+        };
+
+        Self {
+            shared_head: head,
+            actor: Net::new(
+                actor_input,
                 output_size,
                 actor_layers,
                 device,
                 add_layer_norm,
+                true,
             ),
-            critic: Net::new(input_size, 1, critic_layers, device, add_layer_norm),
+            critic: Net::new(actor_input, 1, critic_layers, device, add_layer_norm, true),
         }
     }
-}
 
-impl<B: Backend> Actic<B> {
+    pub fn apply_shared_head(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        match self.shared_head {
+            Some(ref head) => head.forward(input),
+            None => input,
+        }
+    }
+
     pub fn forward(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> PPOOutput<B> {
-        let policies = self.actor.infer(input.clone(), mask);
-        let values = self.critic.forward(input);
+        let features = self.apply_shared_head(input);
+        let policies = self.actor.infer(features.clone(), mask);
+        let values = self.critic.forward(features);
 
         PPOOutput::<B>::new(policies, values)
+    }
+
+    pub fn react(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        device: &B::Device,
+    ) -> (Vec<usize>, Vec<f32>) {
+        let input = to_state_tensor_2d(state, device);
+        let features = self.apply_shared_head(input);
+        let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
+        sample_actions(self.actor.infer(features, mask_tensor), device)
+    }
+
+    pub fn react_deterministic(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        device: &B::Device,
+    ) -> Vec<usize> {
+        let input = to_state_tensor_2d(state, device);
+        let features = self.apply_shared_head(input);
+        let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
+        argmax_actions(self.actor.infer(features, mask_tensor))
     }
 }

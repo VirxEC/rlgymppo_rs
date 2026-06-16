@@ -25,21 +25,34 @@ pub fn save_model<B: Backend, P: AsRef<Path>>(
         .unwrap()
         .as_secs();
 
-    let base_folder = base_folder.as_ref().join(timestamp.to_string());
+    let save_folder = base_folder.as_ref().join(timestamp.to_string());
+    fs::create_dir_all(&save_folder).unwrap();
+
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+
+    // Save each component to its own file.
     model
-        .save_file(base_folder.join("model"), &recorder)
+        .actor
+        .save_file(save_folder.join("actor"), &recorder)
         .unwrap();
+    model
+        .critic
+        .save_file(save_folder.join("critic"), &recorder)
+        .unwrap();
+    if let Some(ref head) = model.shared_head {
+        head.clone()
+            .save_file(save_folder.join("shared_head"), &recorder)
+            .unwrap();
+    }
 
     let toml_str = toml::to_string(running_stats).unwrap();
-    fs::write(base_folder.join("stats.toml"), toml_str).unwrap();
+    fs::write(save_folder.join("stats.toml"), toml_str).unwrap();
 
-    println!("Saved model to: {base_folder:?}");
+    println!("Saved model to: {save_folder:?}");
 
     if let Some(limit) = limit {
-        // cap the number of saved checkpoints at `limit`
-        let Ok(folders) = base_folder.parent().unwrap().read_dir() else {
-            println!("Failed to read directory: {base_folder:?}");
+        let Ok(folders) = save_folder.parent().unwrap().read_dir() else {
+            println!("Failed to read directory: {save_folder:?}");
             return;
         };
 
@@ -93,14 +106,36 @@ pub fn load_model<B: Backend, P: AsRef<Path>>(
     assert!(path.exists(), "Model path does not exist: {path:?}");
 
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-    let model = model
-        .load_file(path.join("model"), &recorder, device)
+
+    // Load each component from its own file.
+    let actor = model
+        .actor
+        .load_file(path.join("actor"), &recorder, device)
         .unwrap();
+    let critic = model
+        .critic
+        .load_file(path.join("critic"), &recorder, device)
+        .unwrap();
+    let shared_head = model.shared_head.map(|head| {
+        let head_path = path.join("shared_head");
+        if head_path.exists() {
+            head.load_file(head_path, &recorder, device).unwrap()
+        } else {
+            head
+        }
+    });
 
     let toml_str = fs::read_to_string(path.join("stats.toml")).unwrap();
     let stats: Stats = toml::from_str(&toml_str).unwrap();
 
     println!("Loaded model from: {path:?}");
 
-    (model, stats)
+    (
+        Actic {
+            actor,
+            critic,
+            shared_head,
+        },
+        stats,
+    )
 }

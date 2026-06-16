@@ -6,7 +6,7 @@ use rlgym::{
 
 use super::sim::GameInstance;
 use crate::{
-    agent::model::Net,
+    agent::model::Actic,
     base::{Memory, TERMINAL_NONE, TERMINAL_NORMAL, TERMINAL_TRUNCATED},
     utils::Report,
 };
@@ -77,7 +77,7 @@ where
         self.games.iter().map(|game| game.num_players()).sum()
     }
 
-    pub fn run(&mut self, model: &Net<B>, num_steps: usize) -> (Memory, Report) {
+    pub fn run(&mut self, model: &Actic<B>, num_steps: usize) -> (Memory, Report) {
         let mut memory = Memory::with_capacity(num_steps);
 
         // Track which games were reset on the *last* iteration so we can detect

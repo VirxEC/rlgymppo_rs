@@ -14,11 +14,11 @@ use rlgym::{
 };
 
 use super::batch_sim::BatchSim;
-use crate::{agent::model::Net, base::Memory, utils::Report};
+use crate::{agent::model::Actic, base::Memory, utils::Report};
 
 #[derive(Default)]
 pub struct DataRequest<B: Backend> {
-    pub model: Option<Net<B>>,
+    pub model: Option<Actic<B>>,
     pub total_num_players: usize,
 }
 
@@ -40,7 +40,7 @@ impl<B: Backend> ThreadSim<B> {
         create_env_fn: F,
         step_callback: C,
         batch_size: usize,
-        exp_buffer_size: usize,
+        overbatching: bool,
         num_threads: usize,
         num_games_per_thread: usize,
         device: B::Device,
@@ -109,16 +109,26 @@ impl<B: Backend> ThreadSim<B> {
 
         thread_controls.0.write().total_num_players = total_num_players;
 
+        // Compute capacity for the ring buffer.
+        // When overbatching, allocate enough to hold the maximum possible steps
+        // so that the extra due to ceil-division is not discarded.
+        let capacity = if overbatching {
+            let steps_per_player = batch_size.div_ceil(total_num_players);
+            steps_per_player * total_num_players
+        } else {
+            batch_size
+        };
+
         Self {
             recv,
             threads,
             thread_controls,
-            memory: Memory::with_capacity(exp_buffer_size),
+            memory: Memory::with_capacity(capacity),
             metrics: Report::default(),
         }
     }
 
-    pub fn run(&mut self, model: Net<B>) -> (&Memory, Report) {
+    pub fn run(&mut self, model: Actic<B>) -> (&Memory, Report) {
         self.metrics.clear();
 
         {

@@ -7,10 +7,8 @@ pub(crate) mod serde;
 
 pub use avg_tracker::AvgTracker;
 use burn::{
-    module::AutodiffModule,
-    optim::{GradientsParams, LearningRate, Optimizer},
     prelude::*,
-    tensor::{Distribution, Transaction, backend::AutodiffBackend, cast::ToElement},
+    tensor::{Distribution, Transaction, cast::ToElement},
 };
 pub use report::{Report, Reportable};
 
@@ -79,15 +77,4 @@ pub(crate) fn elementwise_min<B: Backend, const D: usize>(
 ) -> Tensor<B, D> {
     let rhs_lower = rhs.clone().lower(lhs.clone());
     lhs.clone().mask_where(rhs_lower, rhs.clone())
-}
-
-pub(crate) fn update_parameters<B: AutodiffBackend, M: AutodiffModule<B>>(
-    loss: Tensor<B, 1>,
-    module: M,
-    optimizer: &mut impl Optimizer<M, B>,
-    learning_rate: LearningRate,
-) -> M {
-    let gradients = loss.backward();
-    let gradient_params = GradientsParams::from_grads(gradients, &module);
-    optimizer.step(learning_rate, module, gradient_params)
 }

@@ -3,7 +3,7 @@ pub mod model;
 
 use burn::{
     nn::loss::{MseLoss, Reduction},
-    optim::{Adam, AdamConfig, adaptor::OptimizerAdaptor},
+    optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
     prelude::*,
     tensor::{backend::AutodiffBackend, cast::ToElement},
 };
@@ -20,27 +20,29 @@ use crate::{
         get_action_masks_batch, get_batch_1d, get_generic_batch, get_log_probs_batch,
         get_states_batch,
     },
-    utils::{Report, elementwise_min, running_stat::Stats, update_parameters},
+    utils::{Report, elementwise_min, running_stat::Stats},
 };
 
 pub struct Ppo<B: AutodiffBackend> {
     config: PpoLearnerConfig,
     policy_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
     value_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
+    shared_head_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
     device: B::Device,
 }
 
 impl<B: AutodiffBackend> Ppo<B> {
     pub fn new(config: PpoLearnerConfig, device: B::Device) -> Self {
+        let make_optim = || {
+            AdamConfig::new()
+                .with_epsilon(1e-8)
+                .with_grad_clipping(config.clip_grad.clone())
+                .init()
+        };
         Self {
-            policy_optimizer: AdamConfig::new()
-                .with_epsilon(1e-8)
-                .with_grad_clipping(config.clip_grad.clone())
-                .init(),
-            value_optimizer: AdamConfig::new()
-                .with_epsilon(1e-8)
-                .with_grad_clipping(config.clip_grad.clone())
-                .init(),
+            policy_optimizer: make_optim(),
+            value_optimizer: make_optim(),
+            shared_head_optimizer: make_optim(),
             config,
             device,
         }
@@ -70,7 +72,8 @@ impl<B: AutodiffBackend> Ppo<B> {
 
         let states_batch: Tensor<B, 2> =
             get_states_batch(memory.states(), &memory_indices, &self.device);
-        let old_values_batch = net.critic.forward(states_batch).detach();
+        let features = net.apply_shared_head(states_batch);
+        let old_values_batch = net.critic.forward(features).detach();
         let old_values = old_values_batch.into_data().into_vec::<f32>().unwrap();
 
         let return_std = if self.config.standardize_returns {
@@ -87,8 +90,9 @@ impl<B: AutodiffBackend> Ppo<B> {
         } else {
             let indices: Vec<usize> = (0..memory.trunc_next_states().len()).collect();
             let batch = get_states_batch(memory.trunc_next_states(), &indices, &self.device);
+            let features = net.apply_shared_head(batch);
             net.critic
-                .forward(batch)
+                .forward(features)
                 .detach()
                 .into_data()
                 .into_vec::<f32>()
@@ -197,26 +201,30 @@ impl<B: AutodiffBackend> Ppo<B> {
                 let batch_size_f = self.config.batch_size as f32;
                 let mb_size_f = (end_idx - start_idx) as f32;
                 let ratio = mb_size_f / batch_size_f;
+                let lr = self.config.learning_rate.into();
 
                 let ppo_loss = actor_loss - entropy * self.config.entropy_scale;
-                net.actor = update_parameters(
-                    ppo_loss * ratio,
-                    net.actor,
-                    &mut self.policy_optimizer,
-                    self.config.learning_rate.into(),
-                );
-
                 let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
                 let loss = critic_loss.clone().detach().into_scalar().to_f32();
                 assert!(!loss.is_nan(), "Value loss is NaN: {loss}");
                 mean_val_loss += loss;
 
-                net.critic = update_parameters(
-                    critic_loss * ratio,
-                    net.critic,
-                    &mut self.value_optimizer,
-                    self.config.learning_rate.into(),
-                );
+                // Combined backward pass (like C++): accumulate gradients for the
+                // actor, critic, AND shared head — all through the shared features.
+                let combined = (ppo_loss + critic_loss) * ratio;
+                let mut grads = combined.backward();
+
+                let actor_grads = GradientsParams::from_module(&mut grads, &net.actor);
+                net.actor = self.policy_optimizer.step(lr, net.actor, actor_grads);
+
+                let critic_grads = GradientsParams::from_module(&mut grads, &net.critic);
+                net.critic = self.value_optimizer.step(lr, net.critic, critic_grads);
+
+                if net.shared_head.is_some() {
+                    let head = net.shared_head.take().unwrap();
+                    let head_grads = GradientsParams::from_module(&mut grads, &head);
+                    net.shared_head = Some(self.shared_head_optimizer.step(lr, head, head_grads));
+                }
             }
         }
 

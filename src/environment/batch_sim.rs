@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use burn::prelude::*;
 use rlgym::{
     Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
@@ -84,8 +86,15 @@ where
         // batch-boundary truncation when the while loop exits.
         let mut games_was_reset = vec![false; self.games.len()];
 
+        let mut total_infer_time = 0.0_f64;
+        let mut total_env_step_time = 0.0_f64;
+
         while memory.len() < num_steps {
+            let infer_start = Instant::now();
             let (actions, log_probs) = model.react(&self.next_obs, &self.next_masks, &self.device);
+            total_infer_time += infer_start.elapsed().as_secs_f64();
+
+            let env_start = Instant::now();
 
             let mut start_idx = self.next_obs.len();
             let masks = self.next_masks.drain(..).collect();
@@ -126,6 +135,8 @@ where
                 }
             }
 
+            total_env_step_time += env_start.elapsed().as_secs_f64();
+
             memory.push_batch_part_3(actions);
             self.next_obs.reverse();
             self.next_masks.reverse();
@@ -156,7 +167,11 @@ where
             }
         }
 
-        (memory, self.get_metrics())
+        let mut report = self.get_metrics();
+        report["Collect/inference time"] = total_infer_time.into();
+        report["Collect/env step time"] = total_env_step_time.into();
+
+        (memory, report)
     }
 
     fn get_metrics(&mut self) -> Report {

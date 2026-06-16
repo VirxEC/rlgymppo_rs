@@ -78,7 +78,8 @@ where
         let num_players = result.rewards.len();
         let total_rew = result.rewards.iter().sum::<f32>() as f64;
 
-        self.metrics[".Avg. step reward"] += AvgTracker::new(total_rew, num_players as u64).into();
+        self.metrics["Collect/avg step reward"] +=
+            AvgTracker::new(total_rew, num_players as u64).into();
 
         StepResult {
             obs: result.obs,

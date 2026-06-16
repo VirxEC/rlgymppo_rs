@@ -116,6 +116,14 @@ impl<B: Backend> Net<B> {
 
     /// `mask` is an optional [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
     /// Masks disabled actions by adding a large negative bias to their logits.
+    pub fn linear_layers(&self) -> &[Linear<B>] {
+        &self.linear_layers
+    }
+
+    pub fn layer_norms(&self) -> &[LayerNorm<B>] {
+        &self.layer_norms
+    }
+
     pub fn infer(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
         let logits = self.forward(input);
         let logits = if let Some(mask) = mask {

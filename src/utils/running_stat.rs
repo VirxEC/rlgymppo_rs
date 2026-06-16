@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// Saved wandb run ID for checkpoint/resume.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct WandbRun {
     pub run_id: String,
-    pub entity: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

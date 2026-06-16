@@ -391,6 +391,8 @@ fn main() {
         policy_layer_sizes: vec![256; 2],
         critic_layer_sizes: vec![512; 3],
         device: LibTorchDevice::Cuda(0),
+        #[cfg(feature = "wandb")]
+        wandb_project_name: Some("rlgym-ppo".into()),
         ..Default::default()
     };
 

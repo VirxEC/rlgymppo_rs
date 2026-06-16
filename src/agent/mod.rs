@@ -1,6 +1,8 @@
 pub mod config;
 pub mod model;
 
+use std::time::Instant;
+
 use burn::{
     nn::loss::{MseLoss, Reduction},
     optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
@@ -57,6 +59,7 @@ impl<B: AutodiffBackend> Ppo<B> {
         rng: &mut R,
         metrics: &mut Report,
         stats: &mut Stats,
+        is_first_iteration: bool,
     ) -> (Actic<B>, usize) {
         // When overbatching, use ALL collected experience (the memory may have
         // slightly more entries than config.batch_size due to the ceil division
@@ -69,6 +72,10 @@ impl<B: AutodiffBackend> Ppo<B> {
             };
 
         let mut memory_indices = (0..effective_batch_size).collect::<Vec<_>>();
+
+        // Snapshot parameters before training for update-magnitude computation.
+        let actor_params_before = flatten_net(&net.actor);
+        let critic_params_before = flatten_net(&net.critic);
 
         let states_batch: Tensor<B, 2> =
             get_states_batch(memory.states(), &memory_indices, &self.device);
@@ -99,6 +106,7 @@ impl<B: AutodiffBackend> Ppo<B> {
                 .unwrap()
         };
 
+        let gae_start = Instant::now();
         let GAEOutput {
             returns,
             target_vals,
@@ -114,8 +122,17 @@ impl<B: AutodiffBackend> Ppo<B> {
             return_std,
             self.config.reward_clip_range,
         );
+        metrics["GAE/time"] = gae_start.elapsed().as_secs_f64().into();
+        metrics["GAE/reward clip portion"] = rew_clip_portion.into();
 
-        metrics[".Reward clip portion"] = rew_clip_portion.into();
+        // GAE distribution metrics.
+        let n = returns.len().max(1) as f32;
+        metrics["GAE/avg return"] =
+            ((returns.iter().map(|x| x.abs()).sum::<f32>() / n) as f64).into();
+        metrics["GAE/avg advantage"] =
+            ((advantages.iter().map(|x| x.abs()).sum::<f32>() / n) as f64).into();
+        metrics["GAE/avg val target"] =
+            ((target_vals.iter().map(|x| x.abs()).sum::<f32>() / n) as f64).into();
 
         if self.config.standardize_returns {
             // Randomly sample returns for the running stat.
@@ -131,11 +148,14 @@ impl<B: AutodiffBackend> Ppo<B> {
             }
         }
 
+        metrics["GAE/returns STD"] = (stats.return_stat.get_std() as f64).into();
+
         let mut mean_entropy = 0.0;
         let mut mean_val_loss = 0.0;
         let mut mean_clip_fraction = 0.0;
-        // let mut mean_divergence = 0.0;
-        // let mut mean_ratio = 0.0;
+        let mut mean_rel_entropy_loss = 0.0;
+        let mut mean_policy_loss = 0.0;
+        let mut mean_divergence = 0.0;
 
         for _ in 0..self.config.epochs {
             memory_indices.shuffle(rng);
@@ -181,8 +201,8 @@ impl<B: AutodiffBackend> Ppo<B> {
                     .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
 
                 {
-                    // let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff;
-                    // mean_divergence += kl_tensor.mean().detach().into_scalar().to_f32();
+                    let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff.clone();
+                    mean_divergence += kl_tensor.mean().detach().into_scalar().to_f32();
 
                     let clip_fraction = (ratios.clone() - 1.0)
                         .abs()
@@ -197,11 +217,18 @@ impl<B: AutodiffBackend> Ppo<B> {
                     clipped_ratios * advantage_batch,
                 )
                 .mean();
+                let cur_policy_loss = actor_loss.clone().detach().into_scalar().to_f32();
+                mean_policy_loss += cur_policy_loss;
 
                 let batch_size_f = self.config.batch_size as f32;
                 let mb_size_f = (end_idx - start_idx) as f32;
                 let ratio = mb_size_f / batch_size_f;
                 let lr = self.config.learning_rate.into();
+
+                // Track relative entropy loss: (entropy * scale) / policyLoss.
+                let cur_entropy = entropy.clone().detach().into_scalar().to_f32();
+                mean_rel_entropy_loss += (cur_entropy * self.config.entropy_scale)
+                    / cur_policy_loss.abs().max(f32::EPSILON);
 
                 let ppo_loss = actor_loss - entropy * self.config.entropy_scale;
                 let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
@@ -236,19 +263,37 @@ impl<B: AutodiffBackend> Ppo<B> {
             .max(effective_batch_size.div_ceil(self.config.mini_batch_size) * self.config.epochs)
             as f32;
 
+        mean_policy_loss /= mini_batch_iters;
         mean_val_loss /= mini_batch_iters;
         mean_entropy /= mini_batch_iters;
         mean_clip_fraction /= mini_batch_iters;
-        // mean_divergence /= mini_batch_iters;
-        // mean_ratio /= mini_batch_iters;
+        mean_rel_entropy_loss /= mini_batch_iters;
+        mean_divergence /= mini_batch_iters;
 
-        metrics[".Value loss"] = mean_val_loss.into();
-        metrics[".Entropy"] = mean_entropy.into();
-        metrics[".Clip fraction"] = mean_clip_fraction.into();
-        // metrics[".Divergence"] = mean_divergence.into();
-        // metrics[".Ratio"] = mean_ratio.into();
+        // Compute parameter-update magnitudes (L2 norm of param diff).
+        let actor_params_after = flatten_net(&net.actor);
+        let critic_params_after = flatten_net(&net.critic);
+        let policy_magnitude = l2_diff(&actor_params_before, &actor_params_after);
+        let critic_magnitude = l2_diff(&critic_params_before, &critic_params_after);
 
-        (net, self.config.batch_size)
+        metrics["Loss/entropy"] = mean_entropy.into();
+        metrics["Loss/KL divergence"] = mean_divergence.into();
+
+        // Loss/magnitude metrics produce bad graph scales on the first iteration
+        // because the model is freshly initialised, so we skip them.
+        if !is_first_iteration {
+            metrics["Loss/policy"] = mean_policy_loss.into();
+            metrics["Loss/value"] = mean_val_loss.into();
+            metrics["Loss/clip fraction"] = mean_clip_fraction.into();
+            metrics["Loss/relative entropy"] = mean_rel_entropy_loss.into();
+            metrics["Update/policy magnitude"] = policy_magnitude.into();
+            metrics["Update/critic magnitude"] = critic_magnitude.into();
+        } else {
+            // Always report these even on first iteration.
+            metrics["Loss/value"] = mean_val_loss.into();
+        }
+
+        (net, effective_batch_size)
     }
 }
 
@@ -337,4 +382,47 @@ fn get_gae(
         advantages,
         rew_clip_portion,
     }
+}
+
+/// Flatten all trainable parameters of a `Net` into a single `Vec<f32>`.
+/// Used to compute the L2 norm of parameter updates across a training iteration.
+fn flatten_net<B: Backend>(net: &Net<B>) -> Vec<f32> {
+    let mut data = Vec::new();
+    for layer in net.linear_layers() {
+        data.extend(
+            layer
+                .weight
+                .val()
+                .clone()
+                .into_data()
+                .into_vec::<f32>()
+                .unwrap(),
+        );
+        if let Some(bias) = &layer.bias {
+            data.extend(bias.val().clone().into_data().into_vec::<f32>().unwrap());
+        }
+    }
+    for norm in net.layer_norms() {
+        data.extend(
+            norm.gamma
+                .val()
+                .clone()
+                .into_data()
+                .into_vec::<f32>()
+                .unwrap(),
+        );
+        if let Some(beta) = &norm.beta {
+            data.extend(beta.val().clone().into_data().into_vec::<f32>().unwrap());
+        }
+    }
+    data
+}
+
+/// L2 norm of `a - b` (element-wise Euclidean distance).
+fn l2_diff(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (*x as f64 - *y as f64).powi(2))
+        .sum::<f64>()
+        .sqrt()
 }

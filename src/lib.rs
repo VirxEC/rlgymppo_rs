@@ -18,6 +18,7 @@ use std::{
 
 pub use agent::config::PpoLearnerConfig;
 use agent::{Ppo, model::Actic};
+use base::TERMINAL_NORMAL;
 pub use burn::backend;
 use burn::{
     module::{AutodiffModule, Module},
@@ -116,9 +117,15 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// If true, one extra instance will be launched to visualize training.
     /// RocketSim's built-in renderer is used for visualization.
     pub render: bool,
-    /// The name of the project to use for logging to wandb.
-    /// If None, metrics will not be logged to wandb.
+
+    // ── Weights & Biases ─────────────────────────────────────────────
+    /// Project name for wandb (requires the `wandb` feature).
+    /// When `None`, wandb logging is disabled.
     pub wandb_project_name: Option<String>,
+    /// Group name for wandb (default: `"unnamed-runs"`).
+    pub wandb_group_name: Option<String>,
+    /// Run name for wandb (default: `"rlgymppo-run"`).
+    pub wandb_run_name: Option<String>,
 }
 
 impl<B: AutodiffBackend> Default for LearnerConfig<B> {
@@ -140,6 +147,8 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             num_additional_iterations: None,
             render: false,
             wandb_project_name: None,
+            wandb_group_name: None,
+            wandb_run_name: None,
         }
     }
 }
@@ -233,6 +242,8 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             device: self.device,
             model,
             wandb_project_name: self.wandb_project_name,
+            wandb_group_name: self.wandb_group_name,
+            wandb_run_name: self.wandb_run_name,
             checkpoints_folder: self.checkpoints_folder,
             checkpoints_limit: self.checkpoints_limit,
             timesteps_per_save: self.timesteps_per_save,
@@ -252,6 +263,10 @@ pub struct Learner<B: AutodiffBackend> {
     device: B::Device,
     model: Actic<B>,
     wandb_project_name: Option<String>,
+    #[cfg_attr(not(feature = "wandb"), allow(dead_code))]
+    wandb_group_name: Option<String>,
+    #[cfg_attr(not(feature = "wandb"), allow(dead_code))]
+    wandb_run_name: Option<String>,
     checkpoints_folder: PathBuf,
     checkpoints_limit: Option<usize>,
     timesteps_per_save: u64,
@@ -324,32 +339,55 @@ impl<B: AutodiffBackend> Learner<B> {
              Enable the 'wandb' feature in Cargo.toml to use Weights & Biases logging."
         );
 
+        // Initialise the wandb MetricSender via embedded Python, then
+        // move it to a dedicated thread so Python GIL / HTTP latency never
+        // blocks the training loop.
         #[cfg(feature = "wandb")]
-        let mut wandb = if let Some(project_name) = self.wandb_project_name.as_ref() {
-            use crate::utils::running_stat::WandbRun;
+        let (wandb_tx, wandb_handle) = if let Some(project_name) = self.wandb_project_name.as_ref()
+        {
+            let group = self.wandb_group_name.as_deref().unwrap_or("unnamed-runs");
+            let name = self.wandb_run_name.as_deref().unwrap_or("rlgymppo-run");
+            let run_id = self
+                .stats
+                .wandb_run
+                .as_ref()
+                .map(|r| r.run_id.as_str())
+                .unwrap_or("");
 
-            let mut settings = wandb::settings::Settings::default();
-            settings.set_project(project_name.clone());
+            match rlgymppo_wandb::MetricSender::new(project_name, group, name, run_id) {
+                Ok(sender) => {
+                    // Persist the run ID for resume on restart.
+                    self.stats.wandb_run = Some(crate::utils::running_stat::WandbRun {
+                        run_id: sender.run_id().to_owned(),
+                    });
+                    println!(" > wandb run started with ID: \"{}\"", sender.run_id());
 
-            let run = if let Some(wandb_run) = self.stats.wandb_run.as_ref() {
-                settings.proto.entity = Some(wandb_run.entity.clone());
-
-                let sess = wandb::session::Session::new(settings).unwrap();
-                sess.init_run(Some(wandb_run.run_id.clone())).unwrap()
-            } else {
-                let sess = wandb::session::Session::new(settings).unwrap();
-                let run = sess.init_run(None).unwrap();
-                self.stats.wandb_run = Some(WandbRun {
-                    run_id: run.settings.proto.run_id.as_ref().unwrap().clone(),
-                    entity: run.settings.proto.entity.as_ref().unwrap().clone(),
-                });
-
-                run
-            };
-
-            Some(run)
+                    let (tx, rx) =
+                        std::sync::mpsc::sync_channel::<std::collections::HashMap<String, f64>>(1);
+                    let handle = thread::Builder::new()
+                        .name("wandb".into())
+                        .spawn(move || {
+                            // `sender` moves into this thread; dropped
+                            // when the channel closes → calls finish().
+                            while let Ok(metrics) = rx.recv() {
+                                if let Err(e) = sender.send(&metrics) {
+                                    eprintln!("Warning: wandb send failed: {e}");
+                                }
+                            }
+                        })
+                        .expect("Failed to spawn wandb-sender thread");
+                    (Some(tx), Some(handle))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to initialise wandb MetricSender: {e}\
+                             Metrics will not be logged to wandb."
+                    );
+                    (None, None)
+                }
+            }
         } else {
-            None
+            (None, None)
         };
 
         let (s, r) = channel();
@@ -385,6 +423,7 @@ impl<B: AutodiffBackend> Learner<B> {
             let collect_elapsed = collect_start.elapsed().as_secs_f64();
 
             // train the model
+            let is_first_iteration = self.stats.cumulative_model_updates == 0;
             let train_start = Instant::now();
             let num_new_steps;
             (self.model, num_new_steps) = self.ppo.learn(
@@ -393,25 +432,39 @@ impl<B: AutodiffBackend> Learner<B> {
                 &mut self.rng,
                 &mut metrics,
                 &mut self.stats,
+                is_first_iteration,
             );
 
-            let learn_elapsed = train_start.elapsed().as_secs_f64();
-            let overall_elapsed = collect_start.elapsed().as_secs_f64();
+            let consumption_elapsed = train_start.elapsed().as_secs_f64();
 
-            metrics[".Episode length"] = num_new_steps.into();
-            metrics[".Collection time"] = collect_elapsed.into();
-            metrics[".Collected SPS"] = (num_new_steps as f64 / collect_elapsed).into();
-            metrics[".Learning time"] = learn_elapsed.into();
-            metrics[".Overall time"] = overall_elapsed.into();
-            metrics[".Overall SPS"] =
+            // Episode length = total_steps / number of NORMAL terminals.
+            let n_term = (0..memory.len())
+                .filter(|&i| memory.terminals()[i] == TERMINAL_NORMAL)
+                .count();
+            let ep_len = if n_term > 0 {
+                memory.len() as f64 / n_term as f64
+            } else {
+                memory.len() as f64
+            };
+            metrics["Collect/episode length"] = ep_len.into();
+            metrics["Collect/timesteps"] = num_new_steps.into();
+            metrics["Timing/collection"] = collect_elapsed.into();
+            metrics["Timing/consumption"] = consumption_elapsed.into();
+            metrics["Throughput/collected"] = (num_new_steps as f64 / collect_elapsed).into();
+            metrics["Throughput/consumption"] =
+                (num_new_steps as f64 / consumption_elapsed.max(1e-12)).into();
+            metrics["Throughput/overall"] =
                 (num_new_steps as f64 / collect_start.elapsed().as_secs_f64()).into();
-            metrics[".Cumulative steps"] = self.stats.cumulative_timesteps.into();
-            metrics[".Cumulative epochs"] = self.stats.cumulative_epochs.into();
-            metrics[".Cumulative updates"] = self.stats.cumulative_model_updates.into();
+            metrics["Cumulative/steps"] = self.stats.cumulative_timesteps.into();
+            metrics["Cumulative/epochs"] = self.stats.cumulative_epochs.into();
+            metrics["Cumulative/updates"] = self.stats.cumulative_model_updates.into();
 
             #[cfg(feature = "wandb")]
-            if let Some(wandb) = wandb.as_mut() {
-                metrics.report_wandb(wandb);
+            if let Some(ref tx) = wandb_tx {
+                let flat = metrics.to_flat_map();
+                // Non-blocking send; silently drop if the background
+                // wandb thread is still busy with the previous batch.
+                let _ = tx.try_send(flat);
             }
 
             println!("{metrics}");
@@ -453,9 +506,14 @@ impl<B: AutodiffBackend> Learner<B> {
             self.checkpoints_limit,
         );
 
+        // Close the wandb channel so the background thread exits, which
+        // drops the MetricSender and calls `wandb.finish()`.
         #[cfg(feature = "wandb")]
-        if let Some(mut wandb) = wandb {
-            wandb.finish();
+        {
+            drop(wandb_tx);
+            if let Some(handle) = wandb_handle {
+                handle.join().expect("wandb-sender thread panicked");
+            }
         }
 
         println!("Waiting for threads to exit...");

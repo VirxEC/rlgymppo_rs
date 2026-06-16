@@ -132,27 +132,31 @@ impl fmt::Display for Report {
 }
 
 impl Report {
-    #[cfg(feature = "wandb")]
-    pub fn report_wandb(&self, wandb: &mut wandb::run::Run) {
-        use wandb::run::Value;
+    /// Add a floating-point value under an average-tracking key (e.g. `"Rewards/boost"`).
+    /// Subsequent calls with the same key will be averaged together.
+    pub fn add_avg(&mut self, key: &str, value: f64) {
+        self[key] += AvgTracker::new(value, 1).into();
+    }
 
-        let mut data = std::collections::HashMap::new();
-
+    /// Convert the report to a flat `{name → value}` map suitable for
+    /// logging (e.g. via [`MetricSender`](rlgymppo_wandb::MetricSender)).
+    /// Average-tracker values are resolved to their current mean.
+    pub fn to_flat_map(&self) -> std::collections::HashMap<String, f64> {
+        let mut map = std::collections::HashMap::new();
         for (key, val) in &self.data {
             match val {
                 Reportable::Float(v) => {
-                    data.insert(key.clone(), Value::Float(*v));
+                    map.insert(key.clone(), *v);
                 }
                 Reportable::Int(v) => {
-                    data.insert(key.clone(), Value::Float(*v as f64));
+                    map.insert(key.clone(), *v as f64);
                 }
                 Reportable::Avg(avg) => {
-                    data.insert(key.clone(), Value::Float(avg.get()));
+                    map.insert(key.clone(), avg.get());
                 }
             }
         }
-
-        wandb.log(data);
+        map
     }
 
     pub fn remove(&mut self, key: &str) {

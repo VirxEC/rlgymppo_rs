@@ -1,0 +1,7 @@
+[package]
+name = "rlgymppo-wandb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["auto-initialize"] }

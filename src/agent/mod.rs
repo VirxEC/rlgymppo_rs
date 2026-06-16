@@ -8,6 +8,7 @@ use burn::{
     tensor::{backend::AutodiffBackend, cast::ToElement},
 };
 use rand::{Rng, seq::SliceRandom};
+use ringbuffer::RingBuffer;
 
 use crate::{
     agent::{
@@ -15,7 +16,8 @@ use crate::{
         model::{Actic, Net, PPOOutput},
     },
     base::{
-        Memory, get_action_batch, get_batch_1d, get_generic_batch, get_log_probs_batch,
+        Memory, TERMINAL_NORMAL, TERMINAL_TRUNCATED, TerminalState, get_action_batch,
+        get_action_masks_batch, get_batch_1d, get_generic_batch, get_log_probs_batch,
         get_states_batch,
     },
     utils::{Report, elementwise_min, running_stat::Stats, update_parameters},
@@ -58,13 +60,30 @@ impl<B: AutodiffBackend> Ppo<B> {
 
         let states_batch: Tensor<B, 2> =
             get_states_batch(memory.states(), &memory_indices, &self.device);
-        let old_values_batch = net.critic.infer(states_batch).detach();
+        let old_values_batch = net.critic.forward(states_batch).detach();
         let old_values = old_values_batch.into_data().into_vec::<f32>().unwrap();
 
         let return_std = if self.config.standardize_returns {
             stats.return_stat.get_std()
         } else {
             1.0
+        };
+
+        let terminals = get_batch_1d(memory.terminals(), &memory_indices);
+
+        // Run the critic on truncation next-state observations for the bootstrap
+        // (mirrors C++ `tTruncValPreds`).
+        let trunc_val_preds = if memory.trunc_next_states().is_empty() {
+            Vec::new()
+        } else {
+            let indices: Vec<usize> = (0..memory.trunc_next_states().len()).collect();
+            let batch = get_states_batch(memory.trunc_next_states(), &indices, &self.device);
+            net.critic
+                .forward(batch)
+                .detach()
+                .into_data()
+                .into_vec::<f32>()
+                .unwrap()
         };
 
         let GAEOutput {
@@ -74,8 +93,8 @@ impl<B: AutodiffBackend> Ppo<B> {
         } = get_gae(
             old_values,
             get_batch_1d(memory.rewards(), &memory_indices),
-            get_batch_1d(memory.dones(), &memory_indices),
-            get_batch_1d(memory.truncateds(), &memory_indices),
+            terminals,
+            &trunc_val_preds,
             self.config.gamma,
             self.config.lambda,
             return_std,
@@ -110,10 +129,15 @@ impl<B: AutodiffBackend> Ppo<B> {
                 let target_vals_batch =
                     get_generic_batch(&target_vals, sample_indices, &self.device);
 
+                // Build action mask tensor for this mini-batch.
+                let mask_batch = (!memory.action_masks().is_empty()).then(|| {
+                    get_action_masks_batch(memory.action_masks(), sample_indices, &self.device)
+                });
+
                 let PPOOutput {
                     policies: policy_batch,
                     values: value_batch,
-                } = net.forward(state_batch);
+                } = net.forward(state_batch, mask_batch);
 
                 let log_prob = policy_batch.clone().log();
                 let entropy = -(log_prob.clone() * policy_batch).sum_dim(1).mean();
@@ -201,8 +225,8 @@ struct GAEOutput {
 fn get_gae(
     values: Vec<f32>,
     rewards: Vec<f32>,
-    dones: Vec<bool>,
-    truncateds: Vec<bool>,
+    terminals: Vec<TerminalState>,
+    trunc_val_preds: &[f32],
     gamma: f32,
     lambda: f32,
     return_std: f32,
@@ -220,29 +244,47 @@ fn get_gae(
     }
 
     let mut last_return = 0.0;
-    let mut last_val = 0.0;
     let mut running_advantage = 0.0;
+    let mut trunc_count = 0_usize;
 
     for i in (0..n_returns).rev() {
-        let not_done = f32::from(!dones[i]);
-        let not_truncated = f32::from(!truncateds[i]);
+        let term = terminals[i];
+        let is_done = term == TERMINAL_NORMAL;
+        let is_trunc = term == TERMINAL_TRUNCATED;
 
+        let not_done = f32::from(!is_done);
+        let not_trunc = f32::from(!is_trunc);
+
+        // Normalize reward (same as C++: curReward = _rews[step] / returnStd).
         let mut norm_reward = rewards[i] * return_scale;
         if clip_range > 0.0 {
             norm_reward = norm_reward.clamp(-clip_range, clip_range);
         }
 
-        let pred_ret = norm_reward + gamma * last_val * not_done;
-        let delta = pred_ret - values[i];
-        last_val = values[i];
+        // Determine next-value prediction:
+        //   - TRUNCATED  → pull from `trunc_val_preds` (C++: `_truncValPreds[truncCount]`)
+        //   - NOT_TERMINAL → pull from `values[i + 1]` (C++: `_valPreds[step + 1]`)
+        //   - NORMAL / end-of-buffer → 0.0 (the `(1-done)` multiplier zeros it anyway)
+        let next_val = if is_trunc {
+            let v = trunc_val_preds[trunc_count];
+            trunc_count += 1;
+            v
+        } else if !is_done && i + 1 < n_returns {
+            values[i + 1]
+        } else {
+            0.0
+        };
 
-        last_return = rewards[i] + last_return * gamma * not_done * not_truncated;
+        let pred_ret = norm_reward + gamma * next_val * not_done;
+        let delta = pred_ret - values[i];
+
+        last_return = rewards[i] + last_return * gamma * not_done * not_trunc;
         returns[i] = last_return;
 
-        running_advantage = delta + gamma * lambda * not_done * not_truncated * running_advantage;
+        running_advantage = delta + gamma * lambda * not_done * not_trunc * running_advantage;
         advantages[i] = running_advantage;
 
-        target_vals[i] = last_val + running_advantage;
+        target_vals[i] = values[i] + running_advantage;
     }
 
     returns.truncate(max_n_returns);

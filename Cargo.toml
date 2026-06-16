@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.20.1", features = ["autodiff"] }
+arrayvec = "0.7.6"
+burn = { version = "0.21.0", features = ["autodiff"] }
 rlgym = { git = "https://github.com/VirxEC/rlgym_rs.git", branch = "native-rust" }
 ahash = "0.8.11"
 toml = { version = "1.1.2", features = ["preserve_order"] }
@@ -13,11 +14,12 @@ ringbuffer = "0.16.0"
 rand = "0.10.1"
 itertools = "0.14.0"
 parking_lot = "0.12.4"
-wandb = { git = "https://github.com/wandb/wandb.git", tag="v0.18.7", optional = true }
+# wandb = { git = "https://github.com/wandb/wandb.git", tag="v0.18.7", optional = true }
 
 [features]
 default = ["router", "fusion"]
-wandb = ["dep:wandb"]
+# wandb = ["dep:wandb"]
+wandb = []
 
 # performance
 fusion = ["burn/fusion"]

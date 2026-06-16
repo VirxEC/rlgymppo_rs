@@ -1,3 +1,5 @@
+pub mod actions;
+
 mod avg_tracker;
 mod report;
 pub(crate) mod running_stat;
@@ -11,6 +13,18 @@ use burn::{
     tensor::{Distribution, Transaction, backend::AutodiffBackend, cast::ToElement},
 };
 pub use report::{Report, Reportable};
+
+pub(crate) fn to_mask_tensor_2d<B: Backend>(
+    masks: &[Vec<bool>],
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let shape = [masks.len(), masks[0].len()];
+    let data: Vec<f32> = masks
+        .iter()
+        .flat_map(|m| m.iter().map(|&v| if v { 1.0 } else { 0.0 }))
+        .collect();
+    Tensor::from_data(TensorData::new(data, shape), device)
+}
 
 pub(crate) fn to_state_tensor_2d<B: Backend>(
     state: &[Vec<f32>],
@@ -28,7 +42,7 @@ pub(crate) fn sample_actions<B: Backend>(
     action_probs: Tensor<B, 2>,
     device: &B::Device,
 ) -> (Vec<usize>, Vec<f32>) {
-    let shape = action_probs.shape().dims;
+    let shape = action_probs.shape();
     let log_probs = action_probs.log();
 
     let u = Tensor::<B, 2>::random(shape, Distribution::Default, device);

@@ -7,6 +7,7 @@ use crate::utils::{AvgTracker, Report};
 
 pub struct StepResult {
     pub obs: FullObs,
+    pub action_masks: Vec<Vec<bool>>,
     pub rewards: Vec<f32>,
     pub is_terminal: bool,
     pub truncated: bool,
@@ -49,19 +50,19 @@ where
         }
     }
 
-    pub fn do_rendering(&mut self) {
-        self.env.do_rendering()
+    pub fn set_rlviser_enabled(&mut self, enabled: bool) {
+        self.env.set_rlviser_enabled(enabled)
     }
 
     pub fn num_players(&self) -> usize {
         self.last_state.cars.len()
     }
 
-    pub fn reset(&mut self) -> FullObs {
-        let (state, obs) = self.env.reset();
+    pub fn reset(&mut self) -> (FullObs, Vec<Vec<bool>>) {
+        let (state, obs, masks) = self.env.reset();
         self.last_state = state;
 
-        obs
+        (obs, masks)
     }
 
     pub fn step(&mut self, actions: &[ACT::Input]) -> StepResult {
@@ -81,6 +82,7 @@ where
 
         StepResult {
             obs: result.obs,
+            action_masks: result.action_masks,
             rewards: result.rewards,
             is_terminal: result.is_terminal,
             truncated: result.truncated,

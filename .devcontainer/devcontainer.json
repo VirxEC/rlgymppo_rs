@@ -13,10 +13,12 @@
     "--cap-add=SYS_PTRACE",
     "--security-opt=seccomp=unconfined",
     "--shm-size=8G",
-
     // RDNA2 performance stability tuning
     "--ulimit=memlock=-1",
     "--ulimit=stack=67108864",
+
+    // Host networking so UDP via 127.0.0.1 works bidirectionally
+    "--network=host",
   ],
 
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",

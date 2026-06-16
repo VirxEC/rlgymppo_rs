@@ -68,7 +68,7 @@ where
         device: B::Device,
     ) -> Self {
         let mut game = GameInstance::new(env, step_callback.clone());
-        let last_obs = game.reset();
+        let (last_obs, _last_masks) = game.reset();
 
         Self {
             controller,
@@ -104,7 +104,7 @@ where
             )
         };
 
-        self.game.do_rendering();
+        self.game.set_rlviser_enabled(true);
 
         let mut last_controls_update_time = Instant::now();
         let controls_update_rate = Duration::from_secs(1);
@@ -139,9 +139,9 @@ where
             }
 
             let actions = if deterministic {
-                model.react_deterministic(&self.last_obs, &self.device)
+                model.react_deterministic(&self.last_obs, &[], &self.device)
             } else {
-                model.react(&self.last_obs, &self.device).0
+                model.react(&self.last_obs, &[], &self.device).0
             };
 
             // ensure real-time rendering
@@ -155,7 +155,7 @@ where
             let result = self.game.step(&actions);
 
             self.last_obs = if result.is_terminal || result.truncated {
-                self.game.reset()
+                self.game.reset().0
             } else {
                 result.obs
             };

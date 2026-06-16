@@ -7,14 +7,11 @@ use rlgym::rocketsim::init_from_default;
 use rlgymppo::{
     LearnerConfig, PpoLearnerConfig,
     backend::Autodiff,
-    rlgym::{
-        Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
-    },
+    rlgym::{Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate},
     rocketsim::{
-        Arena, ArenaState, BallState, CarBodyConfig, CarControls, CarInfo, CarState, GameMode,
-        Team, consts,
+        Arena, ArenaState, BallState, CarBodyConfig, CarInfo, CarState, GameMode, Team, consts,
     },
-    utils::{AvgTracker, Report},
+    utils::{AvgTracker, Report, actions::DefaultAction},
 };
 
 struct SharedInfo {
@@ -164,109 +161,6 @@ impl Obs<SharedInfo> for MyObs {
 
         assert!(obs.len() <= Self::ZERO_PADDING * 2);
         obs
-    }
-}
-
-struct MyAction {
-    actions_table: Vec<CarControls>,
-    action_buffer: [(usize, CarControls); MyObs::ZERO_PADDING * 2],
-}
-
-impl Default for MyAction {
-    fn default() -> Self {
-        let mut actions_table = Vec::new();
-
-        // ground
-        for throttle in [-1.0, 1.0] {
-            for steer in [-1.0, 0.0, 1.0] {
-                for boost in [false, true] {
-                    for handbrake in [false, true] {
-                        if boost && throttle != 1.0 {
-                            continue;
-                        }
-
-                        actions_table.push(CarControls {
-                            throttle,
-                            steer,
-                            boost,
-                            handbrake,
-                            jump: false,
-                            pitch: 0.0,
-                            yaw: 0.0,
-                            roll: 0.0,
-                        });
-                    }
-                }
-            }
-        }
-
-        // aerial
-        // for pitch in [-1.0, 0.0, 1.0] {
-        //     for yaw in [-1.0, 0.0, 1.0] {
-        //         for roll in [-1.0, 0.0, 1.0] {
-        //             for jump in [false, true] {
-        //                 for boost in [false, true] {
-        //                     // Only need roll for sideflip
-        //                     if jump && yaw != 0.0 {
-        //                         continue;
-        //                     }
-
-        //                     // Duplicate with ground
-        //                     if pitch == 0.0 && roll == 0.0 && !jump {
-        //                         continue;
-        //                     }
-
-        //                     // Enable handbrake for potential wavedashes
-        //                     let handbrake = jump && (pitch != 0.0 || yaw != 0.0 || roll != 0.0);
-        //                     actions_table.push(CarControls {
-        //                         throttle: 0.0,
-        //                         steer: yaw,
-        //                         boost,
-        //                         handbrake,
-        //                         jump,
-        //                         pitch,
-        //                         yaw,
-        //                         roll,
-        //                     });
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
-
-        Self {
-            actions_table,
-            action_buffer: Default::default(),
-        }
-    }
-}
-
-impl Action<SharedInfo> for MyAction {
-    type Input = usize;
-
-    fn get_tick_skip() -> u8 {
-        8
-    }
-
-    fn get_action_space(&self, _shared_info: &SharedInfo) -> usize {
-        self.actions_table.len()
-    }
-
-    fn reset(&mut self, _initial_state: &ArenaState, _shared_info: &mut SharedInfo) {}
-
-    fn parse_actions(
-        &mut self,
-        actions: &[usize],
-        state: &ArenaState,
-        _shared_info: &mut SharedInfo,
-    ) -> &[(usize, CarControls)] {
-        for ((buf, (info, _)), action) in
-            self.action_buffer.iter_mut().zip(&state.cars).zip(actions)
-        {
-            *buf = (info.idx, self.actions_table[*action]);
-        }
-
-        &self.action_buffer[..state.cars.len()]
     }
 }
 
@@ -427,7 +321,7 @@ fn create_env(
 ) -> Env<
     MyStateSetter,
     MyObs,
-    MyAction,
+    DefaultAction<6>,
     CombinedWeightedRewards,
     OnGoal,
     EpisodeDurationMax,
@@ -452,7 +346,7 @@ fn create_env(
         arena,
         MyStateSetter,
         MyObs,
-        MyAction::default(),
+        DefaultAction::default(),
         new_rewards![(VelocityToBallReward, 1.0), (FaceBallReward, 0.2)],
         OnGoal,
         EpisodeDurationMax::default(),
@@ -468,16 +362,16 @@ fn step_callback(report: &mut Report, shared_info: &mut SharedInfo, _game_state:
 fn main() {
     init_from_default(cfg!(not(debug_assertions))).unwrap();
 
-    let mini_batch_size = 50_000;
-    let batch_size = mini_batch_size * 4;
-    let lr = 3e-4;
+    let mini_batch_size = 20_000;
+    let batch_size = mini_batch_size * 2;
+    let lr = 2e-4;
 
     // Router will fallback to NdArray if Wgpu is not available
     // Realistically more useful for using CUDA and falling back to NdArray
     let config = LearnerConfig::<Autodiff<LibTorch>> {
         render: false,
-        num_threads: 12,
-        num_games_per_thread: 64,
+        num_threads: 8,
+        num_games_per_thread: 256,
         exp_buffer_size: batch_size,
         timesteps_per_save: 10_000_000,
         checkpoints_limit: Some(3),
@@ -489,7 +383,7 @@ fn main() {
             ..Default::default()
         },
         policy_layer_sizes: vec![256; 4],
-        critic_layer_sizes: vec![1024; 4],
+        critic_layer_sizes: vec![512; 4],
         device: LibTorchDevice::Cuda(0),
         ..Default::default()
     };

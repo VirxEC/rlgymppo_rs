@@ -4,7 +4,7 @@ use burn::{
     tensor::activation::{relu, softmax},
 };
 
-use crate::utils::{argmax_actions, sample_actions, to_state_tensor_2d};
+use crate::utils::{argmax_actions, sample_actions, to_mask_tensor_2d, to_state_tensor_2d};
 
 pub struct PPOOutput<B: Backend> {
     pub policies: Tensor<B, 2>,
@@ -59,7 +59,7 @@ impl<B: Backend> Net<B> {
         Self { layers }
     }
 
-    fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         let mut output = input;
         let num_layers = self.layers.len();
         for layer in &self.layers[..num_layers - 1] {
@@ -69,16 +69,39 @@ impl<B: Backend> Net<B> {
         self.layers[num_layers - 1].forward(output)
     }
 
-    pub fn infer(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        softmax(self.forward(input), 1).clamp(1e-11, 1.0)
+    /// `mask` is an optional [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
+    /// Masks disabled actions by adding a large negative bias to their logits.
+    pub fn infer(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+        let logits = self.forward(input);
+        let logits = if let Some(mask) = mask {
+            logits - (1.0 - mask) * 1e10_f32
+        } else {
+            logits
+        };
+        softmax(logits, 1).clamp(1e-11, 1.0)
     }
 
-    pub fn react_deterministic(&self, state: &[Vec<f32>], device: &B::Device) -> Vec<usize> {
-        argmax_actions(self.infer(to_state_tensor_2d(state, device)))
+    pub fn react_deterministic(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        device: &B::Device,
+    ) -> Vec<usize> {
+        let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
+        argmax_actions(self.infer(to_state_tensor_2d(state, device), mask_tensor))
     }
 
-    pub fn react(&self, state: &[Vec<f32>], device: &B::Device) -> (Vec<usize>, Vec<f32>) {
-        sample_actions(self.infer(to_state_tensor_2d(state, device)), device)
+    pub fn react(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        device: &B::Device,
+    ) -> (Vec<usize>, Vec<f32>) {
+        let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
+        sample_actions(
+            self.infer(to_state_tensor_2d(state, device), mask_tensor),
+            device,
+        )
     }
 }
 
@@ -104,8 +127,8 @@ impl<B: Backend> Actic<B> {
 }
 
 impl<B: Backend> Actic<B> {
-    pub fn forward(&self, input: Tensor<B, 2>) -> PPOOutput<B> {
-        let policies = self.actor.infer(input.clone());
+    pub fn forward(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> PPOOutput<B> {
+        let policies = self.actor.infer(input.clone(), mask);
         let values = self.critic.forward(input);
 
         PPOOutput::<B>::new(policies, values)

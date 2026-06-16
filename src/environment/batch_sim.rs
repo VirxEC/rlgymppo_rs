@@ -5,7 +5,11 @@ use rlgym::{
 };
 
 use super::sim::GameInstance;
-use crate::{agent::model::Net, base::Memory, utils::Report};
+use crate::{
+    agent::model::Net,
+    base::{Memory, TERMINAL_NONE, TERMINAL_NORMAL, TERMINAL_TRUNCATED},
+    utils::Report,
+};
 
 pub struct BatchSim<B: Backend, C, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
@@ -20,6 +24,7 @@ where
 {
     games: Vec<GameInstance<C, SS, OBS, ACT, REW, TERM, TRUNC, SI>>,
     next_obs: Vec<Vec<f32>>,
+    next_masks: Vec<Vec<bool>>,
     metrics: Report,
     device: B::Device,
 }
@@ -49,16 +54,20 @@ where
         let mut games = Vec::with_capacity(num_games);
 
         let mut next_obs = Vec::with_capacity(num_games);
+        let mut next_masks = Vec::with_capacity(num_games);
         for i in 0..num_games {
             let env = create_env_fn(Some(thread_num * i));
             let mut game = GameInstance::new(env, step_callback.clone());
-            next_obs.extend(game.reset());
+            let (obs, masks) = game.reset();
+            next_obs.extend(obs);
+            next_masks.extend(masks);
             games.push(game);
         }
 
         Self {
             metrics: Report::default(),
             next_obs,
+            next_masks,
             games,
             device,
         }
@@ -72,28 +81,48 @@ where
         let mut memory = Memory::with_capacity(num_steps);
 
         while memory.len() < num_steps {
-            let (actions, log_probs) = model.react(&self.next_obs, &self.device);
+            let (actions, log_probs) = model.react(&self.next_obs, &self.next_masks, &self.device);
 
             let mut start_idx = self.next_obs.len();
-            memory.push_batch_part_1(self.next_obs.drain(..), log_probs);
+            let masks = self.next_masks.drain(..).collect();
+            memory.push_batch_part_1(self.next_obs.drain(..), masks, log_probs);
 
             for game in self.games.iter_mut().rev() {
                 let end_idx = start_idx;
                 start_idx -= game.num_players();
                 let result = game.step(&actions[start_idx..end_idx]);
 
-                memory.push_batch_part_2(result.rewards, result.is_terminal, result.truncated);
-                let obs = if result.is_terminal || result.truncated {
-                    game.reset()
+                // Encode the terminal type: NONE / NORMAL / TRUNCATED (like C++ TerminalType).
+                let terminal_type = if result.truncated {
+                    TERMINAL_TRUNCATED
+                } else if result.is_terminal {
+                    TERMINAL_NORMAL
                 } else {
-                    result.obs
+                    TERMINAL_NONE
                 };
 
-                self.next_obs.extend(obs);
+                // Save the next observation before reset so the critic can bootstrap
+                // on truncated episodes (C++ GAE: `truncValPreds`).
+                let trunc_obs = result.truncated.then(|| result.obs.clone());
+
+                memory.push_batch_part_2(result.rewards, terminal_type);
+
+                if result.is_terminal || result.truncated {
+                    if let Some(ref obs) = trunc_obs {
+                        memory.push_trunc_next_states(obs);
+                    }
+                    let (obs, masks) = game.reset();
+                    self.next_obs.extend(obs);
+                    self.next_masks.extend(masks);
+                } else {
+                    self.next_obs.extend(result.obs);
+                    self.next_masks.extend(result.action_masks);
+                }
             }
 
             memory.push_batch_part_3(actions);
             self.next_obs.reverse();
+            self.next_masks.reverse();
         }
 
         (memory, self.get_metrics())

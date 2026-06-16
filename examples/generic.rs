@@ -38,8 +38,13 @@ impl SharedInfoProvider for SharedInfo {
     fn update(&mut self, game_state: &ArenaState) {
         for (_, state) in &game_state.cars {
             let dist_to_ball = state.pos.distance(game_state.ball.pos);
-            self.metrics["Avg. dist to ball"] += AvgTracker::new(dist_to_ball as f64, 1).into();
-            self.metrics["Avg. velocity"] += AvgTracker::new(state.vel.length() as f64, 1).into();
+            self.metrics["Avg. dist to ball"] += AvgTracker::from(dist_to_ball).into();
+            self.metrics["Avg. velocity"] += AvgTracker::from(state.vel.length()).into();
+
+            let vel_to_ball = state
+                .vel
+                .dot((game_state.ball.pos - state.pos).normalize_or_zero());
+            self.metrics["Avg. vel to ball"] += AvgTracker::from(vel_to_ball).into();
         }
     }
 }
@@ -374,7 +379,7 @@ fn main() {
         num_games_per_thread: 256,
         exp_buffer_size: batch_size,
         timesteps_per_save: 10_000_000,
-        checkpoints_limit: Some(3),
+        checkpoints_limit: Some(10),
         ppo: PpoLearnerConfig {
             batch_size,
             mini_batch_size,

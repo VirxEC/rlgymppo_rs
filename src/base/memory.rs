@@ -3,7 +3,7 @@ use std::iter;
 use burn::prelude::*;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 
-/// Terminal-state encoding (mirrors C++ RLGC::TerminalType).
+/// Terminal-state encoding.
 pub type TerminalState = u8;
 pub const TERMINAL_NONE: TerminalState = 0;
 pub const TERMINAL_NORMAL: TerminalState = 1;
@@ -181,6 +181,11 @@ impl Memory {
 
     pub fn terminals(&self) -> &AllocRingBuffer<TerminalState> {
         &self.terminals
+    }
+
+    /// Mutate the terminal type at a specific index (used for batch-boundary truncation).
+    pub fn set_terminal_at(&mut self, idx: usize, terminal: TerminalState) {
+        self.terminals[idx] = terminal;
     }
 
     pub fn trunc_next_states(&self) -> &AllocRingBuffer<Vec<f32>> {

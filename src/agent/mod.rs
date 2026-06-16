@@ -56,7 +56,17 @@ impl<B: AutodiffBackend> Ppo<B> {
         metrics: &mut Report,
         stats: &mut Stats,
     ) -> (Actic<B>, usize) {
-        let mut memory_indices = (0..self.config.batch_size).collect::<Vec<_>>();
+        // When overbatching, use ALL collected experience (the memory may have
+        // slightly more entries than config.batch_size due to the ceil division
+        // in thread_sim, or due to truncation next-states).
+        let effective_batch_size =
+            if self.config.overbatching && memory.len() > self.config.batch_size {
+                memory.len()
+            } else {
+                self.config.batch_size
+            };
+
+        let mut memory_indices = (0..effective_batch_size).collect::<Vec<_>>();
 
         let states_batch: Tensor<B, 2> =
             get_states_batch(memory.states(), &memory_indices, &self.device);
@@ -71,8 +81,7 @@ impl<B: AutodiffBackend> Ppo<B> {
 
         let terminals = get_batch_1d(memory.terminals(), &memory_indices);
 
-        // Run the critic on truncation next-state observations for the bootstrap
-        // (mirrors C++ `tTruncValPreds`).
+        // Run the critic on truncation next-state observations for the bootstrap.
         let trunc_val_preds = if memory.trunc_next_states().is_empty() {
             Vec::new()
         } else {
@@ -90,6 +99,7 @@ impl<B: AutodiffBackend> Ppo<B> {
             returns,
             target_vals,
             advantages,
+            rew_clip_portion,
         } = get_gae(
             old_values,
             get_batch_1d(memory.rewards(), &memory_indices),
@@ -99,11 +109,22 @@ impl<B: AutodiffBackend> Ppo<B> {
             self.config.lambda,
             return_std,
             self.config.reward_clip_range,
-            self.config.max_returns_per_stats_increment,
         );
 
+        metrics[".Reward clip portion"] = rew_clip_portion.into();
+
         if self.config.standardize_returns {
-            stats.return_stat.increment(returns);
+            // Randomly sample returns for the running stat.
+            let n_to_sample = self
+                .config
+                .max_returns_per_stats_increment
+                .min(returns.len());
+            if n_to_sample > 0 {
+                for _ in 0..n_to_sample {
+                    let idx = rng.next_u32() as usize % returns.len();
+                    stats.return_stat.increment(vec![returns[idx]]);
+                }
+            }
         }
 
         let mut mean_entropy = 0.0;
@@ -112,13 +133,11 @@ impl<B: AutodiffBackend> Ppo<B> {
         // let mut mean_divergence = 0.0;
         // let mut mean_ratio = 0.0;
 
-        let minibatch_ratio = self.config.mini_batch_size as f32 / self.config.batch_size as f32;
-
         for _ in 0..self.config.epochs {
             memory_indices.shuffle(rng);
 
-            for start_idx in (0..self.config.batch_size).step_by(self.config.mini_batch_size) {
-                let end_idx = start_idx + self.config.mini_batch_size;
+            for start_idx in (0..effective_batch_size).step_by(self.config.mini_batch_size) {
+                let end_idx = (start_idx + self.config.mini_batch_size).min(effective_batch_size);
                 let sample_indices = &memory_indices[start_idx..end_idx];
 
                 let state_batch = get_states_batch(memory.states(), sample_indices, &self.device);
@@ -140,7 +159,12 @@ impl<B: AutodiffBackend> Ppo<B> {
                 } = net.forward(state_batch, mask_batch);
 
                 let log_prob = policy_batch.clone().log();
-                let entropy = -(log_prob.clone() * policy_batch).sum_dim(1).mean();
+
+                // Per-sample entropy normalised by ln(n_actions).
+                let num_actions = policy_batch.shape().dims::<2>()[1];
+                let entropy_per_sample =
+                    -(log_prob.clone() * policy_batch).sum_dim(1) / (num_actions as f32).ln();
+                let entropy = entropy_per_sample.mean();
                 mean_entropy += entropy.clone().into_scalar().to_f32();
 
                 let action_log_prob = log_prob.gather(1, action_batch.clone());
@@ -170,9 +194,13 @@ impl<B: AutodiffBackend> Ppo<B> {
                 )
                 .mean();
 
-                let ppo_loss = actor_loss - entropy * self.config.entropy_coeff;
+                let batch_size_f = self.config.batch_size as f32;
+                let mb_size_f = (end_idx - start_idx) as f32;
+                let ratio = mb_size_f / batch_size_f;
+
+                let ppo_loss = actor_loss - entropy * self.config.entropy_scale;
                 net.actor = update_parameters(
-                    ppo_loss * minibatch_ratio,
+                    ppo_loss * ratio,
                     net.actor,
                     &mut self.policy_optimizer,
                     self.config.learning_rate.into(),
@@ -184,7 +212,7 @@ impl<B: AutodiffBackend> Ppo<B> {
                 mean_val_loss += loss;
 
                 net.critic = update_parameters(
-                    critic_loss * minibatch_ratio,
+                    critic_loss * ratio,
                     net.critic,
                     &mut self.value_optimizer,
                     self.config.learning_rate.into(),
@@ -192,12 +220,13 @@ impl<B: AutodiffBackend> Ppo<B> {
             }
         }
 
-        stats.cumulative_timesteps += self.config.batch_size as u64;
+        stats.cumulative_timesteps += effective_batch_size as u64;
         stats.cumulative_epochs += self.config.epochs as u64;
         stats.cumulative_model_updates += 1;
 
-        let mini_batch_iters =
-            1.max(self.config.batch_size / self.config.mini_batch_size * self.config.epochs) as f32;
+        let mini_batch_iters = 1
+            .max(effective_batch_size.div_ceil(self.config.mini_batch_size) * self.config.epochs)
+            as f32;
 
         mean_val_loss /= mini_batch_iters;
         mean_entropy /= mini_batch_iters;
@@ -219,6 +248,7 @@ struct GAEOutput {
     returns: Vec<f32>,
     target_vals: Vec<f32>,
     advantages: Vec<f32>,
+    rew_clip_portion: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,7 +261,6 @@ fn get_gae(
     lambda: f32,
     return_std: f32,
     clip_range: f32,
-    max_n_returns: usize,
 ) -> GAEOutput {
     let n_returns = values.len();
     let mut returns = vec![0.0; n_returns];
@@ -247,6 +276,9 @@ fn get_gae(
     let mut running_advantage = 0.0;
     let mut trunc_count = 0_usize;
 
+    let mut total_reward = 0.0_f32;
+    let mut total_clipped_reward = 0.0_f32;
+
     for i in (0..n_returns).rev() {
         let term = terminals[i];
         let is_done = term == TERMINAL_NORMAL;
@@ -255,15 +287,18 @@ fn get_gae(
         let not_done = f32::from(!is_done);
         let not_trunc = f32::from(!is_trunc);
 
-        // Normalize reward (same as C++: curReward = _rews[step] / returnStd).
+        // Normalize reward.
         let mut norm_reward = rewards[i] * return_scale;
+        total_reward += norm_reward.abs();
+
         if clip_range > 0.0 {
             norm_reward = norm_reward.clamp(-clip_range, clip_range);
         }
+        total_clipped_reward += norm_reward.abs();
 
         // Determine next-value prediction:
-        //   - TRUNCATED  → pull from `trunc_val_preds` (C++: `_truncValPreds[truncCount]`)
-        //   - NOT_TERMINAL → pull from `values[i + 1]` (C++: `_valPreds[step + 1]`)
+        //   - TRUNCATED  → pull from `trunc_val_preds`
+        //   - NOT_TERMINAL → pull from `values[i + 1]`
         //   - NORMAL / end-of-buffer → 0.0 (the `(1-done)` multiplier zeros it anyway)
         let next_val = if is_trunc {
             let v = trunc_val_preds[trunc_count];
@@ -287,10 +322,11 @@ fn get_gae(
         target_vals[i] = values[i] + running_advantage;
     }
 
-    returns.truncate(max_n_returns);
+    let rew_clip_portion = (total_reward - total_clipped_reward) / total_reward.max(f32::EPSILON);
     GAEOutput {
         returns,
         target_vals,
         advantages,
+        rew_clip_portion,
     }
 }

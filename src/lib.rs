@@ -92,6 +92,8 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub policy_layer_sizes: Vec<usize>,
     /// The layer sizes for the critic network.
     pub critic_layer_sizes: Vec<usize>,
+    /// Apply LayerNorm after every hidden linear layer.
+    pub use_layer_norm: bool,
     /// The maximum number of checkpoints to keep.
     /// If None, all checkpoints will be kept.
     pub checkpoints_limit: Option<usize>,
@@ -126,6 +128,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             render_device: B::Device::default(),
             policy_layer_sizes: vec![256; 2],
             critic_layer_sizes: vec![256; 2],
+            use_layer_norm: true,
             checkpoints_limit: None,
             timesteps_per_save: 1_000_000,
             num_threads: 8,
@@ -184,6 +187,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             self.policy_layer_sizes,
             self.critic_layer_sizes,
             &self.device,
+            self.use_layer_norm,
         );
 
         println!("# parameters in actor: {}", model.actor.num_params());

@@ -25,6 +25,32 @@ impl AvgTracker {
     }
 }
 
+impl From<f64> for AvgTracker {
+    fn from(val: f64) -> Self {
+        if val.is_nan() {
+            Self::default()
+        } else {
+            Self {
+                total: val,
+                count: 1,
+            }
+        }
+    }
+}
+
+impl From<f32> for AvgTracker {
+    fn from(val: f32) -> Self {
+        if val.is_nan() {
+            Self::default()
+        } else {
+            Self {
+                total: val as f64,
+                count: 1,
+            }
+        }
+    }
+}
+
 impl AddAssign<f64> for AvgTracker {
     fn add_assign(&mut self, val: f64) {
         if !val.is_nan() {

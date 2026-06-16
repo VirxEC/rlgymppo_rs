@@ -1,5 +1,5 @@
 use burn::{
-    nn::{Initializer, Linear, LinearConfig},
+    nn::{Initializer, LayerNormConfig, Linear, LinearConfig, norm::LayerNorm},
     prelude::*,
     tensor::activation::{relu, softmax},
 };
@@ -19,7 +19,10 @@ impl<B: Backend> PPOOutput<B> {
 
 #[derive(Module, Debug)]
 pub struct Net<B: Backend> {
-    layers: Vec<Linear<B>>,
+    linear_layers: Vec<Linear<B>>,
+    /// LayerNorm applied after each hidden linear layer (before activation).
+    /// Empty when layer normalization is disabled.
+    layer_norms: Vec<LayerNorm<B>>,
 }
 
 unsafe impl<B: Backend> Sync for Net<B> {}
@@ -30,43 +33,63 @@ impl<B: Backend> Net<B> {
         output_size: usize,
         layer_sizes: Vec<usize>,
         device: &B::Device,
+        add_layer_norm: bool,
     ) -> Self {
         assert_ne!(layer_sizes.len(), 0);
 
         let initializer = Initializer::XavierUniform { gain: 1.0 };
 
-        let mut layers = Vec::with_capacity(layer_sizes.len() + 2);
-        layers.push(
+        let mut linear_layers = Vec::with_capacity(layer_sizes.len() + 2);
+        let mut layer_norms = if add_layer_norm {
+            Vec::with_capacity(layer_sizes.len())
+        } else {
+            Vec::new()
+        };
+
+        linear_layers.push(
             LinearConfig::new(input_size, layer_sizes[0])
                 .with_initializer(initializer.clone())
                 .init(device),
         );
 
         for i in 1..layer_sizes.len() {
-            layers.push(
+            linear_layers.push(
                 LinearConfig::new(layer_sizes[i - 1], layer_sizes[i])
                     .with_initializer(initializer.clone())
                     .init(device),
             );
         }
 
-        layers.push(
+        linear_layers.push(
             LinearConfig::new(layer_sizes[layer_sizes.len() - 1], output_size)
                 .with_initializer(initializer.clone())
                 .init(device),
         );
 
-        Self { layers }
+        if add_layer_norm {
+            for &size in &layer_sizes {
+                layer_norms.push(LayerNormConfig::new(size).init(device));
+            }
+        }
+
+        Self {
+            linear_layers,
+            layer_norms,
+        }
     }
 
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         let mut output = input;
-        let num_layers = self.layers.len();
-        for layer in &self.layers[..num_layers - 1] {
-            output = relu(layer.forward(output));
+        let num_hidden = self.linear_layers.len() - 1;
+        for (i, layer) in self.linear_layers[..num_hidden].iter().enumerate() {
+            output = layer.forward(output);
+            if let Some(norm) = self.layer_norms.get(i) {
+                output = norm.forward(output);
+            }
+            output = relu(output);
         }
 
-        self.layers[num_layers - 1].forward(output)
+        self.linear_layers[num_hidden].forward(output)
     }
 
     /// `mask` is an optional [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
@@ -118,10 +141,17 @@ impl<B: Backend> Actic<B> {
         actor_layers: Vec<usize>,
         critic_layers: Vec<usize>,
         device: &B::Device,
+        add_layer_norm: bool,
     ) -> Self {
         Self {
-            actor: Net::new(input_size, output_size, actor_layers, device),
-            critic: Net::new(input_size, 1, critic_layers, device),
+            actor: Net::new(
+                input_size,
+                output_size,
+                actor_layers,
+                device,
+                add_layer_norm,
+            ),
+            critic: Net::new(input_size, 1, critic_layers, device, add_layer_norm),
         }
     }
 }

@@ -80,19 +80,22 @@ where
     pub fn run(&mut self, model: &Net<B>, num_steps: usize) -> (Memory, Report) {
         let mut memory = Memory::with_capacity(num_steps);
 
+        // Track which games were reset on the *last* iteration so we can detect
+        // batch-boundary truncation when the while loop exits.
+        let mut games_was_reset = vec![false; self.games.len()];
+
         while memory.len() < num_steps {
             let (actions, log_probs) = model.react(&self.next_obs, &self.next_masks, &self.device);
 
             let mut start_idx = self.next_obs.len();
             let masks = self.next_masks.drain(..).collect();
             memory.push_batch_part_1(self.next_obs.drain(..), masks, log_probs);
-
-            for game in self.games.iter_mut().rev() {
+            for (game_idx, game) in self.games.iter_mut().enumerate().rev() {
                 let end_idx = start_idx;
                 start_idx -= game.num_players();
                 let result = game.step(&actions[start_idx..end_idx]);
 
-                // Encode the terminal type: NONE / NORMAL / TRUNCATED (like C++ TerminalType).
+                // Encode the terminal type: NONE / NORMAL / TRUNCATED.
                 let terminal_type = if result.truncated {
                     TERMINAL_TRUNCATED
                 } else if result.is_terminal {
@@ -102,12 +105,15 @@ where
                 };
 
                 // Save the next observation before reset so the critic can bootstrap
-                // on truncated episodes (C++ GAE: `truncValPreds`).
+                // on truncated episodes.
                 let trunc_obs = result.truncated.then(|| result.obs.clone());
 
                 memory.push_batch_part_2(result.rewards, terminal_type);
 
-                if result.is_terminal || result.truncated {
+                let was_reset = result.is_terminal || result.truncated;
+                games_was_reset[game_idx] = was_reset;
+
+                if was_reset {
                     if let Some(ref obs) = trunc_obs {
                         memory.push_trunc_next_states(obs);
                     }
@@ -123,6 +129,31 @@ where
             memory.push_batch_part_3(actions);
             self.next_obs.reverse();
             self.next_masks.reverse();
+        }
+
+        // ── Batch-boundary truncation ────────────────────────────────────
+        // The while loop exited because memory is full, but some games are
+        // still mid-episode.  Their trajectories are forcibly truncated so that
+        // GAE gets a proper bootstrap value via `trunc_val_preds`.
+        if !memory.is_empty() && games_was_reset.iter().any(|r| !r) {
+            let mut term_idx = memory.len();
+            for (game_idx, game) in self.games.iter().enumerate().rev() {
+                let np = game.num_players();
+                term_idx -= np;
+                if games_was_reset[game_idx] {
+                    continue;
+                }
+                // Mark the last step of this game's trajectory as TRUNCATED.
+                for p in 0..np {
+                    memory.set_terminal_at(term_idx + p, TERMINAL_TRUNCATED);
+                }
+                // Store the current observation as the truncation next-state
+                // so the critic can bootstrap (-> `truncValPreds` in GAE).
+                // next_obs is in forward game order at this point (reversed above).
+                let start: usize = self.games[..game_idx].iter().map(|g| g.num_players()).sum();
+                let end = start + np;
+                memory.push_trunc_next_states(&self.next_obs[start..end]);
+            }
         }
 
         (memory, self.get_metrics())

@@ -41,6 +41,7 @@ use utils::{
     serde::{load_latest_model, save_model},
 };
 
+#[derive(Clone, Copy)]
 enum HumanInput {
     Save,
     Quit,
@@ -53,19 +54,23 @@ fn stdin_reader(s: Sender<HumanInput>) {
     while stdin().read_exact(&mut buffer).is_ok() {
         match char::from(buffer[0]).to_ascii_lowercase() {
             'q' => {
+                #[cfg(not(feature = "tui"))]
                 println!("Finishing iteration, saving, then exiting...");
                 s.send(HumanInput::Quit).unwrap();
                 return;
             }
             's' => {
+                #[cfg(not(feature = "tui"))]
                 println!("Saving model after this iteration...");
                 s.send(HumanInput::Save).unwrap();
             }
             'r' => {
+                #[cfg(not(feature = "tui"))]
                 println!("Renderer will be toggled after this iteration...");
                 s.send(HumanInput::ToggleRender).unwrap();
             }
             'd' => {
+                #[cfg(not(feature = "tui"))]
                 println!(
                     "Toggling deterministic mode for the rendered model after this iteration..."
                 );
@@ -286,9 +291,12 @@ impl<B: AutodiffBackend> Learner<B> {
     }
 
     fn print_controls_prompt() {
-        println!("Press Q to quit, S to quick save, R to toggle rendering,");
-        println!("and D to toggle deterministic mode for the renderer.");
-        println!("!!! Must be confirmed by pressing enter. !!!\n");
+        #[cfg(not(feature = "tui"))]
+        {
+            println!("Press Q to quit, S to quick save, R to toggle rendering,");
+            println!("and D to toggle deterministic mode for the renderer.");
+            println!("!!! Must be confirmed by pressing enter. !!!\n");
+        }
     }
 
     fn handle_input(&self, input: HumanInput) -> bool {
@@ -311,17 +319,22 @@ impl<B: AutodiffBackend> Learner<B> {
                 guard.render = render;
                 drop(guard);
 
+                #[cfg(not(feature = "tui"))]
                 if render {
                     println!("Starting renderer...");
-                    start_renderer.notify_all();
                 } else {
                     println!("Stopping renderer...");
+                }
+
+                if render {
+                    start_renderer.notify_all();
                 }
             }
             HumanInput::ToggleDeterministic => {
                 let (controls, _) = &*self.renderer_controls;
                 let mut guard = controls.lock();
                 guard.deterministic = !guard.deterministic;
+                #[cfg(not(feature = "tui"))]
                 println!("Rendering deterministic: {}", guard.deterministic);
                 drop(guard);
             }
@@ -339,11 +352,13 @@ impl<B: AutodiffBackend> Learner<B> {
              Enable the 'wandb' feature in Cargo.toml to use Weights & Biases logging."
         );
 
-        // Initialise the wandb MetricSender via embedded Python, then
-        // move it to a dedicated thread so Python GIL / HTTP latency never
-        // blocks the training loop.
+        // Initialise the wandb MetricSender via embedded Python before
+        // the TUI so the "wandb run started" message goes to stdout
+        // before the alternate screen takes over.
         #[cfg(feature = "wandb")]
-        let (wandb_tx, wandb_handle) = if let Some(project_name) = self.wandb_project_name.as_ref()
+        #[cfg_attr(not(all(feature = "tui", feature = "wandb")), allow(dead_code))]
+        let (wandb_tx, wandb_handle, wandb_run_id) = if let Some(project_name) =
+            self.wandb_project_name.as_ref()
         {
             let group = self.wandb_group_name.as_deref().unwrap_or("unnamed-runs");
             let name = self.wandb_run_name.as_deref().unwrap_or("rlgymppo-run");
@@ -357,10 +372,10 @@ impl<B: AutodiffBackend> Learner<B> {
             match rlgymppo_wandb::MetricSender::new(project_name, group, name, run_id) {
                 Ok(sender) => {
                     // Persist the run ID for resume on restart.
-                    self.stats.wandb_run = Some(crate::utils::running_stat::WandbRun {
-                        run_id: sender.run_id().to_owned(),
-                    });
-                    println!(" > wandb run started with ID: \"{}\"", sender.run_id());
+                    let id = sender.run_id().to_owned();
+                    self.stats.wandb_run =
+                        Some(crate::utils::running_stat::WandbRun { run_id: id.clone() });
+                    println!(" > wandb run started with ID: \"{id}\"");
 
                     let (tx, rx) =
                         std::sync::mpsc::sync_channel::<std::collections::HashMap<String, f64>>(1);
@@ -368,7 +383,7 @@ impl<B: AutodiffBackend> Learner<B> {
                         .name("wandb".into())
                         .spawn(move || {
                             // `sender` moves into this thread; dropped
-                            // when the channel closes → calls finish().
+                            // when the channel closes -> calls finish().
                             while let Ok(metrics) = rx.recv() {
                                 if let Err(e) = sender.send(&metrics) {
                                     eprintln!("Warning: wandb send failed: {e}");
@@ -376,19 +391,41 @@ impl<B: AutodiffBackend> Learner<B> {
                             }
                         })
                         .expect("Failed to spawn wandb-sender thread");
-                    (Some(tx), Some(handle))
+                    (Some(tx), Some(handle), Some(id))
                 }
                 Err(e) => {
                     eprintln!(
-                        "Warning: Failed to initialise wandb MetricSender: {e}\
+                        "Warning: Failed to initialise wandb MetricSender: {e}\n\
                              Metrics will not be logged to wandb."
                     );
-                    (None, None)
+                    (None, None, None)
                 }
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
+        #[cfg(not(feature = "wandb"))]
+        #[allow(dead_code)]
+        let wandb_run_id: Option<String> = None;
+
+        // Initialise the TUI display (ratatui-based terminal dashboard).
+        #[cfg(feature = "tui")]
+        let mut tui_display = match rlgymppo_tui::TuiDisplay::new() {
+            Ok(tui) => Some(tui),
+            Err(e) => {
+                eprintln!("Warning: Failed to initialise TUI display: {e}",);
+                eprintln!("Falling back to plain-text iteration logs.");
+                None
+            }
+        };
+
+        // Show the wandb run ID in the TUI now that it's active.
+        #[cfg(all(feature = "tui", feature = "wandb"))]
+        if let Some(ref mut tui) = tui_display
+            && let Some(ref id) = wandb_run_id
+        {
+            tui.notify(format!("Wandb run started: {id}"));
+        }
 
         let (s, r) = channel();
 
@@ -396,6 +433,7 @@ impl<B: AutodiffBackend> Learner<B> {
             stdin_reader(s);
         });
 
+        #[cfg(not(feature = "tui"))]
         println!("Running for the first time. This might be slow at first...");
         Self::print_controls_prompt();
 
@@ -467,15 +505,48 @@ impl<B: AutodiffBackend> Learner<B> {
                 let _ = tx.try_send(flat);
             }
 
+            // ── Update TUI dashboard (or fall back to plain print) ─
+            #[cfg(feature = "tui")]
+            if let Some(ref mut tui) = tui_display {
+                let flat = metrics.to_flat_map();
+                if let Err(e) = tui.update(&flat) {
+                    eprintln!("Warning: TUI display update failed: {e}");
+                }
+            }
+
+            #[cfg(not(feature = "tui"))]
             println!("{metrics}");
 
             for input in r.try_iter() {
+                #[cfg(feature = "tui")]
+                let was_save = matches!(input, HumanInput::Save);
+                #[cfg(feature = "tui")]
+                let was_toggle_render = matches!(input, HumanInput::ToggleRender);
+                #[cfg(feature = "tui")]
+                let was_toggle_det = matches!(input, HumanInput::ToggleDeterministic);
+
                 if !self.handle_input(input) {
                     break 'train;
+                }
+
+                #[cfg(feature = "tui")]
+                if let Some(ref mut tui) = tui_display {
+                    if was_save {
+                        tui.notify("Saved model.");
+                    } else if was_toggle_render {
+                        tui.notify("Renderer toggled.");
+                    } else if was_toggle_det {
+                        tui.notify("Deterministic mode toggled.");
+                    }
                 }
             }
 
             if self.stats.cumulative_timesteps - self.last_save_timestep > self.timesteps_per_save {
+                #[cfg(feature = "tui")]
+                if let Some(ref mut tui) = tui_display {
+                    tui.notify("Auto-saving model...");
+                }
+
                 save_model(
                     self.model.valid(),
                     &self.stats,
@@ -505,6 +576,14 @@ impl<B: AutodiffBackend> Learner<B> {
             &self.checkpoints_folder,
             self.checkpoints_limit,
         );
+
+        // Close the TUI display (restores normal terminal).
+        #[cfg(feature = "tui")]
+        if let Some(mut tui) = tui_display
+            && let Err(e) = tui.close()
+        {
+            eprintln!("Warning: TUI display close failed: {e}");
+        }
 
         // Close the wandb channel so the background thread exits, which
         // drops the MetricSender and calls `wandb.finish()`.

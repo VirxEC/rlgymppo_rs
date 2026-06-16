@@ -1,5 +1,5 @@
 [workspace]
-members = ["rlgymppo-wandb"]
+members = ["rlgymppo-wandb", "rlgymppo-tui"]
 resolver = "2"
 
 [package]
@@ -24,12 +24,14 @@ rlgym = {
   branch = "native-rust"
 }
 rlgymppo-wandb = { path = "rlgymppo-wandb", optional = true }
+rlgymppo-tui = { path = "rlgymppo-tui", optional = true }
 serde = { version = "1.0.208", features = ["derive"] }
 toml = { version = "1.1.2", features = ["preserve_order"] }
 
 [features]
 default = []
 wandb = ["dep:rlgymppo-wandb"]
+tui = ["dep:rlgymppo-tui"]
 
 # performance
 fusion = ["burn/fusion"]

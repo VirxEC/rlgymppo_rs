@@ -21,7 +21,7 @@ use agent::{Ppo, model::Actic};
 use base::TerminalState;
 pub use burn::backend;
 use burn::{
-    module::{AutodiffModule, Module},
+    module::{AutodiffModule, Module, Quantizer},
     tensor::backend::AutodiffBackend,
 };
 use environment::{
@@ -89,6 +89,7 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// The device to use for training.
     /// Will default to the default device from the given backend.
     pub device: B::Device,
+    pub quantizer: Option<Quantizer>,
     /// The device to use for rendering.
     /// Will default to the default device from the given backend.
     pub render_device: B::Device,
@@ -137,6 +138,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             ppo: PpoLearnerConfig::default(),
             checkpoints_folder: PathBuf::from("checkpoints"),
             device: B::Device::default(),
+            quantizer: None,
             render_device: B::Device::default(),
             policy_layer_sizes: vec![256; 3],
             critic_layer_sizes: vec![256; 3],
@@ -239,6 +241,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             rng: SmallRng::from_rng(&mut rng()),
             stats: Stats::default(),
             device: self.device,
+            quantizer: self.quantizer,
             model,
             wandb_project_name: self.wandb_project_name,
             wandb_group_name: self.wandb_group_name,
@@ -269,6 +272,7 @@ where
     rng: SmallRng,
     stats: Stats,
     device: B::Device,
+    quantizer: Option<Quantizer>,
     model: Actic<B>,
     wandb_project_name: Option<String>,
     #[cfg_attr(not(feature = "wandb"), allow(dead_code))]
@@ -462,7 +466,10 @@ where
         {
             let collect_start = Instant::now();
 
-            let nodiff_model = self.model.valid();
+            let mut nodiff_model = self.model.valid();
+            if let Some(quantizer) = &mut self.quantizer {
+                nodiff_model = nodiff_model.quantize_weights(quantizer);
+            }
 
             // update the model the renderer is using
             {

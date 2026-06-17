@@ -138,14 +138,14 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             checkpoints_folder: PathBuf::from("checkpoints"),
             device: B::Device::default(),
             render_device: B::Device::default(),
-            policy_layer_sizes: vec![256; 2],
-            critic_layer_sizes: vec![256; 2],
+            policy_layer_sizes: vec![256; 3],
+            critic_layer_sizes: vec![256; 3],
             use_layer_norm: true,
             shared_head_layer_sizes: vec![256],
             checkpoints_limit: None,
             timesteps_per_save: 1_000_000,
-            num_threads: 8,
-            num_games_per_thread: 256,
+            num_threads: 4,
+            num_games_per_thread: 64,
 
             num_additional_iterations: None,
             render: false,
@@ -301,6 +301,9 @@ where
     pub fn load(&mut self) {
         (self.model, self.stats) =
             load_latest_model(self.model.clone(), &self.checkpoints_folder, &self.device);
+
+        // Align save timer so we don't immediately re-save the loaded checkpoint.
+        self.last_save_timestep = self.stats.cumulative_timesteps;
 
         if let Some(latest_folder) = latest_checkpoint_folder(&self.checkpoints_folder) {
             self.ppo.load_optimizers(&latest_folder);

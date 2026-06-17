@@ -8,7 +8,7 @@ use burn::{
     nn::loss::{MseLoss, Reduction},
     optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
     prelude::*,
-    record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder},
+    record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError},
     tensor::{backend::AutodiffBackend, cast::ToElement},
 };
 use rand::{Rng, seq::SliceRandom};
@@ -88,23 +88,31 @@ impl<B: AutodiffBackend> Ppo<B> {
         #[cfg(not(feature = "tui"))]
         println!("Loading optimizer states...");
 
-        let policy_path = folder.join("policy_optimizer");
-        if policy_path.exists() {
-            let record = recorder.load(policy_path, &self.device).unwrap();
-            self.policy_optimizer = self.policy_optimizer.clone().load_record(record);
-        }
+        let try_load_optim = |name: &str,
+                              target: &mut OptimizerAdaptor<Adam, Net<B>, B>|
+         -> Result<(), RecorderError> {
+            let record = recorder.load(folder.join(name), &self.device)?;
+            *target = target.clone().load_record(record);
+            Ok(())
+        };
 
-        let value_path = folder.join("value_optimizer");
-        if value_path.exists() {
-            let record = recorder.load(value_path, &self.device).unwrap();
-            self.value_optimizer = self.value_optimizer.clone().load_record(record);
-        }
-
-        let head_path = folder.join("shared_head_optimizer");
-        if head_path.exists() {
-            let record = recorder.load(head_path, &self.device).unwrap();
-            self.shared_head_optimizer = self.shared_head_optimizer.clone().load_record(record);
-        }
+        let _ =
+            try_load_optim("policy_optimizer", &mut self.policy_optimizer).inspect_err(
+                |e| match e {
+                    RecorderError::FileNotFound(_) => {}
+                    e => panic!("Failed to load policy optimizer: {e}"),
+                },
+            );
+        let _ =
+            try_load_optim("value_optimizer", &mut self.value_optimizer).inspect_err(|e| match e {
+                RecorderError::FileNotFound(_) => {}
+                e => panic!("Failed to load value optimizer: {e}"),
+            });
+        let _ = try_load_optim("shared_head_optimizer", &mut self.shared_head_optimizer)
+            .inspect_err(|e| match e {
+                RecorderError::FileNotFound(_) => {}
+                e => panic!("Failed to load shared-head optimizer: {e}"),
+            });
 
         #[cfg(not(feature = "tui"))]
         println!("Loaded optimizer states from: {folder:?}");

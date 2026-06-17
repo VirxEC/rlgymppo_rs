@@ -25,20 +25,17 @@ serde = { version = "1.0.208", features = ["derive"] }
 toml = { version = "1.1.2", features = ["preserve_order"] }
 
 [features]
-default = []
+default = ["wandb", "tui"]
 wandb = ["dep:rlgymppo-wandb"]
 tui = ["dep:rlgymppo-tui"]
 
-# performance
 fusion = ["burn/fusion"]
 
-# multi-device
-router = ["burn/router"]
-
+# backends
 candle = ["burn/candle"]
 cuda = ["burn/cuda"]
-# backends
-ndarray = ["burn/ndarray"]
+metal = ["burn/metal"]
+flex = ["burn/flex"]
 rocm = ["burn/rocm"]
 torch = ["burn/tch"]
 wgpu = ["burn/wgpu"]

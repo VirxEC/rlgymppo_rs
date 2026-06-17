@@ -146,11 +146,9 @@ pub fn load_model<B: Backend, P: AsRef<Path>>(
         .unwrap();
     let shared_head = model.shared_head.map(|head| {
         let head_path = path.join("shared_head");
-        if head_path.exists() {
-            head.load_file(head_path, &recorder, device).unwrap()
-        } else {
-            head
-        }
+        head.clone()
+            .load_file(head_path, &recorder, device)
+            .unwrap_or(head)
     });
 
     let toml_str = fs::read_to_string(path.join("stats.toml")).unwrap();

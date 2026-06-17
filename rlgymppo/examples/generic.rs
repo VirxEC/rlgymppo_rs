@@ -192,8 +192,8 @@ impl Obs<SharedInfo> for MyObs {
     }
 }
 
-const MIN_GAME_DURATION: u64 = 30 * 120; // 30 seconds in ticks
-const MAX_GAME_DURATION: u64 = 2 * 60 * 120; // 2 minutes in ticks
+const MIN_GAME_DURATION: u64 = 60 * 120; // 1 minute in ticks
+const MAX_GAME_DURATION: u64 = 3 * 60 * 120; // 3 minutes in ticks
 type GameEndCond = RandomGameEndedCondition<MIN_GAME_DURATION, MAX_GAME_DURATION, SharedInfo>;
 
 const MAX_NO_TOUCH_DURATION: u64 = 30 * 120; // 30 seconds in ticks

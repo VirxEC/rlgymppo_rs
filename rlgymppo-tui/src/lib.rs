@@ -328,6 +328,8 @@ fn format_num(val: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::f64::consts::PI;
+
     use super::*;
 
     #[test]
@@ -339,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_format_num_float() {
-        assert_eq!(format_num(3.14159), "3.1416");
+        assert_eq!(format_num(PI), "3.1416");
         assert_eq!(format_num(0.00123), "0.0012");
     }
 

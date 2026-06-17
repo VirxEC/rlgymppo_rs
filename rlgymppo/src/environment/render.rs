@@ -8,11 +8,11 @@ use burn::prelude::*;
 use parking_lot::{Condvar, Mutex};
 use rlgym::{
     Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
-    rocketsim::{ArenaState, consts},
+    rocketsim::consts,
 };
 
-use super::sim::GameInstance;
-use crate::{agent::model::Actic, utils::Report};
+use super::sim::{GameInstance, RewardSamplingConfig};
+use crate::{agent::model::Actic, utils::shared_info::SharedInfoReport};
 
 pub struct RendererControls<B: Backend> {
     pub model: Option<Actic<B>>,
@@ -32,9 +32,8 @@ impl<B: Backend> RendererControls<B> {
     }
 }
 
-pub struct Renderer<B: Backend, C, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+pub struct Renderer<B: Backend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    C: Fn(&mut Report, &mut SI, &ArenaState),
     SS: StateSetter<SI>,
     SI: SharedInfoProvider,
     OBS: Obs<SI>,
@@ -43,18 +42,17 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    game: GameInstance<C, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+    game: GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
     last_obs: Vec<Vec<f32>>,
     controller: Arc<(Mutex<RendererControls<B>>, Condvar)>,
     device: B::Device,
 }
 
-impl<B, C, SS, OBS, ACT, REW, TERM, TRUNC, SI> Renderer<B, C, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<B, SS, OBS, ACT, REW, TERM, TRUNC, SI> Renderer<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     B: Backend,
-    C: Fn(&mut Report, &mut SI, &ArenaState) + Clone,
     SS: StateSetter<SI>,
-    SI: SharedInfoProvider,
+    SI: SharedInfoProvider + SharedInfoReport,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
     REW: Reward<SI>,
@@ -63,11 +61,17 @@ where
 {
     pub fn new(
         env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
-        step_callback: C,
         controller: Arc<(Mutex<RendererControls<B>>, Condvar)>,
         device: B::Device,
     ) -> Self {
-        let mut game = GameInstance::new(env, step_callback.clone());
+        // The renderer doesn't track training metrics, so disable reward sampling.
+        let mut game = GameInstance::new(
+            env,
+            RewardSamplingConfig {
+                add_rewards_to_metrics: false,
+                ..Default::default()
+            },
+        );
         let (last_obs, _last_masks) = game.reset();
 
         Self {

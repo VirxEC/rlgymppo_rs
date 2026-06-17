@@ -24,6 +24,18 @@ pub struct PpoLearnerConfig {
     /// Extend the last batch to use all remaining experience when it's less than
     /// 2x the batch size.
     pub overbatching: bool,
+
+    // ── Reward metrics sampling ─────────────────────────────────────
+    /// Whether to include per-component reward metrics in the report.
+    /// Reward components whose name starts with `"Reward/"` are tracked.
+    pub add_rewards_to_metrics: bool,
+    /// Sample reward metrics once every N steps (1 = every step).
+    /// Set to 0 to disable sampling (track every step).
+    pub reward_sample_interval: usize,
+    /// Maximum number of random reward-component samples to include
+    /// per metric report step (unused in the current Rust impl, kept
+    /// for API compatibility with GigaLearn).
+    pub max_reward_samples: usize,
 }
 
 impl Default for PpoLearnerConfig {
@@ -42,6 +54,9 @@ impl Default for PpoLearnerConfig {
             mini_batch_size: 20_000,
             overbatching: true,
             clip_grad: Some(GradientClippingConfig::Norm(0.5)),
+            add_rewards_to_metrics: true,
+            reward_sample_interval: 8,
+            max_reward_samples: 50,
         }
     }
 }

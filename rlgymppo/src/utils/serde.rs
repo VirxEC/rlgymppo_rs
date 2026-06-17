@@ -1,23 +1,25 @@
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use burn::{
     prelude::*,
     record::{FullPrecisionSettings, NamedMpkGzFileRecorder},
+    tensor::backend::AutodiffBackend,
 };
 
 use super::running_stat::Stats;
-use crate::agent::model::Actic;
+use crate::agent::{Ppo, model::Actic};
 
+/// Save a model checkpoint (model weights + training stats).
 pub fn save_model<B: Backend, P: AsRef<Path>>(
     model: Actic<B>,
     running_stats: &Stats,
     base_folder: P,
     limit: Option<usize>,
-) {
+) -> PathBuf {
     #[cfg(not(feature = "tui"))]
     println!("Saving model...");
 
@@ -56,7 +58,7 @@ pub fn save_model<B: Backend, P: AsRef<Path>>(
         let Ok(folders) = save_folder.parent().unwrap().read_dir() else {
             #[cfg(not(feature = "tui"))]
             println!("Failed to read directory: {save_folder:?}");
-            return;
+            return save_folder;
         };
 
         let mut folders: Vec<_> = folders
@@ -64,7 +66,7 @@ pub fn save_model<B: Backend, P: AsRef<Path>>(
             .filter(|entry| entry.path().is_dir())
             .collect();
         if folders.len() <= limit {
-            return;
+            return save_folder;
         }
 
         folders.sort_by_key(|entry| entry.file_name());
@@ -77,6 +79,35 @@ pub fn save_model<B: Backend, P: AsRef<Path>>(
             println!("Removed old model folder: {oldest:?}");
         }
     }
+
+    save_folder
+}
+
+/// Save a full checkpoint: model weights, training stats, and optimizer states.
+/// The model may use the inner backend (without gradients) while the Ppo
+/// uses the autodiff backend.
+pub fn save_checkpoint<BAutodiff: AutodiffBackend, P: AsRef<Path>>(
+    model: Actic<BAutodiff::InnerBackend>,
+    ppo: &Ppo<BAutodiff>,
+    running_stats: &Stats,
+    base_folder: P,
+    limit: Option<usize>,
+) -> PathBuf {
+    let folder = save_model(model, running_stats, &base_folder, limit);
+    ppo.save_optimizers(&folder);
+    folder
+}
+
+/// Find the latest checkpoint folder by timestamp.
+pub fn latest_checkpoint_folder(base_folder: &Path) -> Option<PathBuf> {
+    let Ok(folders) = base_folder.read_dir() else {
+        return None;
+    };
+
+    folders
+        .filter_map(|entry| entry.ok())
+        .max_by_key(|entry| entry.file_name().to_str().unwrap().parse::<u64>().ok())
+        .map(|entry| entry.path())
 }
 
 pub fn load_latest_model<B: Backend, P: AsRef<Path>>(
@@ -85,22 +116,13 @@ pub fn load_latest_model<B: Backend, P: AsRef<Path>>(
     device: &B::Device,
 ) -> (Actic<B>, Stats) {
     let base_folder = base_folder.as_ref();
-    let Ok(folders) = base_folder.read_dir() else {
-        #[cfg(not(feature = "tui"))]
-        println!("Failed to read directory: {:?}", base_folder.display());
-        return (model, Stats::default());
-    };
-
-    let Some(latest_folder) = folders
-        .filter_map(|entry| entry.ok())
-        .max_by_key(|entry| entry.file_name().to_str().unwrap().parse::<u64>().ok())
-    else {
+    let Some(latest_folder) = latest_checkpoint_folder(base_folder) else {
         #[cfg(not(feature = "tui"))]
         println!("No valid folders found in: {:?}", base_folder.display());
         return (model, Stats::default());
     };
 
-    load_model(model, latest_folder.path(), device)
+    load_model(model, latest_folder, device)
 }
 
 pub fn load_model<B: Backend, P: AsRef<Path>>(

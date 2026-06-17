@@ -18,7 +18,7 @@ use std::{
 
 pub use agent::config::PpoLearnerConfig;
 use agent::{Ppo, model::Actic};
-use base::TERMINAL_NORMAL;
+use base::TerminalState;
 pub use burn::backend;
 use burn::{
     module::{AutodiffModule, Module},
@@ -26,19 +26,17 @@ use burn::{
 };
 use environment::{
     render::{Renderer, RendererControls},
+    sim::RewardSamplingConfig,
     thread_sim::ThreadSim,
 };
 use parking_lot::{Condvar, Mutex};
 use rand::{SeedableRng, rng, rngs::SmallRng};
 pub use rlgym::{self, rocketsim};
-use rlgym::{
-    Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
-    rocketsim::ArenaState,
-};
+use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 use utils::{
-    Report,
     running_stat::Stats,
-    serde::{load_latest_model, save_model},
+    serde::{latest_checkpoint_folder, load_latest_model, save_checkpoint},
+    shared_info::SharedInfoReport,
 };
 
 #[derive(Clone, Copy)]
@@ -159,16 +157,14 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
 }
 
 impl<B: AutodiffBackend> LearnerConfig<B> {
-    pub fn init<F, C, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+    pub fn init<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         self,
         create_env: F,
-        step_callback: C,
-    ) -> Learner<B>
+    ) -> Learner<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
-        C: Fn(&mut Report, &mut SI, &ArenaState) + Clone + Send + 'static,
         SS: StateSetter<SI>,
-        SI: SharedInfoProvider,
+        SI: SharedInfoProvider + SharedInfoReport,
         OBS: Obs<SI>,
         ACT: Action<SI, Input = usize>,
         REW: Reward<SI>,
@@ -216,28 +212,26 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
 
         let renderer = {
             let create_env = create_env.clone();
-            let step_callback = step_callback.clone();
             let renderer_controls = renderer_controls.clone();
 
             thread::spawn(move || {
-                Renderer::new(
-                    (create_env)(None),
-                    step_callback,
-                    renderer_controls,
-                    self.render_device,
-                )
-                .run();
+                Renderer::new((create_env)(None), renderer_controls, self.render_device).run();
             })
+        };
+
+        let reward_sampling = RewardSamplingConfig {
+            add_rewards_to_metrics: self.ppo.add_rewards_to_metrics,
+            reward_sample_interval: self.ppo.reward_sample_interval,
+            max_reward_samples: self.ppo.max_reward_samples,
         };
 
         let thread_sim = ThreadSim::new(
             create_env,
-            step_callback,
             self.ppo.batch_size,
-            self.ppo.overbatching,
             self.num_threads,
             self.num_games_per_thread,
             self.device.clone(),
+            reward_sampling,
         );
 
         Learner {
@@ -261,7 +255,16 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     }
 }
 
-pub struct Learner<B: AutodiffBackend> {
+pub struct Learner<B: AutodiffBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+where
+    SS: StateSetter<SI>,
+    SI: SharedInfoProvider,
+    OBS: Obs<SI>,
+    ACT: Action<SI, Input = usize>,
+    REW: Reward<SI>,
+    TERM: Terminal<SI>,
+    TRUNC: Truncate<SI>,
+{
     ppo: Ppo<B>,
     rng: SmallRng,
     stats: Stats,
@@ -279,15 +282,29 @@ pub struct Learner<B: AutodiffBackend> {
     num_additional_iterations: Option<u64>,
     renderer_controls: Arc<(Mutex<RendererControls<B::InnerBackend>>, Condvar)>,
     renderer: JoinHandle<()>,
-    collector: ThreadSim<B::InnerBackend>,
+    collector: ThreadSim<B::InnerBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
 }
 
-impl<B: AutodiffBackend> Learner<B> {
-    /// Load the previously saved model.
+impl<B: AutodiffBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+    Learner<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+where
+    SS: StateSetter<SI>,
+    SI: SharedInfoProvider + SharedInfoReport,
+    OBS: Obs<SI>,
+    ACT: Action<SI, Input = usize>,
+    REW: Reward<SI>,
+    TERM: Terminal<SI>,
+    TRUNC: Truncate<SI>,
+{
+    /// Load the previously saved model, training stats, and optimizer state.
     /// Does nothing if the model can't be loaded, this is safe to call unconditionally.
     pub fn load(&mut self) {
         (self.model, self.stats) =
             load_latest_model(self.model.clone(), &self.checkpoints_folder, &self.device);
+
+        if let Some(latest_folder) = latest_checkpoint_folder(&self.checkpoints_folder) {
+            self.ppo.load_optimizers(&latest_folder);
+        }
     }
 
     fn print_controls_prompt() {
@@ -299,14 +316,15 @@ impl<B: AutodiffBackend> Learner<B> {
         }
     }
 
-    fn handle_input(&self, input: HumanInput) -> bool {
+    fn handle_input(&mut self, input: HumanInput) -> bool {
         match input {
             HumanInput::Quit => {
                 return false;
             }
             HumanInput::Save => {
-                save_model(
+                save_checkpoint(
                     self.model.valid(),
+                    &self.ppo,
                     &self.stats,
                     &self.checkpoints_folder,
                     self.checkpoints_limit,
@@ -404,9 +422,6 @@ impl<B: AutodiffBackend> Learner<B> {
         } else {
             (None, None, None)
         };
-        #[cfg(not(feature = "wandb"))]
-        #[allow(dead_code)]
-        let wandb_run_id: Option<String> = None;
 
         // Initialise the TUI display (ratatui-based terminal dashboard).
         #[cfg(feature = "tui")]
@@ -477,7 +492,7 @@ impl<B: AutodiffBackend> Learner<B> {
 
             // Episode length = total_steps / number of NORMAL terminals.
             let n_term = (0..memory.len())
-                .filter(|&i| memory.terminals()[i] == TERMINAL_NORMAL)
+                .filter(|&i| memory.terminals()[i] == TerminalState::Normal)
                 .count();
             let ep_len = if n_term > 0 {
                 memory.len() as f64 / n_term as f64
@@ -547,8 +562,9 @@ impl<B: AutodiffBackend> Learner<B> {
                     tui.notify("Auto-saving model...");
                 }
 
-                save_model(
+                save_checkpoint(
                     self.model.valid(),
+                    &self.ppo,
                     &self.stats,
                     &self.checkpoints_folder,
                     self.checkpoints_limit,
@@ -570,8 +586,9 @@ impl<B: AutodiffBackend> Learner<B> {
             start_renderer.notify_all();
         }
 
-        save_model(
-            self.model,
+        save_checkpoint(
+            self.model.valid(),
+            &self.ppo,
             &self.stats,
             &self.checkpoints_folder,
             self.checkpoints_limit,
@@ -596,14 +613,14 @@ impl<B: AutodiffBackend> Learner<B> {
         }
 
         println!("Waiting for threads to exit...");
-        self.renderer.join().unwrap();
         self.collector.join();
+        self.renderer.join().unwrap();
 
         println!("Done.")
     }
 
     /// Only run the renderer. Useful for debugging.
-    pub fn render(self) {
+    pub fn render(mut self) {
         let (s, r) = channel();
 
         thread::spawn(move || {
@@ -641,8 +658,9 @@ impl<B: AutodiffBackend> Learner<B> {
             start_renderer.notify_all();
         }
 
-        save_model(
-            self.model,
+        save_checkpoint(
+            self.model.valid(),
+            &self.ppo,
             &self.stats,
             &self.checkpoints_folder,
             self.checkpoints_limit,
@@ -650,7 +668,6 @@ impl<B: AutodiffBackend> Learner<B> {
 
         println!("Waiting for threads to exit...");
         self.renderer.join().unwrap();
-        self.collector.join();
 
         println!("Done.")
     }

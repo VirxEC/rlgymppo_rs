@@ -1,7 +1,7 @@
 use arrayvec::ArrayVec;
 use rlgym::{
-    Action,
-    rocketsim::{ArenaState, CarControls, CarState},
+    Action, GameState,
+    rocketsim::{CarControls, CarState},
 };
 
 /// Generates a discrete action space table with 90 actions:
@@ -194,12 +194,12 @@ impl<const MAX_NUM_AGENTS: usize, SI> Action<SI> for DefaultAction<MAX_NUM_AGENT
         self.actions_table.len()
     }
 
-    fn reset(&mut self, _initial_state: &ArenaState, _shared_info: &mut SI) {}
+    fn reset(&mut self, _initial_state: &GameState, _shared_info: &mut SI) {}
 
     fn parse_actions<'a>(
         &'a mut self,
         actions: &[usize],
-        state: &ArenaState,
+        state: &GameState,
         _shared_info: &'a mut SI,
     ) -> &'a [(usize, CarControls)] {
         self.action_buffer.clear();
@@ -212,7 +212,7 @@ impl<const MAX_NUM_AGENTS: usize, SI> Action<SI> for DefaultAction<MAX_NUM_AGENT
         &self.action_buffer[..state.cars.len()]
     }
 
-    fn get_action_masks(&mut self, state: &ArenaState, _shared_info: &mut SI) -> Vec<Vec<bool>> {
+    fn get_action_masks(&mut self, state: &GameState, _shared_info: &mut SI) -> Vec<Vec<bool>> {
         state
             .cars
             .iter()

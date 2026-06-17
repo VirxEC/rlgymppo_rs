@@ -1,13 +1,14 @@
-use std::iter;
-
 use burn::prelude::*;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 
 /// Terminal-state encoding.
-pub type TerminalState = u8;
-pub const TERMINAL_NONE: TerminalState = 0;
-pub const TERMINAL_NORMAL: TerminalState = 1;
-pub const TERMINAL_TRUNCATED: TerminalState = 2;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalState {
+    #[default]
+    None,
+    Normal,
+    Truncated,
+}
 
 pub fn get_batch_1d<T: Copy>(data: &AllocRingBuffer<T>, indices: &[usize]) -> Vec<T> {
     indices.iter().map(|i| data[*i]).collect::<Vec<_>>()
@@ -117,40 +118,36 @@ impl Memory {
         }
     }
 
-    pub fn push_batch_part_1(
+    /// Push a complete per-player trajectory.
+    /// All vectors must have the same length.
+    /// `trunc_next_state` is `Some` only when the last terminal is `TERMINAL_TRUNCATED`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_player(
         &mut self,
-        states: std::vec::Drain<Vec<f32>>,
-        masks: Vec<Vec<bool>>,
+        states: Vec<Vec<f32>>,
+        actions: Vec<usize>,
         log_probs: Vec<f32>,
+        rewards: Vec<f32>,
+        terminals: Vec<TerminalState>,
+        action_masks: Vec<Vec<bool>>,
+        trunc_next_state: Option<Vec<f32>>,
     ) {
-        debug_assert_eq!(states.len(), log_probs.len());
-        debug_assert_eq!(states.len(), masks.len());
+        let n = states.len();
+        debug_assert_eq!(n, actions.len());
+        debug_assert_eq!(n, log_probs.len());
+        debug_assert_eq!(n, rewards.len());
+        debug_assert_eq!(n, terminals.len());
+        debug_assert_eq!(n, action_masks.len());
 
         self.states.extend(states);
-        self.action_masks.extend(masks);
-        self.log_probs.extend(log_probs);
-
-        debug_assert_eq!(self.states.len(), self.log_probs.len());
-        debug_assert_eq!(self.states.len(), self.action_masks.len());
-    }
-
-    pub fn push_batch_part_2(&mut self, rewards: Vec<f32>, terminal: TerminalState) {
-        let n = rewards.len();
-        debug_assert_eq!(n, rewards.len());
-
-        self.rewards.extend(rewards);
-        self.terminals.extend(iter::repeat_n(terminal, n));
-    }
-
-    /// Store the next-state observations for a truncated step, one per player.
-    pub fn push_trunc_next_states(&mut self, states: &[Vec<f32>]) {
-        self.trunc_next_states.extend(states.iter().cloned());
-    }
-
-    pub fn push_batch_part_3(&mut self, actions: Vec<usize>) {
         self.actions.extend(actions);
-        debug_assert_eq!(self.states.len(), self.actions.len());
-        debug_assert_eq!(self.states.len(), self.rewards.len());
+        self.log_probs.extend(log_probs);
+        self.rewards.extend(rewards);
+        self.terminals.extend(terminals);
+        self.action_masks.extend(action_masks);
+        if let Some(ns) = trunc_next_state {
+            self.trunc_next_states.enqueue(ns);
+        }
     }
 
     pub fn merge(&mut self, other: Memory) {
@@ -181,11 +178,6 @@ impl Memory {
 
     pub fn terminals(&self) -> &AllocRingBuffer<TerminalState> {
         &self.terminals
-    }
-
-    /// Mutate the terminal type at a specific index (used for batch-boundary truncation).
-    pub fn set_terminal_at(&mut self, idx: usize, terminal: TerminalState) {
-        self.terminals[idx] = terminal;
     }
 
     pub fn trunc_next_states(&self) -> &AllocRingBuffer<Vec<f32>> {

@@ -166,6 +166,11 @@ impl Report {
     pub fn clear(&mut self) {
         self.data.clear();
     }
+
+    /// Remove all entries whose key starts with the given prefix.
+    pub fn remove_keys_with_prefix(&mut self, prefix: &str) {
+        self.data.retain(|key, _| !key.starts_with(prefix));
+    }
 }
 
 impl Index<String> for Report {

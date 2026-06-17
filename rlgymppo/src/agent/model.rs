@@ -45,7 +45,10 @@ impl<B: Backend> Net<B> {
     ) -> Self {
         assert_ne!(layer_sizes.len(), 0);
 
-        let initializer = Initializer::XavierUniform { gain: 1.0 };
+        let initializer = Initializer::KaimingUniform {
+            gain: 1.0 / 3.0f64.sqrt(),
+            fan_out_only: false,
+        };
 
         let num_linears = layer_sizes.len() + if add_output_layer { 1 } else { 0 };
         let mut linear_layers = Vec::with_capacity(num_linears);

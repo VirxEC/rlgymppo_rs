@@ -1,4 +1,8 @@
 pub mod actions;
+pub mod rewards;
+pub mod shared_info;
+pub mod state_setters;
+pub mod terminal;
 
 mod avg_tracker;
 mod report;
@@ -48,17 +52,17 @@ pub(crate) fn sample_actions<B: Backend>(
     let noisy = log_probs.clone() + gumbel;
     let indices = noisy.argmax(1);
 
-    let transation = Transaction::default()
+    let transaction = Transaction::default()
         .register(log_probs.gather(1, indices.clone()))
         .register(indices)
         .execute();
 
     (
-        transation[1]
+        transaction[1]
             .iter::<B::IntElem>()
             .map(|x| x.to_usize())
             .collect(),
-        transation[0].to_vec().unwrap(),
+        transaction[0].to_vec().unwrap(),
     )
 }
 

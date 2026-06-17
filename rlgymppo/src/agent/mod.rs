@@ -1,12 +1,14 @@
 pub mod config;
 pub mod model;
 
-use std::time::Instant;
+use std::{path::Path, time::Instant};
 
 use burn::{
+    module::AutodiffModule,
     nn::loss::{MseLoss, Reduction},
     optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
     prelude::*,
+    record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder},
     tensor::{backend::AutodiffBackend, cast::ToElement},
 };
 use rand::{Rng, seq::SliceRandom};
@@ -18,9 +20,8 @@ use crate::{
         model::{Actic, Net, PPOOutput},
     },
     base::{
-        Memory, TERMINAL_NORMAL, TERMINAL_TRUNCATED, TerminalState, get_action_batch,
-        get_action_masks_batch, get_batch_1d, get_generic_batch, get_log_probs_batch,
-        get_states_batch,
+        Memory, TerminalState, get_action_batch, get_action_masks_batch, get_batch_1d,
+        get_generic_batch, get_log_probs_batch, get_states_batch,
     },
     utils::{Report, elementwise_min, running_stat::Stats},
 };
@@ -48,6 +49,65 @@ impl<B: AutodiffBackend> Ppo<B> {
             config,
             device,
         }
+    }
+
+    /// Save the Adam optimizer states (momentum/velocity buffers) to a checkpoint folder.
+    pub fn save_optimizers(&self, folder: &Path) {
+        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+
+        #[cfg(not(feature = "tui"))]
+        println!("Saving optimizer states...");
+
+        recorder
+            .record(
+                self.policy_optimizer.to_record(),
+                folder.join("policy_optimizer"),
+            )
+            .unwrap();
+        recorder
+            .record(
+                self.value_optimizer.to_record(),
+                folder.join("value_optimizer"),
+            )
+            .unwrap();
+        recorder
+            .record(
+                self.shared_head_optimizer.to_record(),
+                folder.join("shared_head_optimizer"),
+            )
+            .unwrap();
+
+        #[cfg(not(feature = "tui"))]
+        println!("Saved optimizer states to: {folder:?}");
+    }
+
+    /// Load the Adam optimizer states from a checkpoint folder.
+    pub fn load_optimizers(&mut self, folder: &Path) {
+        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+
+        #[cfg(not(feature = "tui"))]
+        println!("Loading optimizer states...");
+
+        let policy_path = folder.join("policy_optimizer");
+        if policy_path.exists() {
+            let record = recorder.load(policy_path, &self.device).unwrap();
+            self.policy_optimizer = self.policy_optimizer.clone().load_record(record);
+        }
+
+        let value_path = folder.join("value_optimizer");
+        if value_path.exists() {
+            let record = recorder.load(value_path, &self.device).unwrap();
+            self.value_optimizer = self.value_optimizer.clone().load_record(record);
+        }
+
+        let head_path = folder.join("shared_head_optimizer");
+        if head_path.exists() {
+            let record = recorder.load(head_path, &self.device).unwrap();
+            self.shared_head_optimizer = self.shared_head_optimizer.clone().load_record(record);
+        }
+
+        #[cfg(not(feature = "tui"))]
+        println!("Loaded optimizer states from: {folder:?}");
     }
 }
 
@@ -77,11 +137,29 @@ impl<B: AutodiffBackend> Ppo<B> {
         let actor_params_before = flatten_net(&net.actor);
         let critic_params_before = flatten_net(&net.critic);
 
-        let states_batch: Tensor<B, 2> =
-            get_states_batch(memory.states(), &memory_indices, &self.device);
-        let features = net.apply_shared_head(states_batch);
-        let old_values_batch = net.critic.forward(features).detach();
-        let old_values = old_values_batch.into_data().into_vec::<f32>().unwrap();
+        // Compute old critic values for GAE in mini-batches using a
+        // non-autodiff model clone so no gradient graph accumulates.
+        let old_values = {
+            let nodiff_net = net.valid();
+            let mb = self.config.mini_batch_size;
+            let n = effective_batch_size;
+            let mut values = Vec::with_capacity(n);
+            for start in (0..n).step_by(mb) {
+                let end = (start + mb).min(n);
+                let slice = &memory_indices[start..end];
+                let states =
+                    get_states_batch::<B::InnerBackend>(memory.states(), slice, &self.device);
+                let features = nodiff_net.apply_shared_head(states);
+                let batch_vals = nodiff_net
+                    .critic
+                    .forward(features)
+                    .into_data()
+                    .into_vec::<f32>()
+                    .unwrap();
+                values.extend(batch_vals);
+            }
+            values
+        };
 
         let return_std = if self.config.standardize_returns {
             stats.return_stat.get_std()
@@ -91,19 +169,35 @@ impl<B: AutodiffBackend> Ppo<B> {
 
         let terminals = get_batch_1d(memory.terminals(), &memory_indices);
 
-        // Run the critic on truncation next-state observations for the bootstrap.
-        let trunc_val_preds = if memory.trunc_next_states().is_empty() {
-            Vec::new()
-        } else {
-            let indices: Vec<usize> = (0..memory.trunc_next_states().len()).collect();
-            let batch = get_states_batch(memory.trunc_next_states(), &indices, &self.device);
-            let features = net.apply_shared_head(batch);
-            net.critic
-                .forward(features)
-                .detach()
-                .into_data()
-                .into_vec::<f32>()
-                .unwrap()
+        // Run the critic on truncation next-state observations for the
+        // bootstrap, mini-batched on a non-autodiff model clone.
+        let trunc_val_preds = {
+            let nodiff_net = net.valid();
+            if memory.trunc_next_states().is_empty() {
+                Vec::new()
+            } else {
+                let mb = self.config.mini_batch_size;
+                let n = memory.trunc_next_states().len();
+                let mut values = Vec::with_capacity(n);
+                for start in (0..n).step_by(mb) {
+                    let end = (start + mb).min(n);
+                    let indices: Vec<usize> = (start..end).collect();
+                    let batch = get_states_batch::<B::InnerBackend>(
+                        memory.trunc_next_states(),
+                        &indices,
+                        &self.device,
+                    );
+                    let features = nodiff_net.apply_shared_head(batch);
+                    let batch_vals = nodiff_net
+                        .critic
+                        .forward(features)
+                        .into_data()
+                        .into_vec::<f32>()
+                        .unwrap();
+                    values.extend(batch_vals);
+                }
+                values
+            }
         };
 
         let gae_start = Instant::now();
@@ -334,8 +428,8 @@ fn get_gae(
 
     for i in (0..n_returns).rev() {
         let term = terminals[i];
-        let is_done = term == TERMINAL_NORMAL;
-        let is_trunc = term == TERMINAL_TRUNCATED;
+        let is_done = term == TerminalState::Normal;
+        let is_trunc = term == TerminalState::Truncated;
 
         let not_done = f32::from(!is_done);
         let not_trunc = f32::from(!is_trunc);

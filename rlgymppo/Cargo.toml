@@ -5,7 +5,7 @@ edition = "2024"
 
 [[example]]
 name = "generic"
-required-features = ["torch"]
+required-features = ["rocm"]
 
 [dependencies]
 ahash = "0.8.11"
@@ -25,7 +25,7 @@ serde = { version = "1.0.208", features = ["derive"] }
 toml = { version = "1.1.2", features = ["preserve_order"] }
 
 [features]
-default = ["wandb", "tui"]
+default = ["wandb", "tui", "rocm"]
 wandb = ["dep:rlgymppo-wandb"]
 tui = ["dep:rlgymppo-tui"]
 

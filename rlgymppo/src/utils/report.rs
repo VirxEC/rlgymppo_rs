@@ -19,7 +19,7 @@ macro_rules! reportable_from_primitive {
         $(
             impl From<$t> for Reportable {
                 fn from(val: $t) -> Self {
-                    Reportable::Int(val as i64)
+                    Self::Int(val as i64)
                 }
             }
         )*
@@ -32,35 +32,82 @@ reportable_from_primitive!(
 
 impl From<f64> for Reportable {
     fn from(val: f64) -> Self {
-        Reportable::Float(val)
+        Self::Float(val)
     }
 }
 
 impl From<f32> for Reportable {
     fn from(val: f32) -> Self {
-        Reportable::Float(val as f64)
+        Self::Float(val as f64)
     }
 }
 
 impl From<AvgTracker> for Reportable {
     fn from(val: AvgTracker) -> Self {
-        Reportable::Avg(val)
+        Self::Avg(val)
     }
 }
 
 impl Default for Reportable {
     fn default() -> Self {
-        Reportable::Float(0.0)
+        Self::Float(0.0)
     }
 }
 
 impl AddAssign<Reportable> for Reportable {
     fn add_assign(&mut self, other: Reportable) {
         match (self, other) {
-            (Reportable::Float(a), Reportable::Float(b)) => *a += b,
-            (Reportable::Int(a), Reportable::Int(b)) => *a += b,
-            (Reportable::Avg(a), Reportable::Avg(b)) => *a += b,
+            (Self::Float(a), Self::Float(b)) => *a += b,
+            (Self::Int(a), Self::Int(b)) => *a += b,
+            (Self::Avg(a), Self::Avg(b)) => *a += b,
             (a, b) => *a = b,
+        }
+    }
+}
+
+// impl AddAssign<T> for Reportable where T is the different values of Reportable
+impl AddAssign<f64> for Reportable {
+    fn add_assign(&mut self, other: f64) {
+        match self {
+            Self::Float(a) => *a += other,
+            Self::Avg(a) => *a += AvgTracker::from(other),
+            _ => panic!("Expected Float, got {self:?}"),
+        }
+    }
+}
+
+impl AddAssign<f32> for Reportable {
+    fn add_assign(&mut self, other: f32) {
+        match self {
+            Self::Float(a) => *a += other as f64,
+            Self::Avg(a) => *a += AvgTracker::from(other),
+            _ => panic!("Expected Float, got {self:?}"),
+        }
+    }
+}
+
+impl AddAssign<i64> for Reportable {
+    fn add_assign(&mut self, other: i64) {
+        match self {
+            Self::Int(a) => *a += other,
+            Self::Avg(a) => *a += AvgTracker::from(other as f64),
+            _ => panic!("Expected Int, got {self:?}"),
+        }
+    }
+}
+
+impl AddAssign<AvgTracker> for Reportable {
+    fn add_assign(&mut self, mut other: AvgTracker) {
+        match self {
+            Self::Float(a) => {
+                other += *a;
+                *self = other.into();
+            }
+            Self::Int(a) => {
+                other += *a as f64;
+                *self = other.into();
+            }
+            Self::Avg(a) => *a += other,
         }
     }
 }
@@ -68,42 +115,42 @@ impl AddAssign<Reportable> for Reportable {
 impl Reportable {
     pub fn as_float(&self) -> f64 {
         match self {
-            Reportable::Float(val) => *val,
+            Self::Float(val) => *val,
             _ => unreachable!("Expected Val, got Avg"),
         }
     }
 
     pub fn as_int(&self) -> i64 {
         match self {
-            Reportable::Int(val) => *val,
+            Self::Int(val) => *val,
             _ => unreachable!("Expected Int, got Float"),
         }
     }
 
     pub fn as_avg(&self) -> AvgTracker {
         match self {
-            Reportable::Avg(avg) => *avg,
+            Self::Avg(avg) => *avg,
             _ => unreachable!("Expected Avg, got Val"),
         }
     }
 
     pub fn as_float_mut(&mut self) -> &mut f64 {
         match self {
-            Reportable::Float(val) => val,
+            Self::Float(val) => val,
             _ => unreachable!("Expected Val, got Avg"),
         }
     }
 
     pub fn as_int_mut(&mut self) -> &mut i64 {
         match self {
-            Reportable::Int(val) => val,
+            Self::Int(val) => val,
             _ => unreachable!("Expected Int, got Float"),
         }
     }
 
     pub fn as_avg_mut(&mut self) -> &mut AvgTracker {
         match self {
-            Reportable::Avg(avg) => avg,
+            Self::Avg(avg) => avg,
             _ => unreachable!("Expected Avg, got Val"),
         }
     }
@@ -135,7 +182,7 @@ impl Report {
     /// Add a floating-point value under an average-tracking key (e.g. `"Rewards/boost"`).
     /// Subsequent calls with the same key will be averaged together.
     pub fn add_avg(&mut self, key: &str, value: f64) {
-        self[key] += AvgTracker::new(value, 1).into();
+        self[key] += AvgTracker::new(value, 1);
     }
 
     /// Convert the report to a flat `{name → value}` map suitable for

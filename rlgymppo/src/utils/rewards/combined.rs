@@ -4,9 +4,9 @@ use crate::utils::{AvgTracker, shared_info::SharedInfoReport};
 
 #[macro_export]
 macro_rules! combined_rewards {
-    ($($name:expr, $reward:ty, $weight:expr;)+) => {
+    ($($name:expr, $reward:expr => $weight:expr;)+) => {
         $crate::utils::rewards::CombinedRewards::new(vec![
-            $(($name, Box::<$reward>::default(), $weight),)+
+            $(($name, Box::new($reward), $weight),)+
         ])
     };
 }
@@ -17,10 +17,19 @@ macro_rules! combined_rewards {
 ///
 /// # Example
 ///
+/// Simple default-constructible rewards use their path directly:
 /// ```
 /// let reward_fn = combined_rewards![
-///     "reward1", RewardFunction1, 1.0;
-///     "reward2", RewardFunction2, 0.5;
+///     "reward1", MyUnitReward => 1.0;
+///     "reward2", MyUnitReward2 => 0.5;
+/// ];
+/// ```
+///
+/// Parameterized or wrapped rewards use their constructor:
+/// ```
+/// let reward_fn = combined_rewards![
+///     "reward1", ZeroSumReward::new(ChildReward, 0.3, 1.0) => 1.0;
+///     "reward2", SomeReward::new(0.5) => 0.5;
 /// ];
 /// ```
 pub struct CombinedRewards<SI: SharedInfoReport> {
@@ -51,7 +60,7 @@ impl<SI: SharedInfoReport> Reward<SI> for CombinedRewards<SI> {
             }
 
             shared_info.report()[*name] +=
-                AvgTracker::new(reward_total as f64, rewards.len() as u64).into();
+                AvgTracker::new(reward_total as f64, rewards.len() as u64);
         }
 
         rewards

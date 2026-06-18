@@ -74,11 +74,3 @@ pub(crate) fn argmax_actions<B: Backend>(output: Tensor<B, 2>) -> Vec<usize> {
         .map(|x| x.to_usize())
         .collect()
 }
-
-pub(crate) fn elementwise_min<B: Backend, const D: usize>(
-    lhs: Tensor<B, D>,
-    rhs: Tensor<B, D>,
-) -> Tensor<B, D> {
-    let rhs_lower = rhs.clone().lower(lhs.clone());
-    lhs.clone().mask_where(rhs_lower, rhs.clone())
-}

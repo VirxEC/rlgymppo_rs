@@ -16,8 +16,8 @@ use std::{
     time::Instant,
 };
 
-pub use agent::config::PpoLearnerConfig;
-use agent::{Ppo, model::Actic};
+use agent::{Ppo, model::Actic, self_play::VersionManager};
+pub use agent::{config::PpoLearnerConfig, self_play::SelfPlayConfig};
 use base::TerminalState;
 pub use burn::backend;
 use burn::{
@@ -30,7 +30,7 @@ use environment::{
     thread_sim::ThreadSim,
 };
 use parking_lot::{Condvar, Mutex};
-use rand::{SeedableRng, rng, rngs::SmallRng};
+use rand::{Rng, SeedableRng, rng, rngs::SmallRng};
 pub use rlgym::{self, rocketsim};
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 use utils::{
@@ -122,6 +122,11 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// RocketSim's built-in renderer is used for visualization.
     pub render: bool,
 
+    // ── Self‑Play ─────────────────────────────────────────────────────
+    /// Configuration for saving old policy versions and occasionally
+    /// training against them (self-play).
+    pub self_play: SelfPlayConfig,
+
     // ── Weights & Biases ─────────────────────────────────────────────
     /// Project name for wandb (requires the `wandb` feature).
     /// When `None`, wandb logging is disabled.
@@ -151,6 +156,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
 
             num_additional_iterations: None,
             render: false,
+            self_play: SelfPlayConfig::default(),
             wandb_project_name: None,
             wandb_group_name: None,
             wandb_run_name: None,
@@ -236,6 +242,17 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             reward_sampling,
         );
 
+        // ── Self‑play: if training against old versions is enabled,
+        //     force save_policy_versions on so we have versions to use.
+        let mut self_play_config = self.self_play;
+        if self_play_config.train_against_old_versions {
+            self_play_config.save_policy_versions = true;
+        }
+        let version_mgr = VersionManager::new(
+            self.checkpoints_folder.join("policy_versions"),
+            self_play_config.clone(),
+        );
+
         Learner {
             ppo: self.ppo.init(self.device.clone()),
             rng: SmallRng::from_rng(&mut rng()),
@@ -254,6 +271,8 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             renderer_controls: renderer_controls.clone(),
             renderer,
             collector: thread_sim,
+            self_play_config,
+            version_mgr,
         }
     }
 }
@@ -286,6 +305,10 @@ where
     num_additional_iterations: Option<u64>,
     renderer_controls: Arc<(Mutex<RendererControls<B::InnerBackend>>, Condvar)>,
     renderer: JoinHandle<()>,
+    // ── Self‑Play ──────────────────────────────────────────────────
+    self_play_config: SelfPlayConfig,
+    version_mgr: VersionManager<B::InnerBackend>,
+
     collector: ThreadSim<B::InnerBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
 }
 
@@ -312,6 +335,16 @@ where
         if let Some(latest_folder) = latest_checkpoint_folder(&self.checkpoints_folder) {
             self.ppo.load_optimizers(&latest_folder);
         }
+
+        // Load saved policy versions from disk.
+        {
+            let template = self.model.valid();
+            self.version_mgr.load_versions(
+                &template,
+                &self.device,
+                self.stats.cumulative_timesteps,
+            );
+        }
     }
 
     fn print_controls_prompt() {
@@ -336,6 +369,7 @@ where
                     &self.checkpoints_folder,
                     self.checkpoints_limit,
                 );
+                self.version_mgr.save_versions();
             }
             HumanInput::ToggleRender => {
                 let (controls, start_renderer) = &*self.renderer_controls;
@@ -481,8 +515,30 @@ where
                 start_rendering.notify_all();
             }
 
+            // ── Self‑play: stochastically decide to use an old version ──
+            let self_play = if self.self_play_config.train_against_old_versions
+                && !self.version_mgr.is_empty()
+                && (self.rng.next_u32() as f64 / u32::MAX as f64)
+                    < self.self_play_config.train_against_old_chance as f64
+            {
+                let idx = self.version_mgr.random_index(&mut self.rng);
+                let old_team = if self.rng.next_u32().is_multiple_of(2) {
+                    0
+                } else {
+                    1
+                };
+                #[cfg(not(feature = "tui"))]
+                println!(
+                    " > Training against old version {} (team {})",
+                    self.version_mgr.versions[idx].timesteps, old_team
+                );
+                Some((self.version_mgr.versions[idx].model.clone(), old_team))
+            } else {
+                None
+            };
+
             // collect steps
-            let (memory, mut metrics) = self.collector.run(nodiff_model);
+            let (memory, mut metrics) = self.collector.run(nodiff_model, self_play);
             let collect_elapsed = collect_start.elapsed().as_secs_f64();
 
             // train the model
@@ -499,6 +555,15 @@ where
             );
 
             let consumption_elapsed = train_start.elapsed().as_secs_f64();
+
+            // ── Self‑play: save a policy version if we crossed a boundary ──
+            let prev_timesteps = self.stats.cumulative_timesteps - num_new_steps as u64;
+            let nodiff_model_snapshot = self.model.valid();
+            self.version_mgr.on_iteration(
+                &nodiff_model_snapshot,
+                self.stats.cumulative_timesteps,
+                prev_timesteps,
+            );
 
             // Episode length = total_steps / number of NORMAL terminals.
             let n_term = (0..memory.len())
@@ -579,6 +644,7 @@ where
                     &self.checkpoints_folder,
                     self.checkpoints_limit,
                 );
+                self.version_mgr.save_versions();
                 self.last_save_timestep = self.stats.cumulative_timesteps;
             }
 
@@ -603,6 +669,7 @@ where
             &self.checkpoints_folder,
             self.checkpoints_limit,
         );
+        self.version_mgr.save_versions();
 
         // Close the TUI display (restores normal terminal).
         #[cfg(feature = "tui")]
@@ -675,6 +742,7 @@ where
             &self.checkpoints_folder,
             self.checkpoints_limit,
         );
+        self.version_mgr.save_versions();
 
         println!("Waiting for threads to exit...");
         self.renderer.join().unwrap();

@@ -23,6 +23,16 @@ pub struct DataResponse {
     pub metrics: Report,
 }
 
+/// Shared model state passed to collector threads via the barrier.
+/// The `model` field carries the current policy; `self_play`
+/// optionally carries an old policy version and the team it
+/// controls (0 = Blue, 1 = Orange).
+struct ThreadControl<B: Backend> {
+    model: RwLock<Option<Actic<B>>>,
+    self_play: RwLock<Option<(Actic<B>, usize)>>,
+    barrier: Barrier,
+}
+
 /// Multi‑threaded collector.  Each thread owns an independent pool of
 /// `num_games_per_thread` games so completions stay frequent regardless of
 /// the total thread count — scaling up just adds more parallel pools.
@@ -40,7 +50,7 @@ where
     TRUNC: Truncate<SI>,
 {
     recv: Receiver<DataResponse>,
-    control: Arc<(RwLock<Option<Actic<B>>>, Barrier)>,
+    control: Arc<ThreadControl<B>>,
     threads: Vec<thread::JoinHandle<()>>,
     metrics: Report,
     memory: Memory,
@@ -71,7 +81,11 @@ where
         B::Device: Send,
     {
         let (sender, recv) = channel();
-        let control = Arc::new((RwLock::new(None), Barrier::new(num_threads + 1)));
+        let control = Arc::new(ThreadControl {
+            model: RwLock::new(None),
+            self_play: RwLock::new(None),
+            barrier: Barrier::new(num_threads + 1),
+        });
 
         let steps_per_thread = batch_size.div_ceil(num_threads);
         let mut threads = Vec::with_capacity(num_threads);
@@ -93,16 +107,25 @@ where
                 );
 
                 loop {
-                    control.1.wait(); // barrier: wait for model to be set
+                    control.barrier.wait(); // wait for model to be set
                     let model = {
-                        let guard = control.0.read();
+                        let guard = control.model.read();
                         guard.clone()
                     };
                     let Some(model) = model else {
                         break; // None signals shutdown
                     };
 
-                    let (memory, metrics) = batch_sim.run(&model, steps_per_thread);
+                    let self_play = {
+                        let guard = control.self_play.read();
+                        guard.clone()
+                    };
+
+                    let (memory, metrics) = batch_sim.run(
+                        &model,
+                        steps_per_thread,
+                        self_play.as_ref().map(|(m, t)| (m, *t)),
+                    );
 
                     sender.send(DataResponse { memory, metrics }).unwrap();
                 }
@@ -120,15 +143,26 @@ where
         }
     }
 
-    pub fn run(&mut self, model: Actic<B>) -> (&Memory, Report) {
+    /// Publish the model (and optionally an old self-play model), wake
+    /// all collector threads, and collect the resulting trajectories.
+    ///
+    /// `self_play` optionally supplies an old policy version and which
+    /// team (0 = Blue, 1 = Orange) should use it.  Only current-policy
+    /// player trajectories are recorded in the returned memory.
+    pub fn run(
+        &mut self,
+        model: Actic<B>,
+        self_play: Option<(Actic<B>, usize)>,
+    ) -> (&Memory, Report) {
         self.metrics.clear();
         self.memory.clear();
 
-        // Publish the model for all threads.
-        *self.control.0.write() = Some(model);
+        // Publish the model and self-play assignment for all threads.
+        *self.control.model.write() = Some(model);
+        *self.control.self_play.write() = self_play;
 
         // Wake all collector threads.
-        self.control.1.wait();
+        self.control.barrier.wait();
 
         // Collect results from every thread.
         for _ in 0..self.threads.len() {
@@ -142,8 +176,8 @@ where
 
     pub fn join(self) {
         // Signal shutdown.
-        *self.control.0.write() = None;
-        self.control.1.wait();
+        *self.control.model.write() = None;
+        self.control.barrier.wait();
 
         for thread in self.threads {
             thread.join().unwrap();

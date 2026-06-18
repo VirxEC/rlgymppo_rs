@@ -44,9 +44,18 @@ impl From<f32> for AvgTracker {
             Self::default()
         } else {
             Self {
-                total: val as f64,
+                total: f64::from(val),
                 count: 1,
             }
+        }
+    }
+}
+
+impl From<bool> for AvgTracker {
+    fn from(val: bool) -> Self {
+        Self {
+            total: f64::from(val),
+            count: 1,
         }
     }
 }

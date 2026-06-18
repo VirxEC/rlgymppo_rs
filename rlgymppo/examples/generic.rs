@@ -1,11 +1,11 @@
 #![recursion_limit = "256"]
 
-use burn::backend::{LibTorch, libtorch::LibTorchDevice};
+use burn::backend::{Rocm, rocm::RocmDevice};
 use itertools::repeat_n;
 use rand::{Rng, SeedableRng, rng, rngs::SmallRng};
-use rlgym::rocketsim::{Vec3A, consts, init_from_default};
+use rlgym::rocketsim::{ArenaEvent, Vec3A, consts, init_from_default};
 use rlgymppo::{
-    LearnerConfig, PpoLearnerConfig, any_terminal,
+    LearnerConfig, PpoLearnerConfig, SelfPlayConfig, any_terminal,
     backend::Autodiff,
     combined_rewards,
     rlgym::{Env, FullObs, GameState, Obs, SharedInfoProvider},
@@ -13,7 +13,7 @@ use rlgymppo::{
     utils::{
         AvgTracker, Report,
         actions::DefaultAction,
-        rewards::{CombinedRewards, FaceBallReward, VelocityToBallReward},
+        rewards,
         shared_info::{SharedInfoReport, SharedInfoRng},
         state_setters::{KickoffState, RandomState, WeightedState},
         terminal::{AnyTerminal, NoTouchCondition, OnGoalCondition, RandomGameEndedCondition},
@@ -39,23 +39,33 @@ impl SharedInfoProvider for SharedInfo {
     fn reset(&mut self, _initial_state: &GameState) {}
 
     fn update(&mut self, game_state: &GameState) {
-        for (_, state) in &game_state.cars {
+        for (info, state) in &game_state.cars {
             let dist_to_ball = state.pos.distance(game_state.ball.pos);
-            self.metrics["Player/Distance to ball"] += AvgTracker::from(dist_to_ball).into();
+            self.metrics["Player/Distance to ball"] += AvgTracker::from(dist_to_ball);
 
-            self.metrics["Player/In Air Ratio"] +=
-                AvgTracker::from(!state.is_on_ground as u32 as f32).into();
-            self.metrics["Player/Demoed Ratio"] +=
-                AvgTracker::from(state.is_demoed as u32 as f32).into();
+            self.metrics["Player/In Air Ratio"] += AvgTracker::from(!state.is_on_ground);
+            self.metrics["Player/Demoed Ratio"] += AvgTracker::from(state.is_demoed);
 
-            self.metrics["Player/Speed"] += AvgTracker::from(state.vel.length()).into();
+            self.metrics["Player/Speed"] += AvgTracker::from(state.vel.length());
 
             let dir_to_ball = (game_state.ball.pos - state.pos).normalize_or_zero();
             let speed_towards_ball = state.vel.dot(dir_to_ball).max(0.0);
-            self.metrics["Player/Speed Towards Ball"] +=
-                AvgTracker::from(speed_towards_ball).into();
+            self.metrics["Player/Speed Towards Ball"] += AvgTracker::from(speed_towards_ball);
 
-            self.metrics["Player/Boost"] += AvgTracker::from(state.boost).into();
+            self.metrics["Player/Boost"] += AvgTracker::from(state.boost);
+
+            let has_touched = game_state.events.iter().any(
+                |event| matches!(event, ArenaEvent::CarHitBall(hit) if hit.car_idx == info.idx),
+            );
+            self.metrics["Player/Ball Touch Ratio"] += AvgTracker::from(has_touched);
+        }
+
+        // Track touch height from car-ball contact events
+        for event in &game_state.events {
+            if let ArenaEvent::CarHitBall(car_hit_ball) = event {
+                self.metrics["Player/Touch Height"] +=
+                    AvgTracker::from(car_hit_ball.contact_point.z);
+            }
         }
     }
 }
@@ -205,7 +215,7 @@ fn create_env(
     WeightedState<SharedInfo>,
     MyObs,
     DefaultAction<6>,
-    CombinedRewards<SharedInfo>,
+    rewards::CombinedRewards<SharedInfo>,
     AnyTerminal<SharedInfo>,
     NoTouchCondition<MAX_NO_TOUCH_DURATION, SharedInfo>,
     SharedInfo,
@@ -236,10 +246,15 @@ fn create_env(
         MyObs,
         DefaultAction::default(),
         combined_rewards![
-            "Reward/Face ball", FaceBallReward, 0.1;
-            "Reward/Velocity to ball", VelocityToBallReward, 1.0;
+            "Reward/In Air", rewards::AirReward => 0.05;
+            "Reward/Touch ball", rewards::BallTouchReward => 10.0;
+            "Reward/Face ball", rewards::FaceBallReward => 0.2;
+            "Reward/Velocity to ball", rewards::VelocityToBallReward => 1.0;
+            // "Reward/Velocity ball to goal", rewards::ZeroSumReward::new(
+            //     rewards::VelocityBallToGoalReward, 1.0, 1.0
+            // ) => 2.0;
         ],
-        any_terminal![OnGoalCondition, GameEndCond],
+        any_terminal![OnGoalCondition<SharedInfo>, GameEndCond],
         NoTouchCondition::default(),
         SharedInfo::default(),
     )
@@ -248,19 +263,19 @@ fn create_env(
 fn main() {
     init_from_default(cfg!(not(debug_assertions))).unwrap();
 
-    let mini_batch_size = 50_000;
-    let batch_size = mini_batch_size * 1;
+    let mini_batch_size = 40_000;
+    let batch_size = mini_batch_size * 2;
     let lr = 2e-4;
 
     // Router will fallback to NdArray if Wgpu is not available
     // Realistically more useful for using CUDA and falling back to NdArray
-    let config = LearnerConfig::<Autodiff<LibTorch>> {
+    let config = LearnerConfig::<Autodiff<Rocm>> {
         // if the renderer is on by default or not (can be toggled at runtime)
         render: false,
         // !!! WATCH OUT !!!
         //
-        // 6 (cars in a 3v3) * 120 (max seconds per episode) * 15 (steps per second, 120 tps / 8 tick skip = 8)
-        // = 10_800 (!!!)
+        // 6 (cars in a 3v3) * 180 (max seconds per episode) * 15 (steps per second, 120 tps / 8 tick skip = 8)
+        // = 16_200 (!!!)
         // Each thread may run over by almost 11k ticks! this is minimized due to randomness,
         // but if your total batch size is small, keep the number of threads low.
         //
@@ -271,25 +286,33 @@ fn main() {
         // 4 (threads) * 64 (games per thread) = 256 (total games)
         // 256 total games is a good number to target.
         //
-        // If you increase `num_threads`, you can decrease `num_games_per_thread` to keep the total games around 256.
+        // If you increase `num_threads`,
+        // you can decrease `num_games_per_thread` to keep the total games around 256.
         num_games_per_thread: 64,
         timesteps_per_save: 10_000_000,
         checkpoints_limit: Some(10),
         ppo: PpoLearnerConfig {
             batch_size,
             mini_batch_size,
-            epochs: 1,
+            epochs: 2,
             learning_rate: lr,
             // This scales differently than "ent_coef" in other frameworks;
             // This is the scale for normalized entropy,
             // which means you won't have to change it if you add more actions
-            entropy_scale: 0.035,
+            entropy_scale: 0.018,
             ..Default::default()
         },
+        self_play: SelfPlayConfig {
+            save_policy_versions: true,
+            ts_per_version: 100_000_000,
+            max_old_versions: 10,
+            train_against_old_versions: false,
+            train_against_old_chance: 0.15,
+        },
         shared_head_layer_sizes: vec![256],
-        policy_layer_sizes: vec![256; 3],
-        critic_layer_sizes: vec![256; 3],
-        device: LibTorchDevice::Cuda(0),
+        policy_layer_sizes: vec![512; 2],
+        critic_layer_sizes: vec![512; 4],
+        device: RocmDevice::new(0),
         #[cfg(feature = "wandb")]
         wandb_project_name: Some("rlgym-ppo".into()),
         #[cfg(feature = "wandb")]

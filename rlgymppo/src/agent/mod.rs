@@ -1,5 +1,6 @@
 pub mod config;
 pub mod model;
+pub mod self_play;
 
 use std::{path::Path, time::Instant};
 
@@ -23,7 +24,7 @@ use crate::{
         Memory, TerminalState, get_action_batch, get_action_masks_batch, get_batch_1d,
         get_generic_batch, get_log_probs_batch, get_states_batch,
     },
-    utils::{Report, elementwise_min, running_stat::Stats},
+    utils::{Report, running_stat::Stats},
 };
 
 pub struct Ppo<B: AutodiffBackend> {
@@ -314,11 +315,9 @@ impl<B: AutodiffBackend> Ppo<B> {
                     mean_clip_fraction += clip_fraction.detach().into_scalar().to_f32();
                 }
 
-                let actor_loss = -elementwise_min(
-                    ratios * advantage_batch.clone(),
-                    clipped_ratios * advantage_batch,
-                )
-                .mean();
+                let actor_loss = -(ratios * advantage_batch.clone())
+                    .min_pair(clipped_ratios * advantage_batch)
+                    .mean();
                 let cur_policy_loss = actor_loss.clone().detach().into_scalar().to_f32();
                 mean_policy_loss += cur_policy_loss;
 
@@ -349,8 +348,7 @@ impl<B: AutodiffBackend> Ppo<B> {
                 let critic_grads = GradientsParams::from_module(&mut grads, &net.critic);
                 net.critic = self.value_optimizer.step(lr, net.critic, critic_grads);
 
-                if net.shared_head.is_some() {
-                    let head = net.shared_head.take().unwrap();
+                if let Some(head) = net.shared_head.take() {
                     let head_grads = GradientsParams::from_module(&mut grads, &head);
                     net.shared_head = Some(self.shared_head_optimizer.step(lr, head, head_grads));
                 }

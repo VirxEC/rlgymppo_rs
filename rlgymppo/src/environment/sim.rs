@@ -105,6 +105,16 @@ where
         self.last_state.cars.len()
     }
 
+    /// Return the team index (0 = Blue, 1 = Orange) for each player
+    /// in observation order (matches `cars` ordering).
+    pub fn player_teams(&self) -> Vec<usize> {
+        self.last_state
+            .cars
+            .iter()
+            .map(|(info, _)| info.team as usize)
+            .collect()
+    }
+
     pub fn reset(&mut self) -> (FullObs, Vec<Vec<bool>>) {
         let (state, obs, masks) = self.env.reset();
         self.last_state = state;
@@ -135,8 +145,7 @@ where
         let num_players = result.rewards.len();
         let total_rew = result.rewards.iter().sum::<f32>() as f64;
 
-        self.metrics["Collect/avg step reward"] +=
-            AvgTracker::new(total_rew, num_players as u64).into();
+        self.metrics["Collect/avg step reward"] += AvgTracker::new(total_rew, num_players as u64);
 
         StepResult {
             obs: result.obs,

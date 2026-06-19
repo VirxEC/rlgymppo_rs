@@ -10,7 +10,7 @@ use burn::{
     optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
     prelude::*,
     record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError},
-    tensor::{backend::AutodiffBackend, cast::ToElement},
+    tensor::{Transaction, backend::AutodiffBackend},
 };
 use rand::{Rng, seq::SliceRandom};
 use ringbuffer::RingBuffer;
@@ -292,53 +292,63 @@ impl<B: AutodiffBackend> Ppo<B> {
                 let entropy_per_sample =
                     -(log_prob.clone() * policy_batch).sum_dim(1) / (num_actions as f32).ln();
                 let entropy = entropy_per_sample.mean();
-                mean_entropy += entropy.clone().into_scalar().to_f32();
 
                 let action_log_prob = log_prob.gather(1, action_batch.clone());
                 let log_prob_diff = action_log_prob - old_log_probs_batch;
                 let ratios = log_prob_diff.clone().exp();
-                // mean_ratio += ratios.clone().mean().detach().into_scalar().to_f32();
 
                 let clipped_ratios = ratios
                     .clone()
                     .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
 
-                {
-                    let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff.clone();
-                    mean_divergence += kl_tensor.mean().detach().into_scalar().to_f32();
+                let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff;
+                let kl_mean = kl_tensor.mean();
 
-                    let clip_fraction = (ratios.clone() - 1.0)
-                        .abs()
-                        .greater_elem(self.config.clip_range)
-                        .float()
-                        .mean();
-                    mean_clip_fraction += clip_fraction.detach().into_scalar().to_f32();
-                }
+                let clip_fraction = (ratios.clone() - 1.0)
+                    .abs()
+                    .greater_elem(self.config.clip_range)
+                    .float()
+                    .mean();
 
                 let actor_loss = -(ratios * advantage_batch.clone())
                     .min_pair(clipped_ratios * advantage_batch)
                     .mean();
-                let cur_policy_loss = actor_loss.clone().detach().into_scalar().to_f32();
-                mean_policy_loss += cur_policy_loss;
 
                 let batch_size_f = self.config.batch_size as f32;
                 let mb_size_f = (end_idx - start_idx) as f32;
                 let ratio = mb_size_f / batch_size_f;
                 let lr = self.config.learning_rate.into();
 
-                // Track relative entropy loss: (entropy * scale) / policyLoss.
-                let cur_entropy = entropy.clone().detach().into_scalar().to_f32();
+                let ppo_loss = actor_loss.clone() - entropy.clone() * self.config.entropy_scale;
+                let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
+
+                // Batch all metric syncs into a single device transaction.
+                let [entropy_data, kl_data, clip_data, policy_data, critic_data] =
+                    Transaction::default()
+                        .register(entropy.detach())
+                        .register(kl_mean.detach())
+                        .register(clip_fraction)
+                        .register(actor_loss.detach())
+                        .register(critic_loss.clone().detach())
+                        .execute()
+                        .try_into()
+                        .expect("Correct amount of tensor data");
+
+                let cur_entropy = entropy_data.to_vec::<f32>().unwrap()[0];
+                mean_entropy += cur_entropy;
+                mean_divergence += kl_data.to_vec::<f32>().unwrap()[0];
+                mean_clip_fraction += clip_data.to_vec::<f32>().unwrap()[0];
+
+                let cur_policy_loss = policy_data.to_vec::<f32>().unwrap()[0];
+                mean_policy_loss += cur_policy_loss;
+
                 mean_rel_entropy_loss += (cur_entropy * self.config.entropy_scale)
                     / cur_policy_loss.abs().max(f32::EPSILON);
 
-                let ppo_loss = actor_loss - entropy * self.config.entropy_scale;
-                let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
-                let loss = critic_loss.clone().detach().into_scalar().to_f32();
+                let loss = critic_data.to_vec::<f32>().unwrap()[0];
                 assert!(!loss.is_nan(), "Value loss is NaN: {loss}");
                 mean_val_loss += loss;
 
-                // Combined backward pass (like C++): accumulate gradients for the
-                // actor, critic, AND shared head — all through the shared features.
                 let combined = (ppo_loss + critic_loss) * ratio;
                 let mut grads = combined.backward();
 

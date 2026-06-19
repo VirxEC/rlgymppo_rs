@@ -3,7 +3,7 @@ use std::{
     ops::{AddAssign, Index, IndexMut},
 };
 
-use ahash::AHashMap;
+use rustc_hash::FxHashMap;
 
 use crate::utils::AvgTracker;
 
@@ -158,7 +158,7 @@ impl Reportable {
 
 #[derive(Clone, Debug, Default)]
 pub struct Report {
-    data: AHashMap<String, Reportable>,
+    data: FxHashMap<String, Reportable>,
 }
 
 impl fmt::Display for Report {

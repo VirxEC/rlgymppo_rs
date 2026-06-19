@@ -60,7 +60,7 @@ impl<SI: SharedInfoReport> Reward<SI> for CombinedRewards<SI> {
             }
 
             shared_info.report()[*name] +=
-                AvgTracker::new(reward_total as f64, rewards.len() as u64);
+                AvgTracker::new((reward_total / *weight) as f64, rewards.len() as u64);
         }
 
         rewards

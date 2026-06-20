@@ -1,4 +1,4 @@
-use std::{iter::repeat_n, marker::PhantomData};
+use std::iter::repeat_n;
 
 use rand::seq::SliceRandom;
 use rlgym::{
@@ -23,17 +23,16 @@ use crate::utils::shared_info::SharedInfoRng;
 ///
 /// Demoed cars have all observation fields zeroed except the last
 /// (`demo_respawn_timer * DEMO_COEF`), matching the masking pattern from MyObs.
-pub struct DefaultObs<const MAX_PLAYERS: usize, SI> {
+pub struct DefaultObs<const MAX_PLAYERS: usize> {
     /// Component-wise position scaling factor (default: `[1/4096, 1/5120, 1/2044]`)
     pos_coef: Vec3A,
     /// Velocity scaling factor (default: [`Self::VEL_COEF`])
     vel_coef: f32,
     /// Angular velocity scaling factor (default: [`Self::ANG_VEL_COEF`])
     ang_vel_coef: f32,
-    _phantom: PhantomData<SI>,
 }
 
-impl<const MAX_PLAYERS: usize, SI> DefaultObs<MAX_PLAYERS, SI> {
+impl<const MAX_PLAYERS: usize> DefaultObs<MAX_PLAYERS> {
     pub const CAR_OBS: usize = 19;
     pub const BALL_OBS: usize = 9;
     pub const ACTION_OBS: usize = 8;
@@ -51,7 +50,6 @@ impl<const MAX_PLAYERS: usize, SI> DefaultObs<MAX_PLAYERS, SI> {
             pos_coef: Self::POS_COEF,
             vel_coef: Self::VEL_COEF,
             ang_vel_coef: Self::ANG_VEL_COEF,
-            _phantom: PhantomData,
         }
     }
 
@@ -129,7 +127,7 @@ impl<const MAX_PLAYERS: usize, SI> DefaultObs<MAX_PLAYERS, SI> {
     }
 }
 
-impl<const MAX_PLAYERS: usize, SI: SharedInfoRng> Obs<SI> for DefaultObs<MAX_PLAYERS, SI> {
+impl<const MAX_PLAYERS: usize, SI: SharedInfoRng> Obs<SI> for DefaultObs<MAX_PLAYERS> {
     fn get_obs_space(&self, _shared_info: &SI) -> usize {
         self.obs_space()
     }
@@ -229,7 +227,7 @@ impl<const MAX_PLAYERS: usize, SI: SharedInfoRng> Obs<SI> for DefaultObs<MAX_PLA
     }
 }
 
-impl<const MAX_PLAYERS: usize, SI> Default for DefaultObs<MAX_PLAYERS, SI> {
+impl<const MAX_PLAYERS: usize> Default for DefaultObs<MAX_PLAYERS> {
     fn default() -> Self {
         Self::new()
     }

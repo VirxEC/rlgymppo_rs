@@ -6,7 +6,7 @@ use burn::{
 };
 use rand::{Rng, rngs::SmallRng};
 
-use super::model::Actic;
+use super::{model::Actic, skill_tracker::SkillRating};
 
 /// Configuration for saving policy versions and training against old
 /// versions (self-play).
@@ -50,16 +50,20 @@ impl Default for SelfPlayConfig {
 pub struct PolicyVersion<B: Backend> {
     pub timesteps: u64,
     pub model: Actic<B>,
+    /// Frozen Elo ratings at the time this version was created.
+    pub ratings: SkillRating,
 }
 
 impl<B: Backend> PolicyVersion<B> {
     /// Deep-copy the model into a frozen version snapshot.
-    pub fn from_model(model: &Actic<B>, timesteps: u64) -> Self {
+    /// Optionally records the current skill ratings.
+    pub fn from_model(model: &Actic<B>, timesteps: u64, ratings: SkillRating) -> Self {
         // Burn's Module derive provides Clone, which does a true
         // deep-copy (independent parameter buffers).
         Self {
             timesteps,
             model: model.clone(),
+            ratings,
         }
     }
 }
@@ -94,7 +98,16 @@ impl<B: Backend> VersionManager<B> {
     /// Called after every training iteration.  Snapshots a new version
     /// when crossing a `ts_per_version` boundary, and prunes the oldest
     /// version when the sliding window is full.
-    pub fn on_iteration(&mut self, model: &Actic<B>, cur_timesteps: u64, prev_timesteps: u64) {
+    ///
+    /// `cur_ratings`, when provided, is frozen into the new version
+    /// (the skill tracker's current Elo ratings).
+    pub fn on_iteration(
+        &mut self,
+        model: &Actic<B>,
+        cur_timesteps: u64,
+        prev_timesteps: u64,
+        cur_ratings: Option<&SkillRating>,
+    ) {
         if !self.config.save_policy_versions {
             return;
         }
@@ -105,8 +118,11 @@ impl<B: Backend> VersionManager<B> {
             #[cfg(not(feature = "tui"))]
             println!(" > Saving policy version at {cur_timesteps} ts ...");
 
-            self.versions
-                .push(PolicyVersion::from_model(model, cur_timesteps));
+            self.versions.push(PolicyVersion::from_model(
+                model,
+                cur_timesteps,
+                cur_ratings.cloned().unwrap_or_default(),
+            ));
 
             while self.versions.len() > self.config.max_old_versions {
                 self.versions.remove(0);
@@ -178,6 +194,10 @@ impl<B: Backend> VersionManager<B> {
                     .unwrap();
             }
 
+            // Persist the frozen skill ratings as TOML.
+            let stats_toml = toml::to_string_pretty(&version.ratings).unwrap();
+            fs::write(path.join("stats.toml"), stats_toml).unwrap();
+
             #[cfg(not(feature = "tui"))]
             println!(" > Persisted policy version {} to disk", version.timesteps);
         }
@@ -248,6 +268,12 @@ impl<B: Backend> VersionManager<B> {
                     .unwrap_or(head)
             });
 
+            // Attempt to load frozen skill ratings.
+            let ratings = fs::read_to_string(path.join("stats.toml"))
+                .ok()
+                .and_then(|s| toml::from_str::<SkillRating>(&s).ok())
+                .unwrap_or_default();
+
             self.versions.push(PolicyVersion {
                 timesteps: ts,
                 model: Actic {
@@ -255,6 +281,7 @@ impl<B: Backend> VersionManager<B> {
                     critic,
                     shared_head,
                 },
+                ratings,
             });
         }
 

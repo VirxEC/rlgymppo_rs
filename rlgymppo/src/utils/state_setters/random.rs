@@ -1,7 +1,4 @@
-use std::{
-    f32::consts::{FRAC_PI_2, PI},
-    marker::PhantomData,
-};
+use std::f32::consts::{FRAC_PI_2, PI};
 
 use rand::RngExt;
 use rlgym::{
@@ -52,17 +49,14 @@ pub struct RandomState<
     const RAND_BALL_SPEED: bool,
     const RAND_CAR_SPEED: bool,
     const CARS_ON_GROUND: bool,
-    SI: SharedInfoRng,
-> {
-    _shared_info: PhantomData<SI>,
-}
+>;
 
 impl<
     const RAND_BALL_SPEED: bool,
     const RAND_CAR_SPEED: bool,
     const CARS_ON_GROUND: bool,
     SI: SharedInfoRng,
-> StateSetter<SI> for RandomState<RAND_BALL_SPEED, RAND_CAR_SPEED, CARS_ON_GROUND, SI>
+> StateSetter<SI> for RandomState<RAND_BALL_SPEED, RAND_CAR_SPEED, CARS_ON_GROUND>
 {
     fn apply(&mut self, arena: &mut Arena, shared_info: &mut SI) {
         // Reset boost pads and everything

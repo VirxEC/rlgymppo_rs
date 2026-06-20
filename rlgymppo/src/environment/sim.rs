@@ -6,6 +6,7 @@ use rlgym::{
 
 use crate::utils::{AvgTracker, Report, shared_info::SharedInfoReport};
 
+#[derive(Clone)]
 pub struct StepResult {
     pub obs: FullObs,
     pub action_masks: Vec<Vec<bool>>,
@@ -154,6 +155,11 @@ where
             is_terminal: result.is_terminal,
             truncated: result.truncated,
         }
+    }
+
+    /// Access the game state after the most recent `reset` or `step` call.
+    pub fn last_game_state(&self) -> &GameState {
+        &self.last_state
     }
 
     pub fn get_metrics(&self) -> &Report {

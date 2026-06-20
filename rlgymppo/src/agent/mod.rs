@@ -1,6 +1,7 @@
 pub mod config;
 pub mod model;
 pub mod self_play;
+pub mod skill_tracker;
 
 use std::{path::Path, time::Instant};
 

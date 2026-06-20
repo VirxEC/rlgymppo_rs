@@ -1,15 +1,12 @@
-use std::marker::PhantomData;
-
 use rlgym::{GameState, Truncate, rocketsim::ArenaEvent};
 
 /// Terminal condition that triggers when no car has touched the ball for a given duration.
 #[derive(Default)]
-pub struct NoTouchCondition<const MAX_TICKS: u64, SI> {
+pub struct NoTouchCondition<const MAX_TICKS: u64> {
     last_touch_tick: u64,
-    _shared_info: PhantomData<SI>,
 }
 
-impl<const MAX_TICKS: u64, SI> Truncate<SI> for NoTouchCondition<MAX_TICKS, SI> {
+impl<const MAX_TICKS: u64, SI> Truncate<SI> for NoTouchCondition<MAX_TICKS> {
     fn reset(&mut self, initial_state: &GameState, _shared_info: &mut SI) {
         self.last_touch_tick = initial_state.tick_count;
     }

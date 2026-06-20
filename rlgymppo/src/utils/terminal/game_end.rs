@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 use rand::RngExt;
 use rlgym::{GameState, Terminal, rocketsim::ArenaEvent};
 
@@ -11,18 +9,13 @@ use crate::utils::shared_info::SharedInfoRng;
 ///
 /// The duration is randomly sampled from the range `[MIN_DURATION, MAX_DURATION]` at the start of each episode.
 #[derive(Default)]
-pub struct RandomGameEndedCondition<
-    const MIN_DURATION: u64,
-    const MAX_DURATION: u64,
-    SI: SharedInfoRng,
-> {
+pub struct RandomGameEndedCondition<const MIN_DURATION: u64, const MAX_DURATION: u64> {
     start_tick: u64,
     episode_duration: u64,
-    _shared_info: PhantomData<SI>,
 }
 
 impl<const MIN_DURATION: u64, const MAX_DURATION: u64, SI: SharedInfoRng> Terminal<SI>
-    for RandomGameEndedCondition<MIN_DURATION, MAX_DURATION, SI>
+    for RandomGameEndedCondition<MIN_DURATION, MAX_DURATION>
 {
     fn reset(&mut self, initial_state: &GameState, shared_info: &mut SI) {
         self.start_tick = initial_state.tick_count;

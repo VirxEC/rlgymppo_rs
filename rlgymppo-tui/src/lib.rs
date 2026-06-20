@@ -27,6 +27,8 @@ use ratatui::{
 pub struct TuiDisplay {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     notification: String,
+    /// Previous iteration's values, used to compute deltas (e.g. Rating).
+    prev_vals: HashMap<String, f64>,
 }
 
 /// Category grouping information for the display layout.
@@ -74,6 +76,11 @@ const GROUPS: &[MetricGroup] = &[
         key_prefix: "Cumulative",
         color: Color::White,
     },
+    MetricGroup {
+        name: "Rating",
+        key_prefix: "Rating",
+        color: Color::LightYellow,
+    },
 ];
 
 impl TuiDisplay {
@@ -90,6 +97,7 @@ impl TuiDisplay {
         Ok(Self {
             terminal,
             notification: String::new(),
+            prev_vals: HashMap::new(),
         })
     }
 
@@ -99,6 +107,10 @@ impl TuiDisplay {
     /// `{ "Group/key": value }` map (the same shape used for wandb).
     pub fn update(&mut self, metrics: &HashMap<String, f64>) -> io::Result<()> {
         let notification = std::mem::take(&mut self.notification);
+
+        // Snapshot for delta computation.
+        let prev_vals = self.prev_vals.clone();
+
         self.terminal.draw(|frame| {
             let area = frame.area();
 
@@ -118,11 +130,15 @@ impl TuiDisplay {
             render_header(frame, chunks[0], metrics);
 
             // ── Metrics grid ───────────────────────────────────────
-            render_metrics_grid(frame, chunks[1], metrics);
+            render_metrics_grid(frame, chunks[1], metrics, &prev_vals);
 
             // ── Status bar ─────────────────────────────────────────
             render_status_bar(frame, chunks[2], &notification);
         })?;
+
+        // Stash current values for delta computation next iteration.
+        self.prev_vals = metrics.keys().map(|k| (k.clone(), metrics[k])).collect();
+
         Ok(())
     }
 
@@ -198,19 +214,34 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, metrics: &HashMap<Strin
     );
 }
 
-/// Render all metric groups in a two-column grid.
-fn render_metrics_grid(frame: &mut ratatui::Frame, area: Rect, metrics: &HashMap<String, f64>) {
-    // Split into two equal columns.
+/// Render all metric groups in a two-column grid.  Groups that have no
+/// entries in `metrics` are hidden to keep the display clean.
+fn render_metrics_grid(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    metrics: &HashMap<String, f64>,
+    prev_vals: &HashMap<String, f64>,
+) {
+    // Only keep groups that currently have data.
+    let populated: Vec<&MetricGroup> = GROUPS
+        .iter()
+        .filter(|g| !group_entries(metrics, g.key_prefix).is_empty())
+        .collect();
+
+    if populated.is_empty() {
+        return;
+    }
+
+    // Split into two columns, balancing entries.
+    let mid = populated.len().div_ceil(2);
+    let left_groups = &populated[..mid];
+    let right_groups = &populated[mid..];
+
     let cols =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
 
-    // Left column: Collect, Timing, Throughput, Cumulative
-    // Right column: GAE, Loss, Update
-    let left_groups: &[&MetricGroup] = &[&GROUPS[0], &GROUPS[4], &GROUPS[5], &GROUPS[6]];
-    let right_groups: &[&MetricGroup] = &[&GROUPS[1], &GROUPS[2], &GROUPS[3]];
-
-    render_column(frame, cols[0], metrics, left_groups);
-    render_column(frame, cols[1], metrics, right_groups);
+    render_column(frame, cols[0], metrics, prev_vals, left_groups);
+    render_column(frame, cols[1], metrics, prev_vals, right_groups);
 }
 
 /// Render a column of metric groups.
@@ -218,6 +249,7 @@ fn render_column(
     frame: &mut ratatui::Frame,
     area: Rect,
     metrics: &HashMap<String, f64>,
+    prev_vals: &HashMap<String, f64>,
     groups: &[&MetricGroup],
 ) {
     // Each group gets an equal vertical slice.
@@ -229,7 +261,7 @@ fn render_column(
 
     for (i, group) in groups.iter().enumerate() {
         let entries = group_entries(metrics, group.key_prefix);
-        render_group(frame, rows[i], group, &entries);
+        render_group(frame, rows[i], group, &entries, prev_vals);
     }
 }
 
@@ -239,20 +271,49 @@ fn render_group(
     area: Rect,
     group: &MetricGroup,
     entries: &[(&str, f64)],
+    prev_vals: &HashMap<String, f64>,
 ) {
     let mut lines = Vec::new();
 
-    for (name, value) in entries {
-        lines.push(Line::from(vec![
+    for &(name, value) in entries {
+        let mut spans = vec![
             Span::styled(format!(" {name}"), Style::default().fg(Color::Gray)),
             Span::raw("  "),
-            Span::styled(
-                format_num(*value),
+        ];
+
+        if group.key_prefix == "Rating" {
+            // Show delta alongside the current rating (1 decimal).
+            let full_key = format!("Rating/{name}");
+            let prev = prev_vals.get(&full_key).copied().unwrap_or(value);
+            let delta = value - prev;
+            let val_str = format!("{value:.1}");
+            if delta.abs() >= 0.05 {
+                let sign = if delta >= 0.0 { '+' } else { '-' };
+                let delta_str = format!("{:.1}", delta.abs());
+                spans.push(Span::styled(
+                    format!("{val_str} ({sign}{delta_str})"),
+                    Style::default()
+                        .fg(group.color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    val_str,
+                    Style::default()
+                        .fg(group.color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        } else {
+            spans.push(Span::styled(
+                format_num(value),
                 Style::default()
                     .fg(group.color)
                     .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+            ));
+        }
+
+        lines.push(Line::from(spans));
     }
 
     // If there are no entries, show a placeholder.

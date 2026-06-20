@@ -14,7 +14,7 @@ use rlgym::{
 /// `MAX_NUM_AGENTS` is used to size the internal action buffer, which is
 /// reused across ticks to avoid allocations. It should be set to the maximum
 /// number of agents that will be controlled by this action parser.
-pub struct DefaultAction<const MAX_NUM_AGENTS: usize> {
+pub struct DefaultAction<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8> {
     actions_table: Vec<CarControls>,
     ground_mask: Vec<bool>,
     air_mask: Vec<bool>,
@@ -23,7 +23,7 @@ pub struct DefaultAction<const MAX_NUM_AGENTS: usize> {
     action_buffer: ArrayVec<(usize, CarControls), MAX_NUM_AGENTS>,
 }
 
-impl<const MAX_NUM_AGENTS: usize> DefaultAction<MAX_NUM_AGENTS> {
+impl<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8> DefaultAction<MAX_NUM_AGENTS, TICK_SKIP> {
     pub fn new() -> Self {
         let mut actions_table = Vec::new();
 
@@ -177,17 +177,21 @@ impl<const MAX_NUM_AGENTS: usize> DefaultAction<MAX_NUM_AGENTS> {
     }
 }
 
-impl<const MAX_NUM_AGENTS: usize> Default for DefaultAction<MAX_NUM_AGENTS> {
+impl<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8> Default
+    for DefaultAction<MAX_NUM_AGENTS, TICK_SKIP>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const MAX_NUM_AGENTS: usize, SI> Action<SI> for DefaultAction<MAX_NUM_AGENTS> {
+impl<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8, SI> Action<SI>
+    for DefaultAction<MAX_NUM_AGENTS, TICK_SKIP>
+{
     type Input = usize;
 
     fn get_tick_skip() -> u8 {
-        8
+        TICK_SKIP
     }
 
     fn get_action_space(&self, _shared_info: &SI) -> usize {

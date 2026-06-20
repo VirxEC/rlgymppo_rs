@@ -12,12 +12,14 @@ use std::{
         Arc,
         mpsc::{Sender, channel},
     },
-    thread::{self, JoinHandle},
+    thread,
     time::Instant,
 };
 
-use agent::{Ppo, model::Actic, self_play::VersionManager};
-pub use agent::{config::PpoLearnerConfig, self_play::SelfPlayConfig};
+use agent::{Ppo, model::Actic, self_play::VersionManager, skill_tracker::SkillTracker};
+pub use agent::{
+    config::PpoLearnerConfig, self_play::SelfPlayConfig, skill_tracker::SkillTrackerConfig,
+};
 use base::TerminalState;
 pub use burn::backend;
 use burn::{
@@ -36,7 +38,7 @@ use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
 use utils::{
     running_stat::Stats,
     serde::{latest_checkpoint_folder, load_latest_model, save_checkpoint},
-    shared_info::SharedInfoReport,
+    shared_info::{SharedInfoReport, SharedInfoRng},
 };
 
 #[derive(Clone, Copy)]
@@ -127,6 +129,12 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// training against them (self-play).
     pub self_play: SelfPlayConfig,
 
+    // ── Skill Tracker ────────────────────────────────────────────────
+    /// Elo-based skill rating system that periodically evaluates the
+    /// current policy against old versions.  Reports `"Rating/1v1"`,
+    /// `"Rating/2v2"`, etc.
+    pub skill_tracker: SkillTrackerConfig,
+
     // ── Weights & Biases ─────────────────────────────────────────────
     /// Project name for wandb (requires the `wandb` feature).
     /// When `None`, wandb logging is disabled.
@@ -157,6 +165,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             num_additional_iterations: None,
             render: false,
             self_play: SelfPlayConfig::default(),
+            skill_tracker: SkillTrackerConfig::default(),
             wandb_project_name: None,
             wandb_group_name: None,
             wandb_run_name: None,
@@ -172,7 +181,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         SS: StateSetter<SI>,
-        SI: SharedInfoProvider + SharedInfoReport,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
         OBS: Obs<SI>,
         ACT: Action<SI, Input = usize>,
         REW: Reward<SI>,
@@ -233,6 +242,23 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             max_reward_samples: self.ppo.max_reward_samples,
         };
 
+        let skill_tracker = if self.skill_tracker.enabled {
+            let create_env_skill = create_env.clone();
+            let create_arena = move |game_idx: usize| {
+                let env = (create_env_skill)(Some(game_idx));
+
+                (env.arena, env.observations, env.action, env.shared_info)
+            };
+
+            Some(SkillTracker::new(
+                self.skill_tracker.clone(),
+                create_arena,
+                self.device.clone(),
+            ))
+        } else {
+            None
+        };
+
         let thread_sim = ThreadSim::new(
             create_env,
             self.ppo.batch_size,
@@ -242,12 +268,11 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             reward_sampling,
         );
 
-        // ── Self‑play: if training against old versions is enabled,
-        //     force save_policy_versions on so we have versions to use.
         let mut self_play_config = self.self_play;
-        if self_play_config.train_against_old_versions {
+        if self_play_config.train_against_old_versions || self.skill_tracker.enabled {
             self_play_config.save_policy_versions = true;
         }
+
         let version_mgr = VersionManager::new(
             self.checkpoints_folder.join("policy_versions"),
             self_play_config.clone(),
@@ -273,6 +298,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             collector: thread_sim,
             self_play_config,
             version_mgr,
+            skill_tracker,
         }
     }
 }
@@ -280,7 +306,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
 pub struct Learner<B: AutodiffBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
-    SI: SharedInfoProvider,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
     REW: Reward<SI>,
@@ -304,10 +330,12 @@ where
     last_save_timestep: u64,
     num_additional_iterations: Option<u64>,
     renderer_controls: Arc<(Mutex<RendererControls<B::InnerBackend>>, Condvar)>,
-    renderer: JoinHandle<()>,
+    renderer: thread::JoinHandle<()>,
     // ── Self‑Play ──────────────────────────────────────────────────
     self_play_config: SelfPlayConfig,
     version_mgr: VersionManager<B::InnerBackend>,
+    // ── Skill Tracker ────────────────────────────────────────────
+    skill_tracker: Option<SkillTracker<B::InnerBackend, OBS, ACT, SI>>,
 
     collector: ThreadSim<B::InnerBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
 }
@@ -316,9 +344,9 @@ impl<B: AutodiffBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
     Learner<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
-    SI: SharedInfoProvider + SharedInfoReport,
-    OBS: Obs<SI>,
-    ACT: Action<SI, Input = usize>,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Default + Send + 'static + Clone,
+    OBS: Obs<SI> + Default + Send + 'static,
+    ACT: Action<SI, Input = usize> + Default + Send + 'static,
     REW: Reward<SI>,
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
@@ -345,6 +373,11 @@ where
                 self.stats.cumulative_timesteps,
             );
         }
+
+        // Restore skill tracker ratings from the checkpoint.
+        if let (Some(st), Some(ratings)) = (&mut self.skill_tracker, &self.stats.skill_ratings) {
+            st.cur_ratings.data = ratings.clone();
+        }
     }
 
     fn print_controls_prompt() {
@@ -362,6 +395,10 @@ where
                 return false;
             }
             HumanInput::Save => {
+                // Serialise skill tracker ratings before saving.
+                if let Some(ref st) = self.skill_tracker {
+                    self.stats.skill_ratings = Some(st.cur_ratings.data.clone());
+                }
                 save_checkpoint(
                     self.model.valid(),
                     &self.ppo,
@@ -559,11 +596,22 @@ where
             // ── Self‑play: save a policy version if we crossed a boundary ──
             let prev_timesteps = self.stats.cumulative_timesteps - num_new_steps as u64;
             let nodiff_model_snapshot = self.model.valid();
+
+            // Skill tracker ratings (if enabled) are frozen into new versions.
+            let cur_ratings = self.skill_tracker.as_ref().map(|st| &st.cur_ratings);
             self.version_mgr.on_iteration(
                 &nodiff_model_snapshot,
                 self.stats.cumulative_timesteps,
                 prev_timesteps,
+                cur_ratings,
             );
+
+            // ── Skill tracker: run evaluation matches if due ──────
+            if let Some(ref mut st) = self.skill_tracker {
+                st.on_iteration(&nodiff_model_snapshot, &mut self.version_mgr.versions);
+                // Always report current ratings so the TUI displays them.
+                st.report_ratings(&mut metrics);
+            }
 
             // Episode length = total_steps / number of NORMAL terminals.
             let n_term = (0..memory.len())
@@ -637,6 +685,11 @@ where
                     tui.notify("Auto-saving model...");
                 }
 
+                // Serialise skill tracker ratings into the stats.
+                if let Some(ref st) = self.skill_tracker {
+                    self.stats.skill_ratings = Some(st.cur_ratings.data.clone());
+                }
+
                 save_checkpoint(
                     self.model.valid(),
                     &self.ppo,
@@ -660,6 +713,11 @@ where
 
             // if render = false, this will wake the thread up to exit
             start_renderer.notify_all();
+        }
+
+        // Serialise skill tracker ratings before final save.
+        if let Some(ref st) = self.skill_tracker {
+            self.stats.skill_ratings = Some(st.cur_ratings.data.clone());
         }
 
         save_checkpoint(

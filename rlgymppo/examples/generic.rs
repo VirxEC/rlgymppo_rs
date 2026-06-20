@@ -4,7 +4,7 @@ use burn::backend::{LibTorch, libtorch::LibTorchDevice};
 use rand::{Rng, SeedableRng, rng, rngs::SmallRng};
 use rlgym::rocketsim::{ArenaEvent, init_from_default};
 use rlgymppo::{
-    LearnerConfig, PpoLearnerConfig, SelfPlayConfig, any_terminal,
+    LearnerConfig, PpoLearnerConfig, SelfPlayConfig, SkillTrackerConfig, any_terminal,
     backend::Autodiff,
     combined_rewards,
     rlgym::{Env, GameState, SharedInfoProvider},
@@ -21,6 +21,7 @@ use rlgymppo::{
     weighted_state,
 };
 
+#[derive(Clone)]
 struct SharedInfo {
     rng: SmallRng,
     metrics: Report,
@@ -86,7 +87,7 @@ impl SharedInfoReport for SharedInfo {
 
 const MIN_GAME_DURATION: u64 = 60 * 120; // 1 minute in ticks
 const MAX_GAME_DURATION: u64 = 3 * 60 * 120; // 3 minutes in ticks
-type GameEndCond = RandomGameEndedCondition<MIN_GAME_DURATION, MAX_GAME_DURATION, SharedInfo>;
+type GameEndCond = RandomGameEndedCondition<MIN_GAME_DURATION, MAX_GAME_DURATION>;
 
 const MAX_NO_TOUCH_DURATION: u64 = 15 * 120; // 15 seconds in ticks
 
@@ -95,11 +96,11 @@ fn create_env(
     game_id: Option<usize>,
 ) -> Env<
     WeightedState<SharedInfo>,
-    DefaultObs<6, SharedInfo>,
-    DefaultAction<6>,
+    DefaultObs<6>,
+    DefaultAction<6, 8>,
     rewards::CombinedRewards<SharedInfo>,
     AnyTerminal<SharedInfo>,
-    NoTouchCondition<MAX_NO_TOUCH_DURATION, SharedInfo>,
+    NoTouchCondition<MAX_NO_TOUCH_DURATION>,
     SharedInfo,
 > {
     // `game_id` is None for the game used to calculate the policy obs/action space,
@@ -121,22 +122,21 @@ fn create_env(
         arena,
         weighted_state![
             KickoffState, 0.1;
-            RandomState<true, false, true, SharedInfo>, 0.4;
-            RandomState<true, true, true, SharedInfo>, 0.2;
-            RandomState<true, true, false, SharedInfo>, 0.3;
+            RandomState<true, false, true>, 0.4;
+            RandomState<true, true, true>, 0.2;
+            RandomState<true, true, false>, 0.3;
         ],
         DefaultObs::default(),
         DefaultAction::default(),
         combined_rewards![
             "Reward/In Air", rewards::AirReward => 0.2;
-            "Reward/Touch ball", rewards::BallTouchReward => 10.0;
             "Reward/Face ball", rewards::FaceBallReward => 0.1;
             "Reward/Velocity to ball", rewards::VelocityToBallReward => 1.0;
             // "Reward/Velocity ball to goal", rewards::ZeroSumReward::new(
             //     rewards::VelocityBallToGoalReward, 1.0, 1.0
             // ) => 2.0;
         ],
-        any_terminal![OnGoalCondition<SharedInfo>, GameEndCond],
+        any_terminal![OnGoalCondition, GameEndCond],
         NoTouchCondition::default(),
         SharedInfo::default(),
     )
@@ -145,9 +145,9 @@ fn create_env(
 fn main() {
     init_from_default(cfg!(not(debug_assertions))).unwrap();
 
-    let mini_batch_size = 40_000;
-    let batch_size = mini_batch_size * 2;
-    let lr = 2e-4;
+    let mini_batch_size = 50_000;
+    let batch_size = mini_batch_size * 4;
+    let lr = 1.5e-4;
 
     // Router will fallback to NdArray if Wgpu is not available
     // Realistically more useful for using CUDA and falling back to NdArray
@@ -176,7 +176,7 @@ fn main() {
         ppo: PpoLearnerConfig {
             batch_size,
             mini_batch_size,
-            epochs: 2,
+            epochs: 1,
             learning_rate: lr,
             // This scales differently than "ent_coef" in other frameworks;
             // This is the scale for normalized entropy,
@@ -191,8 +191,12 @@ fn main() {
             train_against_old_versions: false,
             train_against_old_chance: 0.15,
         },
+        skill_tracker: SkillTrackerConfig {
+            enabled: true,
+            ..Default::default()
+        },
         shared_head_layer_sizes: vec![256],
-        policy_layer_sizes: vec![256; 2],
+        policy_layer_sizes: vec![256; 4],
         critic_layer_sizes: vec![256; 4],
         device: LibTorchDevice::Cuda(0),
         #[cfg(feature = "wandb")]

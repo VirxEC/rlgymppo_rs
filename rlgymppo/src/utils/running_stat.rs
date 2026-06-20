@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Saved wandb run ID for checkpoint/resume.
@@ -12,7 +14,12 @@ pub struct Stats {
     pub cumulative_model_updates: u64,
     pub cumulative_epochs: u64,
     pub return_stat: WelfordRunningStat,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wandb_run: Option<WandbRun>,
+    /// Per-mode Elo ratings from the skill tracker (e.g. `"1v1"`, `"2v2"`).
+    /// `None` when the skill tracker is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_ratings: Option<HashMap<String, f32>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]

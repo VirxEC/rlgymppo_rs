@@ -21,7 +21,6 @@ use rlgymppo::{
     weighted_state,
 };
 
-#[derive(Clone)]
 struct SharedInfo {
     rng: SmallRng,
     metrics: Report,
@@ -199,6 +198,7 @@ fn main() {
         policy_layer_sizes: vec![256; 4],
         critic_layer_sizes: vec![256; 4],
         device: LibTorchDevice::Cuda(0),
+        render_device: LibTorchDevice::Cuda(0),
         #[cfg(feature = "wandb")]
         wandb_project_name: Some("rlgym-ppo".into()),
         #[cfg(feature = "wandb")]

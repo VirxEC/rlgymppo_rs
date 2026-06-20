@@ -344,9 +344,9 @@ impl<B: AutodiffBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
     Learner<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
-    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Default + Send + 'static + Clone,
-    OBS: Obs<SI> + Default + Send + 'static,
-    ACT: Action<SI, Input = usize> + Default + Send + 'static,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+    OBS: Obs<SI>,
+    ACT: Action<SI, Input = usize>,
     REW: Reward<SI>,
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,

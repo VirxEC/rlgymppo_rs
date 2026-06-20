@@ -226,13 +226,6 @@ where
             np.push(n);
             player_teams.extend(resp.player_teams);
 
-            if game_idx == 0 {
-                assert!(
-                    n.is_multiple_of(2),
-                    "num_cars must be even for symmetric teams"
-                );
-            }
-
             msg_txs.push(msg_tx);
             resp_rxs.push(resp_rx);
         }

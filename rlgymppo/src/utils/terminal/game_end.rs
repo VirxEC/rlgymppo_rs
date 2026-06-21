@@ -31,7 +31,7 @@ impl<const MIN_DURATION: u64, const MAX_DURATION: u64, SI: SharedInfoRng> Termin
 
         state.events.iter().any(|event| {
             if let ArenaEvent::BallHitWorld(info) = event {
-                info.contact_point.z < 5.0
+                info.contact_point.z < 1.0
             } else {
                 false
             }

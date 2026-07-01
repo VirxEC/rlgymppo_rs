@@ -205,11 +205,10 @@ where
             self.next_obs.clear();
             self.next_masks.clear();
 
-            // Step games in reverse order.
-            let mut action_offset = actions.len();
-            for (game_idx, game) in self.games.iter_mut().enumerate().rev() {
+            // Step games in forward order.
+            let mut action_offset = 0;
+            for (game_idx, game) in self.games.iter_mut().enumerate() {
                 let n = self.np[game_idx];
-                action_offset -= n;
 
                 let result = game.step(&actions[action_offset..action_offset + n]);
 
@@ -292,12 +291,11 @@ where
                     self.next_obs.extend(result.obs);
                     self.next_masks.extend(result.action_masks);
                 }
+
+                action_offset += n;
             }
 
             total_env_step_time += env_start.elapsed().as_secs_f64();
-
-            self.next_obs.reverse();
-            self.next_masks.reverse();
         }
 
         let mut report = self.get_metrics();

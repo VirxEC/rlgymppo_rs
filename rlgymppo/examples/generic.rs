@@ -144,8 +144,8 @@ fn create_env(
 fn main() {
     init_from_default(cfg!(not(debug_assertions))).unwrap();
 
-    let mini_batch_size = 50_000;
-    let batch_size = mini_batch_size;
+    let mini_batch_size = 40_000;
+    let batch_size = mini_batch_size * 2;
     let lr = 1.5e-4;
 
     // Router will fallback to NdArray if Wgpu is not available
@@ -190,7 +190,7 @@ fn main() {
         policy_layer_sizes: vec![256; 3],
         critic_layer_sizes: vec![256; 3],
         device: LibTorchDevice::Cuda(0),
-        render_device: LibTorchDevice::Cuda(0),
+        render_device: LibTorchDevice::Cpu,
         #[cfg(feature = "wandb")]
         wandb_project_name: Some("rlgym-ppo".into()),
         #[cfg(feature = "wandb")]

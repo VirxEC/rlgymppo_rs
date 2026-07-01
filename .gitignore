@@ -5,3 +5,6 @@
 rlviser*
 settings.txt
 Cargo.lock
+perf.data*
+*.svg
+gpucore*

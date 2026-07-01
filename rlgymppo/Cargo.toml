@@ -1,0 +1,41 @@
+[package]
+name = "rlgymppo"
+version = "0.1.0"
+edition = "2024"
+
+[[example]]
+name = "generic"
+required-features = ["torch"]
+
+[dependencies]
+rustc-hash = "2.1.1"
+arrayvec = "0.7.6"
+burn = { version = "0.21.0", features = ["autodiff"] }
+itertools = "0.14.0"
+parking_lot = "0.12.4"
+rand = "0.10.1"
+ringbuffer = "0.16.0"
+rlgym = {
+  git = "https://github.com/VirxEC/rlgym_rs.git",
+  branch = "native-rust"
+}
+rlgymppo-wandb = { path = "../rlgymppo-wandb", optional = true }
+rlgymppo-tui = { path = "../rlgymppo-tui", optional = true }
+serde = { version = "1.0.208", features = ["derive"] }
+toml = { version = "1.1.2", features = ["preserve_order"] }
+
+[features]
+default = ["wandb", "tui"]
+wandb = ["dep:rlgymppo-wandb"]
+tui = ["dep:rlgymppo-tui"]
+
+fusion = ["burn/fusion"]
+
+# backends
+candle = ["burn/candle"]
+cuda = ["burn/cuda"]
+metal = ["burn/metal"]
+flex = ["burn/flex"]
+rocm = ["burn/rocm"]
+torch = ["burn/tch"]
+wgpu = ["burn/wgpu"]

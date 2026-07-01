@@ -1,20 +1,21 @@
-use std::{collections::HashMap, marker::PhantomData, sync::mpsc, thread};
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::sync::mpsc;
+use std::thread;
 
 use burn::prelude::*;
 use rand::Rng;
-use rlgym::{Action, Env, GameState, Obs, Reward, SharedInfoProvider, Truncate, rocketsim::Arena};
+use rlgym::rocketsim::Arena;
+use rlgym::{Action, Env, GameState, Obs, Reward, SharedInfoProvider, Truncate};
 use serde::{Deserialize, Serialize};
 
-use super::{model::Actic, self_play::PolicyVersion};
-use crate::{
-    environment::sim::{GameInstance, RewardSamplingConfig},
-    utils::{
-        Report,
-        shared_info::{SharedInfoReport, SharedInfoRng},
-        state_setters::KickoffState,
-        terminal::OnGoalCondition,
-    },
-};
+use super::model::Actic;
+use super::self_play::PolicyVersion;
+use crate::environment::sim::{GameInstance, RewardSamplingConfig};
+use crate::utils::Report;
+use crate::utils::shared_info::{SharedInfoReport, SharedInfoRng};
+use crate::utils::state_setters::KickoffState;
+use crate::utils::terminal::OnGoalCondition;
 
 /// Per-mode Elo ratings (e.g. `"1v1"`, `"2v2"`, `"3v3"`).
 ///

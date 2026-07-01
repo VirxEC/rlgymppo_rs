@@ -11,10 +11,9 @@ pub(crate) mod running_stat;
 pub(crate) mod serde;
 
 pub use avg_tracker::AvgTracker;
-use burn::{
-    prelude::*,
-    tensor::{Distribution, Transaction, cast::ToElement},
-};
+use burn::prelude::*;
+use burn::tensor::cast::ToElement;
+use burn::tensor::{Distribution, Transaction};
 pub use report::{Report, Reportable};
 
 pub(crate) fn to_mask_tensor_2d<B: Backend>(

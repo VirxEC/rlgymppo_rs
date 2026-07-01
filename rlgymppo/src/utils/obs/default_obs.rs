@@ -1,133 +1,89 @@
 use std::iter::repeat_n;
 
 use rand::seq::SliceRandom;
-use rlgym::{
-    FullObs, GameState, Obs,
-    rocketsim::{CarState, PhysState, Team, Vec3A, consts},
-};
+use rlgym::rocketsim::{CarState, PhysState, Team, consts};
+use rlgym::{FullObs, GameState, Obs};
 
 use crate::utils::shared_info::SharedInfoRng;
 
-/// Default observation builder, ported from GigaLearn's `DefaultObs`/`DefaultObsPadded`.
-///
-/// Builds a fixed-size per-player observation vector consisting of:
-/// - Ball state (pos, vel, ang_vel) – 9 floats
-/// - Previous action – 8 floats
-/// - Boost pad states – 34 floats
-/// - Current car state – 19 floats
-/// - Teammate car states – `(MAX_PLAYERS - 1) * 19` floats (padded with zeros, then shuffled)
-/// - Opponent car states – `MAX_PLAYERS * 19` floats (padded with zeros, then shuffled)
-///
-/// Orange-team observations are mirrored (Y-axis flip) so all observations
-/// use a consistent coordinate system (blue-team perspective).
-///
-/// Demoed cars have all observation fields zeroed except the last
-/// (`demo_respawn_timer * DEMO_COEF`), matching the masking pattern from MyObs.
-pub struct DefaultObs<const MAX_PLAYERS: usize> {
-    /// Component-wise position scaling factor (default: `[1/4096, 1/5120, 1/2044]`)
-    pos_coef: Vec3A,
-    /// Velocity scaling factor (default: [`Self::VEL_COEF`])
-    vel_coef: f32,
-    /// Angular velocity scaling factor (default: [`Self::ANG_VEL_COEF`])
-    ang_vel_coef: f32,
-}
+pub struct DefaultObs<const MAX_PLAYERS_PER_TEAM: usize>;
 
-impl<const MAX_PLAYERS: usize> DefaultObs<MAX_PLAYERS> {
-    pub const CAR_OBS: usize = 19;
-    pub const BALL_OBS: usize = 9;
-    pub const ACTION_OBS: usize = 8;
-    pub const BOOST_PADS_OBS: usize = 34;
+impl<const MAX_TEAM_PLAYERS: usize> DefaultObs<MAX_TEAM_PLAYERS> {
+    const CAR_OBS: usize = 22;
+    const BALL_OBS: usize = 9;
 
-    pub const POS_COEF: Vec3A = Vec3A::new(1.0 / 4096.0, 1.0 / 5120.0, 1.0 / 2044.0);
-    pub const VEL_COEF: f32 = 1.0 / consts::ball::MAX_SPEED;
-    pub const ANG_VEL_COEF: f32 = 1.0 / consts::ball::MAX_ANG_SPEED;
-    pub const BOOST_COEF: f32 = 1.0 / consts::car::boost::MAX;
-    pub const DEMO_COEF: f32 = 1.0 / consts::car::spawn::RESPAWN_TIME;
-
-    /// Create a new `DefaultObs` with default values matching GigaLearn's `DefaultObs`.
-    pub fn new() -> Self {
-        Self {
-            pos_coef: Self::POS_COEF,
-            vel_coef: Self::VEL_COEF,
-            ang_vel_coef: Self::ANG_VEL_COEF,
-        }
-    }
-
-    /// Set the component-wise position scaling factor (default: `[1/4096, 1/5120, 1/2044]`).
-    pub fn with_pos_coef(mut self, coef: Vec3A) -> Self {
-        self.pos_coef = coef;
-        self
-    }
-
-    /// Set the velocity scaling factor (default: [`Self::VEL_COEF`]).
-    pub fn with_vel_coef(mut self, coef: f32) -> Self {
-        self.vel_coef = coef;
-        self
-    }
-
-    /// Set the angular velocity scaling factor (default: [`Self::ANG_VEL_COEF`]).
-    pub fn with_ang_vel_coef(mut self, coef: f32) -> Self {
-        self.ang_vel_coef = coef;
-        self
-    }
+    const POS_COEF: f32 = 1.0 / 6000.0;
+    const VEL_COEF: f32 = 1.0 / consts::ball::MAX_SPEED;
+    const ANG_VEL_COEF: f32 = 1.0 / consts::ball::MAX_ANG_SPEED;
+    const BOOST_COEF: f32 = 1.0 / consts::car::boost::MAX;
+    const DEMO_COEF: f32 = 1.0 / consts::car::spawn::RESPAWN_TIME;
 
     /// Compute the full observation size in floats.
-    fn obs_space(&self) -> usize {
-        Self::BALL_OBS
-            + Self::ACTION_OBS
-            + Self::BOOST_PADS_OBS
-            + Self::CAR_OBS
-            + Self::CAR_OBS * (MAX_PLAYERS.saturating_sub(1))
-            + Self::CAR_OBS * MAX_PLAYERS
+    const fn obs_space(&self) -> usize {
+        Self::BALL_OBS + Self::CAR_OBS * MAX_TEAM_PLAYERS * 2
     }
 
-    /// Append a car's observation fields to `obs`.
+    /// Build a car's observation fields as a `Vec<f32>`.
     ///
-    /// Observation layout per car (19 floats):
+    /// Observation layout per car (22 floats):
     ///   pos(3) + forward(3) + up(3) + vel(3) + ang_vel(3)
-    ///   + boost(1) + isOnGround(1) + hasFlipOrJump(1) + demo_respawn_timer(1)
+    ///   + boost(1) + isOnGround(1) + hasFlipOrJump(1)
+    ///   + isAutoFlipping(1) + airTimeSinceJump(1)
+    ///   + handbrake(1) + demoRespawnTimer(1)
     ///
     /// When `car.is_demoed` is true, all fields are zeroed except the last
     /// (`demo_respawn_timer * DEMO_COEF`).
     #[inline]
-    fn add_car_obs(obs: &mut Vec<f32>, phys: &PhysState, car: &CarState) {
+    fn get_car_obs<const INVERT: bool>(car: &CarState) -> Vec<f32> {
+        let mut obs = Vec::with_capacity(Self::CAR_OBS);
+
         if car.is_demoed {
             obs.extend(repeat_n(0.0, Self::CAR_OBS - 1));
             obs.push(car.demo_respawn_timer * Self::DEMO_COEF);
-            return;
+        } else {
+            let phys = if INVERT { car.phys.flip_y() } else { car.phys };
+
+            // Position (3)
+            obs.extend((phys.pos * Self::POS_COEF).to_array());
+            // Forward direction (rot_mat.x_axis) (3)
+            obs.extend(phys.rot_mat.x_axis.to_array());
+            // Up direction (rot_mat.z_axis) (3)
+            obs.extend(phys.rot_mat.z_axis.to_array());
+            // Velocity (3)
+            obs.extend((phys.vel * Self::VEL_COEF).to_array());
+            // Angular velocity (3)
+            obs.extend((phys.ang_vel * Self::ANG_VEL_COEF).to_array());
+            // Scalar state (7) – last field is the demo respawn timer
+            obs.push(car.boost * Self::BOOST_COEF);
+            obs.push(f32::from(car.is_on_ground));
+            obs.push(f32::from(car.has_flip_or_jump()));
+            obs.push(f32::from(car.is_auto_flipping));
+            obs.push(car.air_time_since_jump);
+            obs.push(car.handbrake_val);
+            obs.push(car.demo_respawn_timer * Self::DEMO_COEF);
         }
 
-        // Position (3)
-        obs.extend(phys.pos.to_array());
-        // Forward direction (rot_mat.x_axis) (3)
-        obs.extend(phys.rot_mat.x_axis.to_array());
-        // Up direction (rot_mat.z_axis) (3)
-        obs.extend(phys.rot_mat.z_axis.to_array());
-        // Velocity (3)
-        obs.extend(phys.vel.to_array());
-        // Angular velocity (3)
-        obs.extend(phys.ang_vel.to_array());
-        // Scalar state (5) – last field is the demo respawn timer
-        obs.push(car.boost * Self::BOOST_COEF);
-        obs.push(f32::from(car.is_on_ground));
-        obs.push(f32::from(car.has_flip_or_jump()));
-        obs.push(car.demo_respawn_timer * Self::DEMO_COEF);
+        assert_eq!(obs.len(), Self::CAR_OBS);
+        obs
     }
 
-    /// Build a scaled, optionally flipped, `PhysState` for a car.
-    #[inline]
-    fn build_car_phys(car: &CarState, invert: bool, coefs: &Self) -> PhysState {
-        let phys = if invert { car.phys.flip_y() } else { car.phys };
-        PhysState {
-            pos: phys.pos * coefs.pos_coef,
-            vel: phys.vel * coefs.vel_coef,
-            ang_vel: phys.ang_vel * coefs.ang_vel_coef,
-            ..phys
-        }
+    /// Build a ball's observation fields as a `Vec<f32>`.
+    ///
+    /// Observation layout: pos(3) + vel(3) + ang_vel(3) = 9 floats.
+    fn get_ball_obs<const INVERT: bool>(phys: PhysState) -> Vec<f32> {
+        let mut obs = Vec::with_capacity(Self::BALL_OBS);
+
+        let phys = if INVERT { phys.flip_y() } else { phys };
+        obs.extend((phys.pos * Self::POS_COEF).to_array());
+        obs.extend((phys.vel * Self::VEL_COEF).to_array());
+        obs.extend((phys.ang_vel * Self::ANG_VEL_COEF).to_array());
+
+        assert_eq!(obs.len(), Self::BALL_OBS);
+        obs
     }
 }
 
-impl<const MAX_PLAYERS: usize, SI: SharedInfoRng> Obs<SI> for DefaultObs<MAX_PLAYERS> {
+impl<const MAX_TEAM_PLAYERS: usize, SI: SharedInfoRng> Obs<SI> for DefaultObs<MAX_TEAM_PLAYERS> {
     fn get_obs_space(&self, _shared_info: &SI) -> usize {
         self.obs_space()
     }
@@ -138,97 +94,86 @@ impl<const MAX_PLAYERS: usize, SI: SharedInfoRng> Obs<SI> for DefaultObs<MAX_PLA
         let num_cars = state.cars.len();
         let mut obs = Vec::with_capacity(num_cars);
 
-        for (info, car_state) in &state.cars {
+        let car_obs: Vec<Vec<f32>> = state
+            .cars
+            .iter()
+            .map(|(_, car)| Self::get_car_obs::<false>(car))
+            .collect();
+        let car_obs_inverted: Vec<Vec<f32>> = state
+            .cars
+            .iter()
+            .map(|(_, car)| Self::get_car_obs::<true>(car))
+            .collect();
+
+        let ball_obs = Self::get_ball_obs::<false>(state.ball.phys);
+        let ball_obs_inverted = Self::get_ball_obs::<true>(state.ball.phys);
+
+        let car_pad_obs = vec![0.0; Self::CAR_OBS];
+        let mut cars: Vec<Vec<f32>> = Vec::new();
+
+        for (i, (info, _car_state)) in state.cars.iter().enumerate() {
             let invert = info.team == Team::Orange;
 
-            // ── Ball (flipped for orange team) ──────────────────────────
-            let ball_phys = if invert {
-                state.ball.phys.flip_y()
+            // Ball
+            let ball = if invert {
+                &ball_obs_inverted
             } else {
-                state.ball.phys
+                &ball_obs
             };
 
             let mut obs_vec: Vec<f32> = Vec::with_capacity(self.obs_space());
 
-            // Ball: pos(3) + vel(3) + ang_vel(3) = 9
-            obs_vec.extend((ball_phys.pos * self.pos_coef).to_array());
-            obs_vec.extend((ball_phys.vel * self.vel_coef).to_array());
-            obs_vec.extend((ball_phys.ang_vel * self.ang_vel_coef).to_array());
+            obs_vec.extend(ball);
+            assert_eq!(obs_vec.len(), Self::BALL_OBS);
 
-            // ── Previous action (8 floats) ──────────────────────────────
-            obs_vec.extend(car_state.prev_controls.to_floats());
+            // Current car
+            let car_obs = if invert { &car_obs_inverted } else { &car_obs };
+            obs_vec.extend(&car_obs[i]);
 
-            // ── Boost pads (34 floats) ──────────────────────────────────
-            let mut pad_count = 0;
-            for (_config, pstate) in &state.boost_pads {
-                if pad_count >= Self::BOOST_PADS_OBS {
-                    break;
-                }
-
-                obs_vec.push(f32::from(pstate.is_active()));
-                pad_count += 1;
-            }
-            obs_vec.extend(repeat_n(0.0, Self::BOOST_PADS_OBS - pad_count));
-
-            // ── Current car (19 floats) ─────────────────────────────────
-            let self_phys = Self::build_car_phys(car_state, invert, self);
-            Self::add_car_obs(&mut obs_vec, &self_phys, car_state);
-
-            // ── Teammates ───────────────────────────────────────────────
-            let mut teammates: Vec<Vec<f32>> = Vec::new();
-            for (other_info, other_car) in &state.cars {
+            // Teammates
+            for (j, (other_info, _)) in state.cars.iter().enumerate() {
                 if other_info.idx == info.idx {
                     continue;
                 }
+
                 if other_info.team == info.team {
-                    let phys = Self::build_car_phys(other_car, invert, self);
-                    let mut tm_obs = Vec::with_capacity(Self::CAR_OBS);
-                    Self::add_car_obs(&mut tm_obs, &phys, other_car);
-                    teammates.push(tm_obs);
+                    cars.push(car_obs[j].clone());
                 }
             }
 
-            // Pad to (MAX_PLAYERS - 1) then shuffle to prevent slot bias
-            while teammates.len() < MAX_PLAYERS.saturating_sub(1) {
-                teammates.push(vec![0.0; Self::CAR_OBS]);
+            while cars.len() < MAX_TEAM_PLAYERS - 1 {
+                cars.push(car_pad_obs.clone());
             }
 
-            teammates.shuffle(shared_info.rng());
-            for tm_obs in teammates {
+            cars.shuffle(shared_info.rng());
+            for tm_obs in &cars {
                 obs_vec.extend(tm_obs);
             }
 
-            // ── Opponents ───────────────────────────────────────────────
-            let mut opponents: Vec<Vec<f32>> = Vec::new();
-            for (other_info, other_car) in &state.cars {
+            cars.clear();
+
+            // Opponents
+            for (j, (other_info, _)) in state.cars.iter().enumerate() {
                 if other_info.team != info.team {
-                    let phys = Self::build_car_phys(other_car, invert, self);
-                    let mut op_obs = Vec::with_capacity(Self::CAR_OBS);
-                    Self::add_car_obs(&mut op_obs, &phys, other_car);
-                    opponents.push(op_obs);
+                    cars.push(car_obs[j].clone());
                 }
             }
 
-            // Pad to MAX_PLAYERS then shuffle
-            while opponents.len() < MAX_PLAYERS {
-                opponents.push(vec![0.0; Self::CAR_OBS]);
+            while cars.len() < MAX_TEAM_PLAYERS {
+                cars.push(car_pad_obs.clone());
             }
 
-            opponents.shuffle(shared_info.rng());
-            for op_obs in opponents {
+            cars.shuffle(shared_info.rng());
+            for op_obs in &cars {
                 obs_vec.extend(op_obs);
             }
 
-            debug_assert_eq!(obs_vec.len(), self.obs_space());
+            cars.clear();
+
+            assert_eq!(obs_vec.len(), self.obs_space());
             obs.push(obs_vec);
         }
 
         obs
-    }
-}
-
-impl<const MAX_PLAYERS: usize> Default for DefaultObs<MAX_PLAYERS> {
-    fn default() -> Self {
-        Self::new()
     }
 }

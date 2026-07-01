@@ -1,5 +1,7 @@
-use rand::distr::{Distribution, weighted::WeightedIndex};
-use rlgym::{StateSetter, rocketsim::Arena};
+use rand::distr::Distribution;
+use rand::distr::weighted::WeightedIndex;
+use rlgym::StateSetter;
+use rlgym::rocketsim::Arena;
 
 use crate::utils::shared_info::SharedInfoRng;
 

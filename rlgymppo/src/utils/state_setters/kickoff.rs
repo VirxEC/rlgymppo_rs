@@ -1,5 +1,6 @@
 use rand::RngExt;
-use rlgym::{StateSetter, rocketsim::Arena};
+use rlgym::StateSetter;
+use rlgym::rocketsim::Arena;
 
 use crate::utils::shared_info::SharedInfoRng;
 

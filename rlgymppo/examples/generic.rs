@@ -1,24 +1,24 @@
 #![recursion_limit = "256"]
 
-use burn::backend::{LibTorch, libtorch::LibTorchDevice};
-use rand::{Rng, SeedableRng, rng, rngs::SmallRng};
+use burn::backend::LibTorch;
+use burn::backend::libtorch::LibTorchDevice;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng, rng};
 use rlgym::rocketsim::{ArenaEvent, init_from_default};
+use rlgymppo::backend::Autodiff;
+use rlgymppo::rlgym::{Env, GameState, SharedInfoProvider};
+use rlgymppo::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
+use rlgymppo::utils::actions::DefaultAction;
+use rlgymppo::utils::obs::DefaultObs;
+use rlgymppo::utils::shared_info::{SharedInfoReport, SharedInfoRng};
+use rlgymppo::utils::state_setters::{KickoffState, RandomState, WeightedState};
+use rlgymppo::utils::terminal::{
+    AnyTerminal, NoTouchCondition, OnGoalCondition, RandomGameEndedCondition,
+};
+use rlgymppo::utils::{AvgTracker, Report, rewards};
 use rlgymppo::{
     LearnerConfig, PpoLearnerConfig, SelfPlayConfig, SkillTrackerConfig, any_terminal,
-    backend::Autodiff,
-    combined_rewards,
-    rlgym::{Env, GameState, SharedInfoProvider},
-    rocketsim::{Arena, CarBodyConfig, GameMode, Team},
-    utils::{
-        AvgTracker, Report,
-        actions::DefaultAction,
-        obs::DefaultObs,
-        rewards,
-        shared_info::{SharedInfoReport, SharedInfoRng},
-        state_setters::{KickoffState, RandomState, WeightedState},
-        terminal::{AnyTerminal, NoTouchCondition, OnGoalCondition, RandomGameEndedCondition},
-    },
-    weighted_state,
+    combined_rewards, weighted_state,
 };
 
 struct SharedInfo {
@@ -88,14 +88,14 @@ const MIN_GAME_DURATION: u64 = 60 * 120; // 1 minute in ticks
 const MAX_GAME_DURATION: u64 = 3 * 60 * 120; // 3 minutes in ticks
 type GameEndCond = RandomGameEndedCondition<MIN_GAME_DURATION, MAX_GAME_DURATION>;
 
-const MAX_NO_TOUCH_DURATION: u64 = 15 * 120; // 15 seconds in ticks
+const MAX_NO_TOUCH_DURATION: u64 = 10 * 120; // 10 seconds in ticks
 
 #[allow(clippy::type_complexity)]
 fn create_env(
     game_id: Option<usize>,
 ) -> Env<
     WeightedState<SharedInfo>,
-    DefaultObs<6>,
+    DefaultObs<3>,
     DefaultAction<6, 8>,
     rewards::CombinedRewards<SharedInfo>,
     AnyTerminal<SharedInfo>,
@@ -125,12 +125,12 @@ fn create_env(
             RandomState<true, true, true>, 0.2;
             RandomState<true, true, false>, 0.3;
         ],
-        DefaultObs::default(),
+        DefaultObs,
         DefaultAction::default(),
         combined_rewards![
-            "Reward/In Air", rewards::AirReward => 0.2;
-            "Reward/Face ball", rewards::FaceBallReward => 0.1;
-            "Reward/Velocity to ball", rewards::VelocityToBallReward => 1.0;
+            "Reward/In Air", rewards::AirReward => 0.25;
+            "Reward/Face ball", rewards::FaceBallReward => 0.25;
+            "Reward/Velocity to ball", rewards::VelocityToBallReward => 4.0;
             // "Reward/Velocity ball to goal", rewards::ZeroSumReward::new(
             //     rewards::VelocityBallToGoalReward, 1.0, 1.0
             // ) => 2.0;
@@ -145,7 +145,7 @@ fn main() {
     init_from_default(cfg!(not(debug_assertions))).unwrap();
 
     let mini_batch_size = 50_000;
-    let batch_size = mini_batch_size * 4;
+    let batch_size = mini_batch_size;
     let lr = 1.5e-4;
 
     // Router will fallback to NdArray if Wgpu is not available
@@ -153,16 +153,8 @@ fn main() {
     let config = LearnerConfig::<Autodiff<LibTorch>> {
         // if the renderer is on by default or not (can be toggled at runtime)
         render: false,
-        // !!! WATCH OUT !!!
-        //
-        // 6 (cars in a 3v3) * 180 (max seconds per episode) * 15 (steps per second, 120 tps / 8 tick skip = 8)
-        // = 16_200 (!!!)
-        // Each thread may run over by almost 11k ticks! this is minimized due to randomness,
-        // but if your total batch size is small, keep the number of threads low.
-        //
-        // Each thread is faster than you think!
-        //
-        // Only increase the number of threads if your cpu is having trouble saturating your gpu.
+        // Only increase the number of threads if your cpu is having trouble
+        // saturating your gpu. Each thread is faster than you think!
         num_threads: 4,
         // 4 (threads) * 64 (games per thread) = 256 (total games)
         // 256 total games is a good number to target.
@@ -194,9 +186,9 @@ fn main() {
             enabled: true,
             ..Default::default()
         },
-        shared_head_layer_sizes: vec![256],
-        policy_layer_sizes: vec![256; 4],
-        critic_layer_sizes: vec![256; 4],
+        shared_head_layer_sizes: vec![256; 2],
+        policy_layer_sizes: vec![256; 3],
+        critic_layer_sizes: vec![256; 3],
         device: LibTorchDevice::Cuda(0),
         render_device: LibTorchDevice::Cuda(0),
         #[cfg(feature = "wandb")]

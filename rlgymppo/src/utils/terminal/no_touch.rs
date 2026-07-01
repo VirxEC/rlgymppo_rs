@@ -1,4 +1,5 @@
-use rlgym::{GameState, Truncate, rocketsim::ArenaEvent};
+use rlgym::rocketsim::ArenaEvent;
+use rlgym::{GameState, Truncate};
 
 /// Terminal condition that triggers when no car has touched the ball for a given duration.
 #[derive(Default)]

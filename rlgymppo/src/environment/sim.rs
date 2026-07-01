@@ -1,10 +1,11 @@
+use rlgym::rocketsim::{BallState, GameMode};
 use rlgym::{
     Action, Env, FullObs, GameState, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
     Truncate,
-    rocketsim::{BallState, GameMode},
 };
 
-use crate::utils::{AvgTracker, Report, shared_info::SharedInfoReport};
+use crate::utils::shared_info::SharedInfoReport;
+use crate::utils::{AvgTracker, Report};
 
 #[derive(Clone)]
 pub struct StepResult {

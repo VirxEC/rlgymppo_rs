@@ -1,6 +1,7 @@
 use rlgym::{GameState, Terminal};
 
-use crate::utils::{AvgTracker, shared_info::SharedInfoReport};
+use crate::utils::AvgTracker;
+use crate::utils::shared_info::SharedInfoReport;
 
 /// A terminal condition that ends the episode when a goal is scored.
 #[derive(Default)]

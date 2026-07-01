@@ -1,5 +1,6 @@
 use rand::RngExt;
-use rlgym::{GameState, Terminal, rocketsim::ArenaEvent};
+use rlgym::rocketsim::ArenaEvent;
+use rlgym::{GameState, Terminal};
 
 use crate::utils::shared_info::SharedInfoRng;
 

@@ -1,10 +1,8 @@
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use rand::RngExt;
-use rlgym::{
-    StateSetter,
-    rocketsim::{Arena, BallState, CarState, Mat3A, Vec3A},
-};
+use rlgym::StateSetter;
+use rlgym::rocketsim::{Arena, BallState, CarState, Mat3A, Vec3A};
 
 use crate::utils::shared_info::SharedInfoRng;
 

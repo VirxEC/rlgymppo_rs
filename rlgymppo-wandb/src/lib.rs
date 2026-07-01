@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 
-use pyo3::{prelude::*, types::PyDict};
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 /// A handle to an active wandb run.
 ///

@@ -1,22 +1,18 @@
-use std::{
-    marker::PhantomData,
-    sync::{
-        Arc, Barrier,
-        mpsc::{Receiver, Sender, channel},
-    },
-    thread,
-};
+use std::marker::PhantomData;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use burn::prelude::Backend;
 use parking_lot::RwLock;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 
-use super::{batch_sim::BatchSim, sim::RewardSamplingConfig};
-use crate::{
-    agent::model::Actic,
-    base::Memory,
-    utils::{Report, shared_info::SharedInfoReport},
-};
+use super::batch_sim::BatchSim;
+use super::sim::RewardSamplingConfig;
+use crate::agent::model::Actic;
+use crate::base::Memory;
+use crate::utils::Report;
+use crate::utils::shared_info::SharedInfoReport;
 
 pub struct DataResponse {
     pub memory: Memory,
@@ -75,6 +71,7 @@ where
         num_games_per_thread: usize,
         device: B::Device,
         reward_sampling: RewardSamplingConfig,
+        max_episode_length: Option<usize>,
     ) -> Self
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
@@ -104,6 +101,7 @@ where
                     num_games_per_thread,
                     device,
                     reward_sampling,
+                    max_episode_length,
                 );
 
                 loop {

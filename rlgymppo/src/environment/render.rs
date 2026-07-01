@@ -1,18 +1,15 @@
-use std::{
-    sync::Arc,
-    thread::sleep,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use burn::prelude::*;
 use parking_lot::{Condvar, Mutex};
-use rlgym::{
-    Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
-    rocketsim::consts,
-};
+use rlgym::rocketsim::consts;
+use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 
 use super::sim::{GameInstance, RewardSamplingConfig};
-use crate::{agent::model::Actic, utils::shared_info::SharedInfoReport};
+use crate::agent::model::Actic;
+use crate::utils::shared_info::SharedInfoReport;
 
 pub struct RendererControls<B: Backend> {
     pub model: Option<Actic<B>>,

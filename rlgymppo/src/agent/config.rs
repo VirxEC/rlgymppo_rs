@@ -1,4 +1,5 @@
-use burn::{grad_clipping::GradientClippingConfig, tensor::backend::AutodiffBackend};
+use burn::grad_clipping::GradientClippingConfig;
+use burn::tensor::backend::AutodiffBackend;
 
 use super::Ppo;
 
@@ -36,6 +37,14 @@ pub struct PpoLearnerConfig {
     /// per metric report step (unused in the current Rust impl, kept
     /// for API compatibility with GigaLearn).
     pub max_reward_samples: usize,
+
+    /// Maximum number of steps per episode before the trajectory is
+    /// force-truncated (None = no limit).  When a player's trajectory
+    /// reaches this length the game is terminated with a TRUNCATED
+    /// terminal, providing the next-state observation for the critic
+    /// bootstrap.  Defaults to 1800 (120 seconds at 15 steps/second,
+    /// matching the GGL default).
+    pub max_episode_length: Option<usize>,
 }
 
 impl Default for PpoLearnerConfig {
@@ -57,6 +66,7 @@ impl Default for PpoLearnerConfig {
             add_rewards_to_metrics: true,
             reward_sample_interval: 8,
             max_reward_samples: 50,
+            max_episode_length: Some(1800),
         }
     }
 }

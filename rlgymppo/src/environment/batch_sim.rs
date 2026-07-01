@@ -4,11 +4,10 @@ use burn::prelude::*;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 
 use super::sim::{GameInstance, RewardSamplingConfig};
-use crate::{
-    agent::model::Actic,
-    base::{Memory, TerminalState},
-    utils::{Report, shared_info::SharedInfoReport},
-};
+use crate::agent::model::Actic;
+use crate::base::{Memory, TerminalState};
+use crate::utils::Report;
+use crate::utils::shared_info::SharedInfoReport;
 
 /// Per-player trajectory buffer that persists across [`run`] calls
 /// so incomplete episodes carry over to the next iteration.
@@ -39,6 +38,7 @@ where
     player_trajs: Vec<PlayerTraj>,
     metrics: Report,
     device: B::Device,
+    max_episode_length: Option<usize>,
 
     // ── Self‑play state ──────────────────────────────────────────
     /// Per-player team index (0 = Blue, 1 = Orange), cached at
@@ -63,6 +63,7 @@ where
         num_games: usize,
         device: B::Device,
         reward_sampling: RewardSamplingConfig,
+        max_episode_length: Option<usize>,
     ) -> Self
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
@@ -97,6 +98,7 @@ where
             player_trajs,
             device,
             player_teams,
+            max_episode_length,
         }
     }
 
@@ -211,7 +213,7 @@ where
 
                 let result = game.step(&actions[action_offset..action_offset + n]);
 
-                let terminal_type = if result.truncated {
+                let mut terminal_type = if result.truncated {
                     TerminalState::Truncated
                 } else if result.is_terminal {
                     TerminalState::Normal
@@ -220,6 +222,18 @@ where
                 };
 
                 let player_start: usize = self.np[..game_idx].iter().sum();
+
+                // Force-truncate if any tracked player in this game exceeds
+                // the maximum episode length (matches GGL behaviour).
+                if terminal_type == TerminalState::None
+                    && let Some(max_len) = self.max_episode_length
+                    && (player_start..player_start + n).any(|ti| {
+                        player_is_tracked[ti] && self.player_trajs[ti].states.len() >= max_len
+                    })
+                {
+                    terminal_type = TerminalState::Truncated;
+                }
+
                 for p in 0..n {
                     let ti = player_start + p;
                     if player_is_tracked[ti] {
@@ -234,13 +248,15 @@ where
                     }
                 }
 
-                if result.is_terminal || result.truncated {
+                let is_terminal = terminal_type != TerminalState::None;
+                if is_terminal {
                     // Episode ended — flush trajectories.
                     for p in 0..n {
                         let ti = player_start + p;
                         if player_is_tracked[ti] {
                             collected_steps += self.player_trajs[ti].states.len();
-                            let trunc_next = result.truncated.then(|| result.obs[p].clone());
+                            let trunc_next = (terminal_type == TerminalState::Truncated)
+                                .then(|| result.obs[p].clone());
                             memory.push_player(
                                 std::mem::take(&mut self.player_trajs[ti].states),
                                 std::mem::take(&mut self.player_trajs[ti].actions),
@@ -256,15 +272,22 @@ where
                         }
                     }
 
-                    // Reset the game.
-                    let (obs, masks) = game.reset();
-                    self.next_obs.extend(obs);
-                    self.next_masks.extend(masks);
+                    if result.is_terminal || result.truncated {
+                        // Env-level terminal — reset the game.
+                        let (obs, masks) = game.reset();
+                        self.next_obs.extend(obs);
+                        self.next_masks.extend(masks);
 
-                    // Refresh cached team info.
-                    let teams = game.player_teams();
-                    self.player_teams[player_start..(player_start + n)]
-                        .copy_from_slice(&teams[..n]);
+                        // Refresh cached team info.
+                        let teams = game.player_teams();
+                        self.player_teams[player_start..(player_start + n)]
+                            .copy_from_slice(&teams[..n]);
+                    } else {
+                        // Force truncation: game continues from current state
+                        // (matches GGL behaviour).
+                        self.next_obs.extend(result.obs);
+                        self.next_masks.extend(result.action_masks);
+                    }
                 } else {
                     self.next_obs.extend(result.obs);
                     self.next_masks.extend(result.action_masks);

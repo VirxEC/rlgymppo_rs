@@ -1,8 +1,6 @@
 use arrayvec::ArrayVec;
-use rlgym::{
-    Action, GameState,
-    rocketsim::{CarControls, CarState},
-};
+use rlgym::rocketsim::{CarControls, CarState};
+use rlgym::{Action, GameState};
 
 /// Generates a discrete action space table with 90 actions:
 /// - 24 ground actions (throttle × steer × boost × handbrake, with filter)
@@ -14,13 +12,13 @@ use rlgym::{
 /// `MAX_NUM_AGENTS` is used to size the internal action buffer, which is
 /// reused across ticks to avoid allocations. It should be set to the maximum
 /// number of agents that will be controlled by this action parser.
-pub struct DefaultAction<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8> {
+pub struct DefaultAction<const MAX_PLAYERS: usize, const TICK_SKIP: u8> {
     actions_table: Vec<CarControls>,
     ground_mask: Vec<bool>,
     air_mask: Vec<bool>,
     jump_mask: Vec<bool>,
     boost_mask: Vec<bool>,
-    action_buffer: ArrayVec<(usize, CarControls), MAX_NUM_AGENTS>,
+    action_buffer: ArrayVec<(usize, CarControls), MAX_PLAYERS>,
 }
 
 impl<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8> DefaultAction<MAX_NUM_AGENTS, TICK_SKIP> {

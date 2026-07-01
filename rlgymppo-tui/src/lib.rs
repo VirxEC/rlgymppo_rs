@@ -4,20 +4,19 @@
 //! ratatui alternate-screen TUI, updating after each iteration.  It is
 //! designed to run alongside the cloud-based wandb logger, or standalone.
 
-use std::{collections::HashMap, io};
+use std::collections::HashMap;
+use std::io;
 
-use crossterm::{
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
-};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 
 /// A terminal-based metrics dashboard using ratatui.
 ///
@@ -214,8 +213,9 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, metrics: &HashMap<Strin
     );
 }
 
-/// Render all metric groups in a two-column grid.  Groups that have no
-/// entries in `metrics` are hidden to keep the display clean.
+/// Render all metric groups in a grid.  Uses 2 columns by default, or 3
+/// when the terminal is significantly wider than it is tall.  Groups that
+/// have no entries in `metrics` are hidden to keep the display clean.
 fn render_metrics_grid(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -232,19 +232,48 @@ fn render_metrics_grid(
         return;
     }
 
-    // Split into two columns, balancing entries.
-    let mid = populated.len().div_ceil(2);
-    let left_groups = &populated[..mid];
-    let right_groups = &populated[mid..];
+    // Use 3 columns when the terminal is noticeably wider than it is tall.
+    let num_cols = if area.width > area.height * 2 { 3 } else { 2 };
 
-    let cols =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
+    let col_constraints: Vec<Constraint> = (0..num_cols)
+        .map(|_| Constraint::Ratio(1, num_cols as u32))
+        .collect();
+    let cols = Layout::horizontal(&col_constraints).split(area);
 
-    render_column(frame, cols[0], metrics, prev_vals, left_groups);
-    render_column(frame, cols[1], metrics, prev_vals, right_groups);
+    // Compute how many groups go in each column.  With 2 columns we bias
+    // toward the right (≈1/3–2/3 split, e.g. 3-5 not 4-4).  With 3 columns
+    // any remainder goes to the rightmost columns (2-3-3 not 3-3-2).
+    let col_sizes: Vec<usize> = if num_cols == 2 {
+        let left = (populated.len() + 1) / 3;
+        vec![left, populated.len() - left]
+    } else {
+        let base = populated.len() / num_cols;
+        let extra = populated.len() % num_cols;
+        (0..num_cols)
+            .map(|i| if i < num_cols - extra { base } else { base + 1 })
+            .collect()
+    };
+
+    let mut start = 0;
+    for (col_idx, col_area) in cols.iter().enumerate() {
+        let take = col_sizes[col_idx];
+        if take > 0 {
+            render_column(
+                frame,
+                *col_area,
+                metrics,
+                prev_vals,
+                &populated[start..start + take],
+            );
+            start += take;
+        }
+    }
 }
 
 /// Render a column of metric groups.
+///
+/// Vertical space is split proportional to the number of entries in each
+/// group, so groups with many metrics (e.g. Collect, Loss) get more room.
 fn render_column(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -252,16 +281,21 @@ fn render_column(
     prev_vals: &HashMap<String, f64>,
     groups: &[&MetricGroup],
 ) {
-    // Each group gets an equal vertical slice.
-    let constraints: Vec<Constraint> = groups
+    // Pre-compute entry lists so we only sort once per group.
+    let group_entries: Vec<Vec<(&str, f64)>> = groups
         .iter()
-        .map(|_| Constraint::Ratio(1, groups.len() as u32))
+        .map(|g| group_entries(metrics, g.key_prefix))
+        .collect();
+    let total: usize = group_entries.iter().map(|e| e.len()).sum();
+
+    let constraints: Vec<Constraint> = group_entries
+        .iter()
+        .map(|e| Constraint::Ratio(e.len() as u32, total as u32))
         .collect();
     let rows = Layout::vertical(constraints).split(area);
 
     for (i, group) in groups.iter().enumerate() {
-        let entries = group_entries(metrics, group.key_prefix);
-        render_group(frame, rows[i], group, &entries, prev_vals);
+        render_group(frame, rows[i], group, &group_entries[i], prev_vals);
     }
 }
 

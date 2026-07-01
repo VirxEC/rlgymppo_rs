@@ -1,7 +1,5 @@
-use rlgym::{
-    GameState, Reward,
-    rocketsim::{ArenaEvent, BallState, CarState, Team, Vec3A, consts},
-};
+use rlgym::rocketsim::{ArenaEvent, BallState, CarState, Team, Vec3A, consts};
+use rlgym::{GameState, Reward};
 
 /// Reward for how well the car is facing the ball.
 ///

@@ -1,12 +1,14 @@
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
 
-use burn::{
-    prelude::*,
-    record::{FullPrecisionSettings, NamedMpkGzFileRecorder},
-};
-use rand::{Rng, rngs::SmallRng};
+use burn::prelude::*;
+use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
+use rand::Rng;
+use rand::rngs::SmallRng;
 
-use super::{model::Actic, skill_tracker::SkillRating};
+use super::model::Actic;
+use super::skill_tracker::SkillRating;
 
 /// Configuration for saving policy versions and training against old
 /// versions (self-play).

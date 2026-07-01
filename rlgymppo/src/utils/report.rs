@@ -1,7 +1,5 @@
-use std::{
-    fmt,
-    ops::{AddAssign, Index, IndexMut},
-};
+use std::fmt;
+use std::ops::{AddAssign, Index, IndexMut};
 
 use rustc_hash::FxHashMap;
 

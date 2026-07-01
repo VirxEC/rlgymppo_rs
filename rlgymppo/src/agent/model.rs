@@ -1,8 +1,7 @@
-use burn::{
-    nn::{Initializer, LayerNormConfig, Linear, LinearConfig, norm::LayerNorm},
-    prelude::*,
-    tensor::activation::{relu, softmax},
-};
+use burn::nn::norm::LayerNorm;
+use burn::nn::{Initializer, LayerNormConfig, Linear, LinearConfig};
+use burn::prelude::*;
+use burn::tensor::activation::{relu, softmax};
 
 use crate::utils::{argmax_actions, sample_actions, to_mask_tensor_2d, to_state_tensor_2d};
 

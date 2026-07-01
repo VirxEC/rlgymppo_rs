@@ -5,41 +5,35 @@ mod environment;
 
 pub mod utils;
 
-use std::{
-    io::{Read, stdin},
-    path::PathBuf,
-    sync::{
-        Arc,
-        mpsc::{Sender, channel},
-    },
-    thread,
-    time::Instant,
-};
+use std::io::{Read, stdin};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::mpsc::{Sender, channel};
+use std::thread;
+use std::time::Instant;
 
-use agent::{Ppo, model::Actic, self_play::VersionManager, skill_tracker::SkillTracker};
-pub use agent::{
-    config::PpoLearnerConfig, self_play::SelfPlayConfig, skill_tracker::SkillTrackerConfig,
-};
+use agent::Ppo;
+pub use agent::config::PpoLearnerConfig;
+use agent::model::Actic;
+pub use agent::self_play::SelfPlayConfig;
+use agent::self_play::VersionManager;
+use agent::skill_tracker::SkillTracker;
+pub use agent::skill_tracker::SkillTrackerConfig;
 use base::TerminalState;
 pub use burn::backend;
-use burn::{
-    module::{AutodiffModule, Module, Quantizer},
-    tensor::backend::AutodiffBackend,
-};
-use environment::{
-    render::{Renderer, RendererControls},
-    sim::RewardSamplingConfig,
-    thread_sim::ThreadSim,
-};
+use burn::module::{AutodiffModule, Module, Quantizer};
+use burn::tensor::backend::AutodiffBackend;
+use environment::render::{Renderer, RendererControls};
+use environment::sim::RewardSamplingConfig;
+use environment::thread_sim::ThreadSim;
 use parking_lot::{Condvar, Mutex};
-use rand::{Rng, SeedableRng, rng, rngs::SmallRng};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng, rng};
 pub use rlgym::{self, rocketsim};
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
-use utils::{
-    running_stat::Stats,
-    serde::{latest_checkpoint_folder, load_latest_model, save_checkpoint},
-    shared_info::{SharedInfoReport, SharedInfoRng},
-};
+use utils::running_stat::Stats;
+use utils::serde::{latest_checkpoint_folder, load_latest_model, save_checkpoint};
+use utils::shared_info::{SharedInfoReport, SharedInfoRng};
 
 #[derive(Clone, Copy)]
 enum HumanInput {
@@ -266,6 +260,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             self.num_games_per_thread,
             self.device.clone(),
             reward_sampling,
+            self.ppo.max_episode_length,
         );
 
         let mut self_play_config = self.self_play;

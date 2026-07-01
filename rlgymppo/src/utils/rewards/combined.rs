@@ -1,6 +1,7 @@
 use rlgym::{GameState, Reward};
 
-use crate::utils::{AvgTracker, shared_info::SharedInfoReport};
+use crate::utils::AvgTracker;
+use crate::utils::shared_info::SharedInfoReport;
 
 #[macro_export]
 macro_rules! combined_rewards {

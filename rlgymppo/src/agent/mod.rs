@@ -3,30 +3,29 @@ pub mod model;
 pub mod self_play;
 pub mod skill_tracker;
 
-use std::{path::Path, time::Instant};
+use std::path::Path;
+use std::time::Instant;
 
-use burn::{
-    module::AutodiffModule,
-    nn::loss::{MseLoss, Reduction},
-    optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
-    prelude::*,
-    record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError},
-    tensor::{Transaction, backend::AutodiffBackend},
-};
-use rand::{Rng, seq::SliceRandom};
+use burn::module::AutodiffModule;
+use burn::nn::loss::{MseLoss, Reduction};
+use burn::optim::adaptor::OptimizerAdaptor;
+use burn::optim::{Adam, AdamConfig, GradientsParams, Optimizer};
+use burn::prelude::*;
+use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError};
+use burn::tensor::Transaction;
+use burn::tensor::backend::AutodiffBackend;
+use rand::Rng;
+use rand::seq::SliceRandom;
 use ringbuffer::RingBuffer;
 
-use crate::{
-    agent::{
-        config::PpoLearnerConfig,
-        model::{Actic, Net, PPOOutput},
-    },
-    base::{
-        Memory, TerminalState, get_action_batch, get_action_masks_batch, get_batch_1d,
-        get_generic_batch, get_log_probs_batch, get_states_batch,
-    },
-    utils::{Report, running_stat::Stats},
+use crate::agent::config::PpoLearnerConfig;
+use crate::agent::model::{Actic, Net, PPOOutput};
+use crate::base::{
+    Memory, TerminalState, get_action_batch, get_action_masks_batch, get_batch_1d,
+    get_generic_batch, get_log_probs_batch, get_states_batch,
 };
+use crate::utils::Report;
+use crate::utils::running_stat::Stats;
 
 pub struct Ppo<B: AutodiffBackend> {
     config: PpoLearnerConfig,

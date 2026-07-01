@@ -172,7 +172,7 @@ fn main() {
             // This scales differently than "ent_coef" in other frameworks;
             // This is the scale for normalized entropy,
             // which means you won't have to change it if you add more actions
-            entropy_scale: 0.018,
+            entropy_scale: 0.036,
             ..Default::default()
         },
         self_play: SelfPlayConfig {

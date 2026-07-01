@@ -22,6 +22,8 @@ pub use agent::skill_tracker::SkillTrackerConfig;
 use base::TerminalState;
 pub use burn::backend;
 use burn::module::{AutodiffModule, Module, Quantizer};
+use burn::nn::modules::norm::NormalizationConfig;
+use burn::nn::{LayerNormConfig, RmsNormConfig};
 use burn::tensor::backend::AutodiffBackend;
 use environment::render::{Renderer, RendererControls};
 use environment::sim::RewardSamplingConfig;
@@ -75,6 +77,17 @@ fn stdin_reader(s: Sender<HumanInput>) {
     }
 }
 
+/// Which normalization layer to apply after each hidden linear layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NormSelection {
+    /// No normalization.
+    None,
+    /// Layer Normalization (learnable affine with gamma & beta).
+    LayerNorm,
+    /// RMS Normalization (learnable scale only, no beta).
+    RmsNorm,
+}
+
 pub struct LearnerConfig<B: AutodiffBackend> {
     /// Hyperparameters for the PPO learner.
     pub ppo: PpoLearnerConfig,
@@ -93,8 +106,8 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub policy_layer_sizes: Vec<usize>,
     /// The layer sizes for the critic network.
     pub critic_layer_sizes: Vec<usize>,
-    /// Apply LayerNorm after every hidden linear layer.
-    pub use_layer_norm: bool,
+    /// Normalization to apply after every hidden linear layer.
+    pub norm: NormSelection,
     /// Layer sizes for the shared feature extractor (empty = no shared head).
     /// When set, the actor and critic take their input from this head's output.
     pub shared_head_layer_sizes: Vec<usize>,
@@ -149,7 +162,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             render_device: B::Device::default(),
             policy_layer_sizes: vec![256; 3],
             critic_layer_sizes: vec![256; 3],
-            use_layer_norm: true,
+            norm: NormSelection::LayerNorm,
             shared_head_layer_sizes: vec![256],
             checkpoints_limit: None,
             timesteps_per_save: 1_000_000,
@@ -200,6 +213,12 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         let obs_space = env.get_obs_space();
         let action_space = env.get_action_space();
 
+        let norm_config = match self.norm {
+            NormSelection::None => None,
+            NormSelection::LayerNorm => Some(NormalizationConfig::Layer(LayerNormConfig::new(0))),
+            NormSelection::RmsNorm => Some(NormalizationConfig::Rms(RmsNormConfig::new(0))),
+        };
+
         let model = Actic::<B>::new(
             obs_space,
             action_space,
@@ -207,7 +226,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             self.critic_layer_sizes,
             &self.shared_head_layer_sizes,
             &self.device,
-            self.use_layer_norm,
+            norm_config,
         );
 
         if let Some(ref head) = model.shared_head {

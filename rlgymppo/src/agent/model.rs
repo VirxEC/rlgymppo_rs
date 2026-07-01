@@ -1,5 +1,5 @@
-use burn::nn::norm::LayerNorm;
-use burn::nn::{Initializer, LayerNormConfig, Linear, LinearConfig};
+use burn::nn::modules::norm::{Normalization, NormalizationConfig};
+use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::activation::{relu, softmax};
 
@@ -19,9 +19,9 @@ impl<B: Backend> PPOOutput<B> {
 #[derive(Module, Debug)]
 pub struct Net<B: Backend> {
     linear_layers: Vec<Linear<B>>,
-    /// LayerNorm applied after each hidden linear layer (before activation).
-    /// Empty when layer normalization is disabled.
-    layer_norms: Vec<LayerNorm<B>>,
+    /// Normalization applied after each hidden linear layer (before activation).
+    /// Empty when normalization is disabled.
+    layer_norms: Vec<Normalization<B>>,
     /// Whether the last linear layer is a dedicated output layer (no norm, no activation).
     /// `false` for the shared head, whose last layer IS a hidden layer.
     #[module(skip)]
@@ -39,7 +39,7 @@ impl<B: Backend> Net<B> {
         output_size: usize,
         layer_sizes: Vec<usize>,
         device: &B::Device,
-        add_layer_norm: bool,
+        norm_config: Option<NormalizationConfig>,
         add_output_layer: bool,
     ) -> Self {
         assert_ne!(layer_sizes.len(), 0);
@@ -51,7 +51,7 @@ impl<B: Backend> Net<B> {
 
         let num_linears = layer_sizes.len() + if add_output_layer { 1 } else { 0 };
         let mut linear_layers = Vec::with_capacity(num_linears);
-        let mut layer_norms = if add_layer_norm {
+        let mut layer_norms = if norm_config.is_some() {
             Vec::with_capacity(layer_sizes.len())
         } else {
             Vec::new()
@@ -79,9 +79,10 @@ impl<B: Backend> Net<B> {
             );
         }
 
-        if add_layer_norm {
+        if let Some(ref base_config) = norm_config {
             for &size in &layer_sizes {
-                layer_norms.push(LayerNormConfig::new(size).init(device));
+                let config = base_config.clone().with_num_features(size);
+                layer_norms.push(config.init::<B>(device));
             }
         }
 
@@ -122,7 +123,7 @@ impl<B: Backend> Net<B> {
         &self.linear_layers
     }
 
-    pub fn layer_norms(&self) -> &[LayerNorm<B>] {
+    pub fn layer_norms(&self) -> &[Normalization<B>] {
         &self.layer_norms
     }
 
@@ -181,7 +182,7 @@ impl<B: Backend> Actic<B> {
         critic_layers: Vec<usize>,
         shared_head_layer_sizes: &[usize],
         device: &B::Device,
-        add_layer_norm: bool,
+        norm_config: Option<NormalizationConfig>,
     ) -> Self {
         let (head, actor_input) = if shared_head_layer_sizes.is_empty() {
             (None, input_size)
@@ -191,7 +192,7 @@ impl<B: Backend> Actic<B> {
                 0,
                 shared_head_layer_sizes.to_vec(),
                 device,
-                add_layer_norm,
+                norm_config.clone(),
                 false, // no output layer – just features
             );
             let feat_size = *shared_head_layer_sizes.last().unwrap();
@@ -205,10 +206,10 @@ impl<B: Backend> Actic<B> {
                 output_size,
                 actor_layers,
                 device,
-                add_layer_norm,
+                norm_config.clone(),
                 true,
             ),
-            critic: Net::new(actor_input, 1, critic_layers, device, add_layer_norm, true),
+            critic: Net::new(actor_input, 1, critic_layers, device, norm_config, true),
         }
     }
 

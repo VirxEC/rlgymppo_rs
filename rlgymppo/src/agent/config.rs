@@ -1,7 +1,10 @@
 use burn::grad_clipping::GradientClippingConfig;
+use burn::optim::adaptor::OptimizerAdaptor;
+use burn::optim::{AdamConfig, SimpleOptimizer};
 use burn::tensor::backend::AutodiffBackend;
 
 use super::Ppo;
+use super::model::Net;
 
 pub struct PpoLearnerConfig {
     pub gamma: f32,
@@ -72,6 +75,7 @@ impl Default for PpoLearnerConfig {
 }
 
 impl PpoLearnerConfig {
+    /// Initialize with the default Adam optimizer.
     pub fn init<B: AutodiffBackend>(self, device: B::Device) -> Ppo<B> {
         assert_eq!(
             self.batch_size % self.mini_batch_size,
@@ -79,6 +83,31 @@ impl PpoLearnerConfig {
             "Batch size must be divisible by mini batch size"
         );
 
-        Ppo::new(self, device)
+        let clip_grad = self.clip_grad.clone();
+        Ppo::new(self, device, || {
+            let mut cfg = AdamConfig::new().with_epsilon(1e-8);
+            if let Some(ref clip) = clip_grad {
+                cfg = cfg.with_grad_clipping(Some(clip.clone()));
+            }
+            cfg.init()
+        })
+    }
+
+    /// Initialize with a custom optimizer.
+    ///
+    /// The `make_optim` closure is called three times (once per sub-network)
+    /// and must return a freshly created [`OptimizerAdaptor`] each time.
+    pub fn init_with<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>>(
+        self,
+        device: B::Device,
+        make_optim: impl Fn() -> OptimizerAdaptor<O, Net<B>, B>,
+    ) -> Ppo<B, O> {
+        assert_eq!(
+            self.batch_size % self.mini_batch_size,
+            0,
+            "Batch size must be divisible by mini batch size"
+        );
+
+        Ppo::new(self, device, make_optim)
     }
 }

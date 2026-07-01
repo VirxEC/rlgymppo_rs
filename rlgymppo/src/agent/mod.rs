@@ -8,8 +8,9 @@ use std::time::Instant;
 
 use burn::module::AutodiffModule;
 use burn::nn::loss::{MseLoss, Reduction};
+use burn::nn::modules::norm::Normalization;
 use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{Adam, AdamConfig, GradientsParams, Optimizer};
+use burn::optim::{Adam, GradientsParams, Optimizer, SimpleOptimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError};
 use burn::tensor::Transaction;
@@ -27,22 +28,20 @@ use crate::base::{
 use crate::utils::Report;
 use crate::utils::running_stat::Stats;
 
-pub struct Ppo<B: AutodiffBackend> {
+pub struct Ppo<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend> = Adam> {
     config: PpoLearnerConfig,
-    policy_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
-    value_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
-    shared_head_optimizer: OptimizerAdaptor<Adam, Net<B>, B>,
+    policy_optimizer: OptimizerAdaptor<O, Net<B>, B>,
+    value_optimizer: OptimizerAdaptor<O, Net<B>, B>,
+    shared_head_optimizer: OptimizerAdaptor<O, Net<B>, B>,
     device: B::Device,
 }
 
-impl<B: AutodiffBackend> Ppo<B> {
-    pub fn new(config: PpoLearnerConfig, device: B::Device) -> Self {
-        let make_optim = || {
-            AdamConfig::new()
-                .with_epsilon(1e-8)
-                .with_grad_clipping(config.clip_grad.clone())
-                .init()
-        };
+impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
+    pub fn new(
+        config: PpoLearnerConfig,
+        device: B::Device,
+        make_optim: impl Fn() -> OptimizerAdaptor<O, Net<B>, B>,
+    ) -> Self {
         Self {
             policy_optimizer: make_optim(),
             value_optimizer: make_optim(),
@@ -52,7 +51,7 @@ impl<B: AutodiffBackend> Ppo<B> {
         }
     }
 
-    /// Save the Adam optimizer states (momentum/velocity buffers) to a checkpoint folder.
+    /// Save the optimizer states (momentum/velocity buffers) to a checkpoint folder.
     pub fn save_optimizers(&self, folder: &Path) {
         let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
@@ -82,7 +81,7 @@ impl<B: AutodiffBackend> Ppo<B> {
         println!("Saved optimizer states to: {folder:?}");
     }
 
-    /// Load the Adam optimizer states from a checkpoint folder.
+    /// Load the optimizer states from a checkpoint folder.
     pub fn load_optimizers(&mut self, folder: &Path) {
         let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
@@ -90,7 +89,7 @@ impl<B: AutodiffBackend> Ppo<B> {
         println!("Loading optimizer states...");
 
         let try_load_optim = |name: &str,
-                              target: &mut OptimizerAdaptor<Adam, Net<B>, B>|
+                              target: &mut OptimizerAdaptor<O, Net<B>, B>|
          -> Result<(), RecorderError> {
             let record = recorder.load(folder.join(name), &self.device)?;
             *target = target.clone().load_record(record);
@@ -120,7 +119,7 @@ impl<B: AutodiffBackend> Ppo<B> {
     }
 }
 
-impl<B: AutodiffBackend> Ppo<B> {
+impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
     pub fn learn<R: Rng>(
         &mut self,
         mut net: Actic<B>,
@@ -513,16 +512,35 @@ fn flatten_net<B: Backend>(net: &Net<B>) -> Vec<f32> {
         }
     }
     for norm in net.layer_norms() {
-        data.extend(
-            norm.gamma
-                .val()
-                .clone()
-                .into_data()
-                .into_vec::<f32>()
-                .unwrap(),
-        );
-        if let Some(beta) = &norm.beta {
-            data.extend(beta.val().clone().into_data().into_vec::<f32>().unwrap());
+        match norm {
+            Normalization::Layer(ln) => {
+                data.extend(
+                    ln.gamma
+                        .val()
+                        .clone()
+                        .into_data()
+                        .into_vec::<f32>()
+                        .unwrap(),
+                );
+                if let Some(beta) = &ln.beta {
+                    data.extend(beta.val().clone().into_data().into_vec::<f32>().unwrap());
+                }
+            }
+            Normalization::Rms(rms) => {
+                data.extend(
+                    rms.gamma
+                        .val()
+                        .clone()
+                        .into_data()
+                        .into_vec::<f32>()
+                        .unwrap(),
+                );
+                // RmsNorm has no beta parameter.
+            }
+            _ => {
+                // Other normalization variants (Batch, Group, Instance) are not
+                // currently used in this codebase, but we skip them gracefully.
+            }
         }
     }
     data

@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::mpsc;
-use std::thread;
 
 use burn::prelude::*;
 use rand::Rng;
@@ -80,7 +78,7 @@ impl Default for SkillTrackerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            num_arenas: thread::available_parallelism().unwrap().get(),
+            num_arenas: 16,
             sim_time_secs: 45.0,
             max_sim_time_secs: 240.0,
             update_interval: 16,
@@ -112,36 +110,10 @@ impl<SI: SharedInfoProvider> Truncate<SI> for NeverTruncate {
     }
 }
 
-/// Main → worker message.
-enum WorkerMsg {
-    /// Apply these actions and step forward.
-    Step(Vec<usize>),
-    /// Reset to a fresh kickoff.
-    Reset,
-}
-
-/// Worker → main response after a step or reset.
-#[derive(Clone)]
-struct WorkerResponse {
-    /// Observations for each player (post-step / post-reset).
-    obs: Vec<Vec<f32>>,
-    /// Action masks for each player.
-    masks: Vec<Vec<bool>>,
-    /// Teams after the step/reset.
-    player_teams: Vec<usize>,
-    /// `true` if the most recent step (not reset) triggered a terminal
-    /// (i.e. a goal was scored).
-    is_terminal: bool,
-    /// Ball-Y at the moment of the terminal (used to determine which
-    /// team scored).  Meaningless unless `is_terminal`.
-    ball_y: f32,
-}
-
 /// Manages the skill-rating evaluation pool and Elo-ratings lifecycle.
 ///
-/// Spawns one persistent worker thread per arena at construction.
-/// Communication: `WorkerMsg::Step(Vec<usize>)` / `WorkerMsg::Reset`
-/// sent per channel; each response carries post-step observations.
+/// Owns a set of in-process [`GameInstance`]s (one per arena) and steps
+/// them synchronously during skill-evaluation matches.
 pub struct SkillTracker<B: Backend, OBS, ACT, SI>
 where
     OBS: Obs<SI>,
@@ -150,10 +122,9 @@ where
 {
     config: SkillTrackerConfig,
 
-    /// One sender per arena (main → worker).
-    msg_txs: Vec<mpsc::Sender<WorkerMsg>>,
-    /// One receiver per arena (worker → main).
-    resp_rxs: Vec<mpsc::Receiver<WorkerResponse>>,
+    /// In-process game instances, one per arena.
+    games:
+        Vec<GameInstance<KickoffState, OBS, ACT, ZeroReward, OnGoalCondition, NeverTruncate, SI>>,
 
     // ── Buffered observation state ──────────────────────────────
     next_obs: Vec<Vec<f32>>,
@@ -175,8 +146,6 @@ where
     device: B::Device,
     tick_skip: u8,
 
-    /// Worker thread handles (joined on drop).
-    _workers: Vec<thread::JoinHandle<()>>,
     _phantom: PhantomData<(OBS, ACT, SI)>,
 }
 
@@ -187,54 +156,59 @@ where
     ACT: Action<SI, Input = usize>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
 {
-    /// Construct a new skill tracker.  Spawns one persistent worker
-    /// thread per arena.
+    /// Construct a new skill tracker.  Creates one in-process
+    /// [`GameInstance`] per arena.
     ///
     /// `create_arena` is called with the arena index; it should return
     /// an [`Arena`](rlgym::rocketsim::Arena) configured identically to
     /// the training env (matching car bodies, etc.).
     pub fn new<F>(config: SkillTrackerConfig, create_arena: F, device: B::Device) -> Self
     where
-        F: Fn(usize) -> (Arena, OBS, ACT, SI) + Clone + Send + 'static,
+        F: Fn(usize) -> (Arena, OBS, ACT, SI),
     {
         let tick_skip = ACT::get_tick_skip();
         let num_arenas = config.num_arenas;
 
-        let mut msg_txs = Vec::with_capacity(num_arenas);
-        let mut resp_rxs = Vec::with_capacity(num_arenas);
+        let mut games = Vec::with_capacity(num_arenas);
         let mut next_obs = Vec::new();
         let mut next_masks = Vec::new();
         let mut np = Vec::with_capacity(num_arenas);
         let mut player_teams = Vec::new();
-        let mut workers = Vec::with_capacity(num_arenas);
+
+        let reward_sampling = RewardSamplingConfig {
+            add_rewards_to_metrics: false,
+            ..Default::default()
+        };
 
         for game_idx in 0..num_arenas {
-            let create_arena = create_arena.clone();
+            let (arena, obs, action, shared_info) = (create_arena)(game_idx);
 
-            let (msg_tx, msg_rx) = mpsc::channel();
-            let (resp_tx, resp_rx) = mpsc::channel();
+            let env = Env::new(
+                arena,
+                KickoffState,
+                obs,
+                action,
+                ZeroReward,
+                OnGoalCondition,
+                NeverTruncate,
+                shared_info,
+            );
 
-            let handle = thread::spawn(move || {
-                worker_loop::<OBS, ACT, SI, F>(game_idx, create_arena, msg_rx, resp_tx);
-            });
-            workers.push(handle);
-
-            // Collect the initial state from the worker.
-            let resp = resp_rx.recv().unwrap();
-            next_obs.extend(resp.obs);
-            next_masks.extend(resp.masks);
-            let n = resp.player_teams.len();
+            let mut game = GameInstance::new(env, reward_sampling.clone());
+            let (obs, masks) = game.reset();
+            let teams = game.player_teams();
+            next_obs.extend(obs);
+            next_masks.extend(masks);
+            let n = teams.len();
             np.push(n);
-            player_teams.extend(resp.player_teams);
+            player_teams.extend(teams);
 
-            msg_txs.push(msg_tx);
-            resp_rxs.push(resp_rx);
+            games.push(game);
         }
 
         Self {
             config,
-            msg_txs,
-            resp_rxs,
+            games,
             next_obs,
             next_masks,
             np,
@@ -248,7 +222,6 @@ where
             prev_total_ticks: 0,
             device,
             tick_skip,
-            _workers: workers,
             _phantom: PhantomData,
         }
     }
@@ -368,32 +341,35 @@ where
                 combined[pi] = old_actions[k];
             }
 
-            // ── Send actions to workers ───────────────────────────
-            let mut action_offset = total_players;
-            for game_idx in (0..num_arenas).rev() {
-                let n = self.np[game_idx];
-                action_offset -= n;
-                let actions = combined[action_offset..action_offset + n].to_vec();
-                self.msg_txs[game_idx]
-                    .send(WorkerMsg::Step(actions))
-                    .unwrap();
-            }
-
             self.next_obs.clear();
             self.next_masks.clear();
 
+            // ── Step games directly ───────────────────────────────
             for game_idx in 0..num_arenas {
-                let resp = self.resp_rxs[game_idx].recv().unwrap();
+                let n = self.np[game_idx];
+                let player_start: usize = self.np[..game_idx].iter().sum();
+                let actions = combined[player_start..player_start + n].to_vec();
 
-                if resp.is_terminal {
+                let result = self.games[game_idx].step(&actions);
+
+                let (teams, obs, masks, is_terminal, ball_y) = if result.is_terminal {
+                    let ball_y = self.games[game_idx].last_game_state().ball.pos.y;
+                    let (obs, masks) = self.games[game_idx].reset();
+                    let teams = self.games[game_idx].player_teams();
+                    (teams, obs, masks, true, ball_y)
+                } else {
+                    let teams = self.games[game_idx].player_teams();
+                    (teams, result.obs, result.action_masks, false, 0.0)
+                };
+
+                if is_terminal {
                     //   ball_y < 0 → Blue scored
-                    let blue_scored = resp.ball_y.is_sign_negative();
+                    let blue_scored = ball_y.is_sign_negative();
                     let scorer_was_new = (new_team == 0) == blue_scored;
 
                     let update = |winner: &mut SkillRating, loser: &mut SkillRating| {
-                        let w =
-                            winner.get_for_teams(&resp.player_teams, self.config.initial_rating);
-                        let l = loser.get_for_teams(&resp.player_teams, self.config.initial_rating);
+                        let w = winner.get_for_teams(&teams, self.config.initial_rating);
+                        let l = loser.get_for_teams(&teams, self.config.initial_rating);
                         let exp_delta = (*l - *w) / 400.0;
                         let expected = 1.0 / (10.0_f32.powf(exp_delta) + 1.0);
                         *w += self.config.rating_inc * (1.0 - expected);
@@ -409,15 +385,11 @@ where
                     self.cur_goals += 1;
                 }
 
-                // Refresh team info from the response (may have changed
-                // after a reset).
-                let player_start: usize = self.np[..game_idx].iter().sum();
-                let n = self.np[game_idx];
-                self.player_teams[player_start..player_start + n]
-                    .copy_from_slice(&resp.player_teams);
+                // Refresh team info (may have changed after a reset).
+                self.player_teams[player_start..player_start + n].copy_from_slice(&teams);
 
-                self.next_obs.extend(resp.obs);
-                self.next_masks.extend(resp.masks);
+                self.next_obs.extend(obs);
+                self.next_masks.extend(masks);
             }
 
             total_ticks += self.tick_skip as u64;
@@ -462,115 +434,20 @@ where
         }
     }
 
-    /// Send `Reset` to every worker; drain their responses.
+    /// Reset all arenas to a fresh kickoff.
     fn reset_all_arenas(&mut self) {
-        for game_idx in 0..self.config.num_arenas {
-            self.msg_txs[game_idx].send(WorkerMsg::Reset).unwrap();
-        }
-
         self.next_obs.clear();
         self.next_masks.clear();
         self.player_teams.clear();
 
         for game_idx in 0..self.config.num_arenas {
-            let resp = self.resp_rxs[game_idx].recv().unwrap();
-            self.next_obs.extend(resp.obs);
-            self.next_masks.extend(resp.masks);
-            self.player_teams.extend(resp.player_teams);
-        }
-    }
-}
-
-/// Runs in each worker thread.  Builds its own [`GameInstance`] from the
-/// user's arena factory, then reacts to messages from the main thread.
-fn worker_loop<OBS, ACT, SI, F>(
-    game_idx: usize,
-    create_arena: F,
-    msg_rx: mpsc::Receiver<WorkerMsg>,
-    resp_tx: mpsc::Sender<WorkerResponse>,
-) where
-    OBS: Obs<SI>,
-    ACT: Action<SI, Input = usize>,
-    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
-    F: Fn(usize) -> (Arena, OBS, ACT, SI),
-{
-    let (arena, obs, action, shared_info) = (create_arena)(game_idx);
-
-    let env = Env::new(
-        arena,
-        KickoffState,
-        obs,
-        action,
-        ZeroReward,
-        OnGoalCondition,
-        NeverTruncate,
-        shared_info,
-    );
-
-    let reward_sampling = RewardSamplingConfig {
-        add_rewards_to_metrics: false,
-        ..Default::default()
-    };
-
-    let mut game = GameInstance::new(env, reward_sampling);
-
-    // Send initial state after the first reset.
-    let (obs, masks) = game.reset();
-    let teams = game.player_teams();
-    resp_tx
-        .send(WorkerResponse {
-            obs,
-            masks,
-            player_teams: teams,
-            is_terminal: false,
-            ball_y: 0.0,
-        })
-        .ok();
-
-    while let Ok(msg) = msg_rx.recv() {
-        match msg {
-            WorkerMsg::Reset => {
-                let (obs, masks) = game.reset();
-                let teams = game.player_teams();
-                resp_tx
-                    .send(WorkerResponse {
-                        obs,
-                        masks,
-                        player_teams: teams,
-                        is_terminal: false,
-                        ball_y: 0.0,
-                    })
-                    .ok();
-            }
-            WorkerMsg::Step(actions) => {
-                let result = game.step(&actions);
-
-                if result.is_terminal {
-                    // Capture scoring info BEFORE resetting.
-                    let ball_y = game.last_game_state().ball.pos.y;
-                    let (obs, masks) = game.reset();
-                    let teams = game.player_teams();
-                    resp_tx
-                        .send(WorkerResponse {
-                            obs,
-                            masks,
-                            player_teams: teams,
-                            is_terminal: true,
-                            ball_y,
-                        })
-                        .ok();
-                } else {
-                    resp_tx
-                        .send(WorkerResponse {
-                            obs: result.obs,
-                            masks: result.action_masks,
-                            player_teams: game.player_teams(),
-                            is_terminal: false,
-                            ball_y: 0.0,
-                        })
-                        .ok();
-                }
-            }
+            let (obs, masks) = self.games[game_idx].reset();
+            let teams = self.games[game_idx].player_teams();
+            let n = teams.len();
+            self.np[game_idx] = n;
+            self.next_obs.extend(obs);
+            self.next_masks.extend(masks);
+            self.player_teams.extend(teams);
         }
     }
 }

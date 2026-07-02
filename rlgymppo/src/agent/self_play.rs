@@ -48,7 +48,7 @@ impl Default for SelfPlayConfig {
 /// A snapshot of the policy network saved at a particular timestep.
 /// Uses `Module::clone()` for a deep copy so later mutations of the
 /// original network do not affect the stored version.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PolicyVersion<B: Backend> {
     pub timesteps: u64,
     pub model: Actic<B>,

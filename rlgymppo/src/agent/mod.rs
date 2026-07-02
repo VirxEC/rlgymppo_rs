@@ -158,13 +158,8 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
                 let states =
                     get_states_batch::<B::InnerBackend>(memory.states(), slice, &self.device);
                 let features = nodiff_net.apply_shared_head(states);
-                let batch_vals = nodiff_net
-                    .critic
-                    .forward(features)
-                    .into_data()
-                    .into_vec::<f32>()
-                    .unwrap();
-                values.extend(batch_vals);
+                let batch_vals = nodiff_net.critic.forward(features);
+                values.extend_from_slice(batch_vals.into_data().as_slice().unwrap());
             }
             values
         };
@@ -280,16 +275,14 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
                 });
 
                 let PPOOutput {
-                    policies: policy_batch,
+                    log_probs: log_prob,
                     values: value_batch,
                 } = net.forward(state_batch, mask_batch);
 
-                let log_prob = policy_batch.clone().log();
-
                 // Per-sample entropy normalised by ln(n_actions).
-                let num_actions = policy_batch.shape().dims::<2>()[1];
-                let entropy_per_sample =
-                    -(log_prob.clone() * policy_batch).sum_dim(1) / (num_actions as f32).ln();
+                let num_actions = log_prob.shape().dims::<2>()[1];
+                let entropy_per_sample = -(log_prob.clone() * log_prob.clone().exp()).sum_dim(1)
+                    / (num_actions as f32).ln();
                 let entropy = entropy_per_sample.mean();
 
                 let action_log_prob = log_prob.gather(1, action_batch.clone());
@@ -321,14 +314,36 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
                 let ppo_loss = actor_loss.clone() - entropy.clone() * self.config.entropy_scale;
                 let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
 
-                // Batch all metric syncs into a single device transaction.
+                let metric_entropy = entropy.detach();
+                let metric_kl = kl_mean.detach();
+                let metric_clip_fraction = clip_fraction.detach();
+                let metric_actor_loss = actor_loss.detach();
+                let metric_critic_loss = critic_loss.clone().detach();
+
+                let combined = (ppo_loss + critic_loss) * ratio;
+                let mut grads = combined.backward();
+
+                let actor_grads = GradientsParams::from_module(&mut grads, &net.actor);
+                net.actor = self.policy_optimizer.step(lr, net.actor, actor_grads);
+
+                let critic_grads = GradientsParams::from_module(&mut grads, &net.critic);
+                net.critic = self.value_optimizer.step(lr, net.critic, critic_grads);
+
+                if let Some(head) = net.shared_head.take() {
+                    let head_grads = GradientsParams::from_module(&mut grads, &head);
+                    net.shared_head = Some(self.shared_head_optimizer.step(lr, head, head_grads));
+                }
+
+                // Batch all metric syncs into a single device transaction after
+                // backward/optimizer work has been enqueued to avoid forcing an
+                // early GPU synchronization in the hot training path.
                 let [entropy_data, kl_data, clip_data, policy_data, critic_data] =
                     Transaction::default()
-                        .register(entropy.detach())
-                        .register(kl_mean.detach())
-                        .register(clip_fraction)
-                        .register(actor_loss.detach())
-                        .register(critic_loss.clone().detach())
+                        .register(metric_entropy)
+                        .register(metric_kl)
+                        .register(metric_clip_fraction)
+                        .register(metric_actor_loss)
+                        .register(metric_critic_loss)
                         .execute()
                         .try_into()
                         .expect("Correct amount of tensor data");
@@ -347,20 +362,6 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
                 let loss = critic_data.to_vec::<f32>().unwrap()[0];
                 assert!(!loss.is_nan(), "Value loss is NaN: {loss}");
                 mean_val_loss += loss;
-
-                let combined = (ppo_loss + critic_loss) * ratio;
-                let mut grads = combined.backward();
-
-                let actor_grads = GradientsParams::from_module(&mut grads, &net.actor);
-                net.actor = self.policy_optimizer.step(lr, net.actor, actor_grads);
-
-                let critic_grads = GradientsParams::from_module(&mut grads, &net.critic);
-                net.critic = self.value_optimizer.step(lr, net.critic, critic_grads);
-
-                if let Some(head) = net.shared_head.take() {
-                    let head_grads = GradientsParams::from_module(&mut grads, &head);
-                    net.shared_head = Some(self.shared_head_optimizer.step(lr, head, head_grads));
-                }
             }
         }
 

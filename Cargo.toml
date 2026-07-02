@@ -1,5 +1,5 @@
 [workspace]
-members = ["rlgymppo", "rlgymppo-wandb", "rlgymppo-tui"]
+members = ["rlgymppo", "rlgymppo-wandb", "rlgymppo-tui", "rlgymppo-trainer"]
 resolver = "2"
 
 [profile.dev]
@@ -11,3 +11,6 @@ opt-level = 3
 
 [profile.release]
 debug = true
+
+[patch."https://github.com/ZealanL/RocketSim.git"]
+rocketsim = { git = "https://github.com/VirxEC/RocketSim.git", branch = "col_test" }

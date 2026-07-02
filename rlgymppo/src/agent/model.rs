@@ -1,18 +1,20 @@
 use burn::nn::modules::norm::{Normalization, NormalizationConfig};
 use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
-use burn::tensor::activation::{relu, softmax};
+use burn::tensor::activation::{log_softmax, relu, softmax};
 
-use crate::utils::{argmax_actions, sample_actions, to_mask_tensor_2d, to_state_tensor_2d};
+use crate::utils::{
+    argmax_actions, sample_actions_from_logits, to_mask_tensor_2d, to_state_tensor_2d,
+};
 
 pub struct PPOOutput<B: Backend> {
-    pub policies: Tensor<B, 2>,
+    pub log_probs: Tensor<B, 2>,
     pub values: Tensor<B, 2>,
 }
 
 impl<B: Backend> PPOOutput<B> {
-    pub fn new(policies: Tensor<B, 2>, values: Tensor<B, 2>) -> Self {
-        Self { policies, values }
+    pub fn new(log_probs: Tensor<B, 2>, values: Tensor<B, 2>) -> Self {
+        Self { log_probs, values }
     }
 }
 
@@ -127,14 +129,21 @@ impl<B: Backend> Net<B> {
         &self.layer_norms
     }
 
-    pub fn infer(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+    pub fn masked_logits(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
         let logits = self.forward(input);
-        let logits = if let Some(mask) = mask {
+        if let Some(mask) = mask {
             logits - (1.0 - mask) * 1e10_f32
         } else {
             logits
-        };
-        softmax(logits, 1).clamp(1e-11, 1.0)
+        }
+    }
+
+    pub fn log_probs(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+        log_softmax(self.masked_logits(input, mask), 1)
+    }
+
+    pub fn infer(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+        softmax(self.masked_logits(input, mask), 1).clamp(1e-11, 1.0)
     }
 
     pub fn react_deterministic(
@@ -144,7 +153,7 @@ impl<B: Backend> Net<B> {
         device: &B::Device,
     ) -> Vec<usize> {
         let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
-        argmax_actions(self.infer(to_state_tensor_2d(state, device), mask_tensor))
+        argmax_actions(self.masked_logits(to_state_tensor_2d(state, device), mask_tensor))
     }
 
     pub fn react(
@@ -154,8 +163,8 @@ impl<B: Backend> Net<B> {
         device: &B::Device,
     ) -> (Vec<usize>, Vec<f32>) {
         let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
-        sample_actions(
-            self.infer(to_state_tensor_2d(state, device), mask_tensor),
+        sample_actions_from_logits(
+            self.masked_logits(to_state_tensor_2d(state, device), mask_tensor),
             device,
         )
     }
@@ -222,10 +231,10 @@ impl<B: Backend> Actic<B> {
 
     pub fn forward(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> PPOOutput<B> {
         let features = self.apply_shared_head(input);
-        let policies = self.actor.infer(features.clone(), mask);
+        let log_probs = self.actor.log_probs(features.clone(), mask);
         let values = self.critic.forward(features);
 
-        PPOOutput::<B>::new(policies, values)
+        PPOOutput::<B>::new(log_probs, values)
     }
 
     pub fn react(
@@ -237,7 +246,7 @@ impl<B: Backend> Actic<B> {
         let input = to_state_tensor_2d(state, device);
         let features = self.apply_shared_head(input);
         let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
-        sample_actions(self.actor.infer(features, mask_tensor), device)
+        sample_actions_from_logits(self.actor.masked_logits(features, mask_tensor), device)
     }
 
     pub fn react_deterministic(
@@ -249,6 +258,6 @@ impl<B: Backend> Actic<B> {
         let input = to_state_tensor_2d(state, device);
         let features = self.apply_shared_head(input);
         let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
-        argmax_actions(self.actor.infer(features, mask_tensor))
+        argmax_actions(self.actor.masked_logits(features, mask_tensor))
     }
 }

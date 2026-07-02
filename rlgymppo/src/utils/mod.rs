@@ -12,6 +12,7 @@ pub(crate) mod serde;
 
 pub use avg_tracker::AvgTracker;
 use burn::prelude::*;
+use burn::tensor::activation::log_softmax;
 use burn::tensor::cast::ToElement;
 use burn::tensor::{Distribution, Transaction};
 pub use report::{Report, Reportable};
@@ -40,17 +41,16 @@ pub(crate) fn to_state_tensor_2d<B: Backend>(
     Tensor::from_data(TensorData::new(data, [state.len(), state[0].len()]), device)
 }
 
-pub(crate) fn sample_actions<B: Backend>(
-    action_probs: Tensor<B, 2>,
+pub(crate) fn sample_actions_from_logits<B: Backend>(
+    logits: Tensor<B, 2>,
     device: &B::Device,
 ) -> (Vec<usize>, Vec<f32>) {
-    let shape = action_probs.shape();
-    let log_probs = action_probs.log();
+    let shape = logits.shape();
+    let log_probs = log_softmax(logits.clone(), 1);
 
     let u = Tensor::<B, 2>::random(shape, Distribution::Default, device);
     let gumbel = u.log().neg().log().neg();
-    let noisy = log_probs.clone() + gumbel;
-    let indices = noisy.argmax(1);
+    let indices = (logits + gumbel).argmax(1);
 
     let transaction = Transaction::default()
         .register(log_probs.gather(1, indices.clone()))

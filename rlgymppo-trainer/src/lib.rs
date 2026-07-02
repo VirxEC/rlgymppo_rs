@@ -1,11 +1,9 @@
 #![recursion_limit = "256"]
 
-use burn::backend::LibTorch;
-use burn::backend::libtorch::LibTorchDevice;
+use burn::tensor::backend::AutodiffBackend;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng, rng};
 use rlgym::rocketsim::{ArenaEvent, init_from_default};
-use rlgymppo::backend::Autodiff;
 use rlgymppo::rlgym::{Env, GameState, SharedInfoProvider};
 use rlgymppo::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
 use rlgymppo::utils::actions::DefaultAction;
@@ -21,7 +19,7 @@ use rlgymppo::{
     combined_rewards, weighted_state,
 };
 
-struct SharedInfo {
+pub struct SharedInfo {
     rng: SmallRng,
     metrics: Report,
 }
@@ -60,7 +58,6 @@ impl SharedInfoProvider for SharedInfo {
             self.metrics["Player/Ball Touch Ratio"] += AvgTracker::from(has_touched);
         }
 
-        // Track touch height from car-ball contact events
         for event in &game_state.events {
             if let ArenaEvent::CarHitBall(car_hit_ball) = event {
                 self.metrics["Player/Touch Height"] +=
@@ -84,14 +81,14 @@ impl SharedInfoReport for SharedInfo {
     }
 }
 
-const MIN_GAME_DURATION: u64 = 60 * 120; // 1 minute in ticks
-const MAX_GAME_DURATION: u64 = 3 * 60 * 120; // 3 minutes in ticks
+const MIN_GAME_DURATION: u64 = 60 * 120;
+const MAX_GAME_DURATION: u64 = 3 * 60 * 120;
 type GameEndCond = RandomGameEndedCondition<MIN_GAME_DURATION, MAX_GAME_DURATION>;
 
-const MAX_NO_TOUCH_DURATION: u64 = 10 * 120; // 10 seconds in ticks
+const MAX_NO_TOUCH_DURATION: u64 = 10 * 120;
 
 #[allow(clippy::type_complexity)]
-fn create_env(
+pub fn create_env(
     game_id: Option<usize>,
 ) -> Env<
     WeightedState<SharedInfo>,
@@ -102,16 +99,10 @@ fn create_env(
     NoTouchCondition<MAX_NO_TOUCH_DURATION>,
     SharedInfo,
 > {
-    // `game_id` is None for the game used to calculate the policy obs/action space,
-    // as well as for the renderer.
-    // Otherwise, every env gets a unique id starting from 0 and incrementing by 1.
     let game_id = game_id.unwrap_or(0);
 
     let mut arena = Arena::new(GameMode::Soccar);
 
-    // pseudo-random game mode: 1v1, 2v2, 3v3
-    // using game id ensures an equal, predictable distribution of game modes
-    // do not change the number of players between episodes
     for _ in 0..=game_id % 3 {
         arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
         arena.add_car(Team::Orange, CarBodyConfig::OCTANE);
@@ -131,9 +122,6 @@ fn create_env(
             "Reward/In Air", rewards::AirReward => 0.25;
             "Reward/Face ball", rewards::FaceBallReward => 0.25;
             "Reward/Velocity to ball", rewards::VelocityToBallReward => 4.0;
-            // "Reward/Velocity ball to goal", rewards::ZeroSumReward::new(
-            //     rewards::VelocityBallToGoalReward, 1.0, 1.0
-            // ) => 2.0;
         ],
         any_terminal![OnGoalCondition, GameEndCond],
         NoTouchCondition::default(),
@@ -141,26 +129,17 @@ fn create_env(
     )
 }
 
-fn main() {
-    init_from_default(cfg!(not(debug_assertions))).unwrap();
-
+pub fn default_config<B: AutodiffBackend>(
+    device: B::Device,
+    render_device: B::Device,
+) -> LearnerConfig<B> {
     let mini_batch_size = 40_000;
     let batch_size = mini_batch_size * 2;
     let lr = 1.5e-4;
 
-    // Router will fallback to NdArray if Wgpu is not available
-    // Realistically more useful for using CUDA and falling back to NdArray
-    let config = LearnerConfig::<Autodiff<LibTorch>> {
-        // if the renderer is on by default or not (can be toggled at runtime)
+    LearnerConfig {
         render: false,
-        // Only increase the number of threads if your cpu is having trouble
-        // saturating your gpu. Each thread is faster than you think!
         num_threads: 4,
-        // 4 (threads) * 64 (games per thread) = 256 (total games)
-        // 256 total games is a good number to target.
-        //
-        // If you increase `num_threads`,
-        // you can decrease `num_games_per_thread` to keep the total games around 256.
         num_games_per_thread: 64,
         timesteps_per_save: 10_000_000,
         checkpoints_limit: Some(10),
@@ -169,9 +148,6 @@ fn main() {
             mini_batch_size,
             epochs: 1,
             learning_rate: lr,
-            // This scales differently than "ent_coef" in other frameworks;
-            // This is the scale for normalized entropy,
-            // which means you won't have to change it if you add more actions
             entropy_scale: 0.036,
             ..Default::default()
         },
@@ -189,16 +165,20 @@ fn main() {
         shared_head_layer_sizes: vec![256; 2],
         policy_layer_sizes: vec![256; 3],
         critic_layer_sizes: vec![256; 3],
-        device: LibTorchDevice::Cuda(0),
-        render_device: LibTorchDevice::Cpu,
+        device,
+        render_device,
         #[cfg(feature = "wandb")]
         wandb_project_name: Some("rlgym-ppo".into()),
         #[cfg(feature = "wandb")]
         wandb_run_name: Some("ppo-bot-v1".into()),
         ..Default::default()
-    };
+    }
+}
 
-    let mut learner = config.init(create_env);
+pub fn run<B: AutodiffBackend>(device: B::Device, render_device: B::Device) {
+    init_from_default(cfg!(not(debug_assertions))).unwrap();
+
+    let mut learner = default_config::<B>(device, render_device).init(create_env);
     learner.load();
     learner.learn();
 }

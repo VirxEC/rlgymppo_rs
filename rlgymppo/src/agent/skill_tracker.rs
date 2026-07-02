@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::thread;
 
 use burn::prelude::*;
 use rand::Rng;
@@ -34,9 +36,7 @@ impl SkillRating {
         self.data.entry(mode.to_string()).or_insert(default)
     }
 
-    /// Get-or-insert a rating for a mode derived from per-player team
-    /// indices (0=Blue, 1=Orange).  Used when no [`GameState`] is
-    /// available (worker threads don't send it).
+    /// Get-or-insert a rating for the team-size mode.
     pub fn get_for_teams(&mut self, teams: &[usize], default: f32) -> &mut f32 {
         let blue = teams.iter().filter(|&&t| t == 0).count();
         let orange = teams.len() - blue;
@@ -110,10 +110,64 @@ impl<SI: SharedInfoProvider> Truncate<SI> for NeverTruncate {
     }
 }
 
-/// Manages the skill-rating evaluation pool and Elo-ratings lifecycle.
-///
-/// Owns a set of in-process [`GameInstance`]s (one per arena) and steps
-/// them synchronously during skill-evaluation matches.
+enum SkillWorkerCmd {
+    Step(Vec<usize>),
+    Reset,
+    Shutdown,
+}
+
+struct SkillArenaResult {
+    arena_idx: usize,
+    obs: Vec<Vec<f32>>,
+    masks: Vec<Vec<bool>>,
+    teams: Vec<usize>,
+    goal: Option<SkillGoalEvent>,
+}
+
+struct SkillGoalEvent {
+    teams: Vec<usize>,
+    blue_scored: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SkillTrackerUpdate {
+    pub eval_id: u64,
+    pub cur_ratings: SkillRating,
+}
+
+enum AsyncSkillTrackerJob<B: Backend> {
+    Run {
+        eval_id: u64,
+        current_model: Actic<B>,
+        versions: Vec<PolicyVersion<B>>,
+        cur_ratings: SkillRating,
+    },
+    Shutdown,
+}
+
+struct AsyncSkillTrackerResult {
+    update: SkillTrackerUpdate,
+    version_ratings: Vec<(u64, SkillRating)>,
+}
+
+pub struct AsyncSkillTracker<B: Backend, OBS, ACT, SI>
+where
+    OBS: Obs<SI>,
+    ACT: Action<SI, Input = usize>,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+{
+    config: SkillTrackerConfig,
+    job_tx: SyncSender<AsyncSkillTrackerJob<B>>,
+    result_rx: Receiver<AsyncSkillTrackerResult>,
+    worker: Option<thread::JoinHandle<()>>,
+    pub cur_ratings: SkillRating,
+    iterations_since_ran: usize,
+    next_eval_id: u64,
+    running_eval_id: Option<u64>,
+    _phantom: PhantomData<(OBS, ACT, SI)>,
+}
+
+/// Runs skill-rating evaluation matches.
 pub struct SkillTracker<B: Backend, OBS, ACT, SI>
 where
     OBS: Obs<SI>,
@@ -122,22 +176,18 @@ where
 {
     config: SkillTrackerConfig,
 
-    /// In-process game instances, one per arena.
-    games:
-        Vec<GameInstance<KickoffState, OBS, ACT, ZeroReward, OnGoalCondition, NeverTruncate, SI>>,
+    worker_txs: Vec<Sender<SkillWorkerCmd>>,
+    worker_rx: Receiver<SkillArenaResult>,
+    workers: Vec<thread::JoinHandle<()>>,
 
-    // ── Buffered observation state ──────────────────────────────
     next_obs: Vec<Vec<f32>>,
     next_masks: Vec<Vec<bool>>,
     np: Vec<usize>,
     player_teams: Vec<usize>,
 
-    // ── Rating state ────────────────────────────────────────────
     pub cur_ratings: SkillRating,
     cur_goals: usize,
-    iterations_since_ran: usize,
 
-    // ── Continuation state ──────────────────────────────────────
     do_continuation: bool,
     prev_old_version_idx: usize,
     prev_new_team: usize,
@@ -149,6 +199,71 @@ where
     _phantom: PhantomData<(OBS, ACT, SI)>,
 }
 
+fn send_skill_reset<OBS, ACT, SI>(
+    arena_idx: usize,
+    game: &mut GameInstance<KickoffState, OBS, ACT, ZeroReward, OnGoalCondition, NeverTruncate, SI>,
+    result_tx: &Sender<SkillArenaResult>,
+) where
+    OBS: Obs<SI>,
+    ACT: Action<SI, Input = usize>,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+{
+    let (obs, masks) = game.reset();
+    let teams = game.player_teams();
+    result_tx
+        .send(SkillArenaResult {
+            arena_idx,
+            obs,
+            masks,
+            teams,
+            goal: None,
+        })
+        .unwrap();
+}
+
+fn send_skill_step<OBS, ACT, SI>(
+    arena_idx: usize,
+    game: &mut GameInstance<KickoffState, OBS, ACT, ZeroReward, OnGoalCondition, NeverTruncate, SI>,
+    actions: &[usize],
+    result_tx: &Sender<SkillArenaResult>,
+) where
+    OBS: Obs<SI>,
+    ACT: Action<SI, Input = usize>,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+{
+    let result = game.step(actions);
+
+    let (teams, obs, masks, goal) = if result.is_terminal {
+        let ball_y = game.last_game_state().ball.pos.y;
+        let goal_teams = game.player_teams();
+        let blue_scored = ball_y.is_sign_negative();
+        let (obs, masks) = game.reset();
+        let teams = game.player_teams();
+        (
+            teams,
+            obs,
+            masks,
+            Some(SkillGoalEvent {
+                teams: goal_teams,
+                blue_scored,
+            }),
+        )
+    } else {
+        let teams = game.player_teams();
+        (teams, result.obs, result.action_masks, None)
+    };
+
+    result_tx
+        .send(SkillArenaResult {
+            arena_idx,
+            obs,
+            masks,
+            teams,
+            goal,
+        })
+        .unwrap();
+}
+
 impl<B, OBS, ACT, SI> SkillTracker<B, OBS, ACT, SI>
 where
     B: Backend,
@@ -156,24 +271,17 @@ where
     ACT: Action<SI, Input = usize>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
 {
-    /// Construct a new skill tracker.  Creates one in-process
-    /// [`GameInstance`] per arena.
-    ///
-    /// `create_arena` is called with the arena index; it should return
-    /// an [`Arena`](rlgym::rocketsim::Arena) configured identically to
-    /// the training env (matching car bodies, etc.).
+    /// Construct a skill tracker with one worker thread per arena.
     pub fn new<F>(config: SkillTrackerConfig, create_arena: F, device: B::Device) -> Self
     where
-        F: Fn(usize) -> (Arena, OBS, ACT, SI),
+        F: Fn(usize) -> (Arena, OBS, ACT, SI) + Clone + Send + 'static,
     {
         let tick_skip = ACT::get_tick_skip();
         let num_arenas = config.num_arenas;
 
-        let mut games = Vec::with_capacity(num_arenas);
-        let mut next_obs = Vec::new();
-        let mut next_masks = Vec::new();
-        let mut np = Vec::with_capacity(num_arenas);
-        let mut player_teams = Vec::new();
+        let (result_tx, worker_rx) = channel();
+        let mut worker_txs = Vec::with_capacity(num_arenas);
+        let mut workers = Vec::with_capacity(num_arenas);
 
         let reward_sampling = RewardSamplingConfig {
             add_rewards_to_metrics: false,
@@ -181,41 +289,75 @@ where
         };
 
         for game_idx in 0..num_arenas {
-            let (arena, obs, action, shared_info) = (create_arena)(game_idx);
+            let (cmd_tx, cmd_rx) = channel();
+            let result_tx = result_tx.clone();
+            let create_arena = create_arena.clone();
+            let reward_sampling = reward_sampling.clone();
 
-            let env = Env::new(
-                arena,
-                KickoffState,
-                obs,
-                action,
-                ZeroReward,
-                OnGoalCondition,
-                NeverTruncate,
-                shared_info,
-            );
+            let worker = thread::spawn(move || {
+                let (arena, obs, action, shared_info) = (create_arena)(game_idx);
 
-            let mut game = GameInstance::new(env, reward_sampling.clone());
-            let (obs, masks) = game.reset();
-            let teams = game.player_teams();
-            next_obs.extend(obs);
-            next_masks.extend(masks);
-            let n = teams.len();
+                let env = Env::new(
+                    arena,
+                    KickoffState,
+                    obs,
+                    action,
+                    ZeroReward,
+                    OnGoalCondition,
+                    NeverTruncate,
+                    shared_info,
+                );
+
+                let mut game = GameInstance::new(env, reward_sampling);
+                send_skill_reset(game_idx, &mut game, &result_tx);
+
+                while let Ok(cmd) = cmd_rx.recv() {
+                    match cmd {
+                        SkillWorkerCmd::Step(actions) => {
+                            send_skill_step(game_idx, &mut game, &actions, &result_tx);
+                        }
+                        SkillWorkerCmd::Reset => {
+                            send_skill_reset(game_idx, &mut game, &result_tx);
+                        }
+                        SkillWorkerCmd::Shutdown => break,
+                    }
+                }
+            });
+
+            worker_txs.push(cmd_tx);
+            workers.push(worker);
+        }
+        drop(result_tx);
+
+        let mut initial_results = Vec::with_capacity(num_arenas);
+        for _ in 0..num_arenas {
+            initial_results.push(worker_rx.recv().unwrap());
+        }
+        initial_results.sort_by_key(|result| result.arena_idx);
+
+        let mut next_obs = Vec::new();
+        let mut next_masks = Vec::new();
+        let mut np = Vec::with_capacity(num_arenas);
+        let mut player_teams = Vec::new();
+        for result in initial_results {
+            let n = result.teams.len();
             np.push(n);
-            player_teams.extend(teams);
-
-            games.push(game);
+            player_teams.extend(result.teams);
+            next_obs.extend(result.obs);
+            next_masks.extend(result.masks);
         }
 
         Self {
             config,
-            games,
+            worker_txs,
+            worker_rx,
+            workers,
             next_obs,
             next_masks,
             np,
             player_teams,
             cur_ratings: SkillRating::default(),
             cur_goals: 0,
-            iterations_since_ran: 0,
             do_continuation: false,
             prev_old_version_idx: 0,
             prev_new_team: 0,
@@ -226,40 +368,9 @@ where
         }
     }
 
-    /// Call once per training iteration.  Returns `true` when matches
-    /// were actually executed.
-    pub fn on_iteration(
-        &mut self,
-        current_model: &Actic<B>,
-        versions: &mut [PolicyVersion<B>],
-    ) -> bool {
-        if !self.config.enabled || versions.is_empty() {
-            return false;
-        }
-
-        self.iterations_since_ran += 1;
-        if self.iterations_since_ran >= self.config.update_interval {
-            self.iterations_since_ran = 0;
-            self.run_matches(current_model, versions);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Always write the current ratings into `report` so the TUI can
-    /// display them every iteration.
-    pub fn report_ratings(&self, report: &mut Report) {
-        for (mode, &rating) in &self.cur_ratings.data {
-            let key = format!("Rating/{mode}");
-            report[key.as_str()] = rating.into();
-        }
-    }
-
     fn run_matches(&mut self, current_model: &Actic<B>, versions: &mut [PolicyVersion<B>]) {
         let num_arenas = self.config.num_arenas;
 
-        // ── Pick opponent & team ──────────────────────────────────
         let (old_idx, new_team, mut total_ticks) = if self.do_continuation {
             (
                 self.prev_old_version_idx,
@@ -303,7 +414,6 @@ where
         let mut slice_start = total_ticks;
 
         while total_ticks < max_ticks && self.cur_goals < num_arenas {
-            // ── Split observations by model group ─────────────────
             let (no, nm): (Vec<_>, Vec<_>) = new_players
                 .iter()
                 .map(|&i| (self.next_obs[i].clone(), self.next_masks[i].clone()))
@@ -331,7 +441,6 @@ where
                 old_version.model.react(&oo, &om, &self.device).0
             };
 
-            // Interleave actions into full player order.
             let total_players = self.next_obs.len();
             let mut combined = vec![0usize; total_players];
             for (k, &pi) in new_players.iter().enumerate() {
@@ -344,32 +453,33 @@ where
             self.next_obs.clear();
             self.next_masks.clear();
 
-            // ── Step games directly ───────────────────────────────
+            let mut player_start = 0;
             for game_idx in 0..num_arenas {
                 let n = self.np[game_idx];
-                let player_start: usize = self.np[..game_idx].iter().sum();
                 let actions = combined[player_start..player_start + n].to_vec();
+                self.worker_txs[game_idx]
+                    .send(SkillWorkerCmd::Step(actions))
+                    .unwrap();
+                player_start += n;
+            }
 
-                let result = self.games[game_idx].step(&actions);
+            let mut arena_results = Vec::with_capacity(num_arenas);
+            for _ in 0..num_arenas {
+                arena_results.push(self.worker_rx.recv().unwrap());
+            }
+            arena_results.sort_by_key(|result| result.arena_idx);
 
-                let (teams, obs, masks, is_terminal, ball_y) = if result.is_terminal {
-                    let ball_y = self.games[game_idx].last_game_state().ball.pos.y;
-                    let (obs, masks) = self.games[game_idx].reset();
-                    let teams = self.games[game_idx].player_teams();
-                    (teams, obs, masks, true, ball_y)
-                } else {
-                    let teams = self.games[game_idx].player_teams();
-                    (teams, result.obs, result.action_masks, false, 0.0)
-                };
+            for result in arena_results {
+                let game_idx = result.arena_idx;
+                let n = result.teams.len();
+                let player_start: usize = self.np[..game_idx].iter().sum();
 
-                if is_terminal {
-                    //   ball_y < 0 → Blue scored
-                    let blue_scored = ball_y.is_sign_negative();
-                    let scorer_was_new = (new_team == 0) == blue_scored;
+                if let Some(goal) = result.goal {
+                    let scorer_was_new = (new_team == 0) == goal.blue_scored;
 
                     let update = |winner: &mut SkillRating, loser: &mut SkillRating| {
-                        let w = winner.get_for_teams(&teams, self.config.initial_rating);
-                        let l = loser.get_for_teams(&teams, self.config.initial_rating);
+                        let w = winner.get_for_teams(&goal.teams, self.config.initial_rating);
+                        let l = loser.get_for_teams(&goal.teams, self.config.initial_rating);
                         let exp_delta = (*l - *w) / 400.0;
                         let expected = 1.0 / (10.0_f32.powf(exp_delta) + 1.0);
                         *w += self.config.rating_inc * (1.0 - expected);
@@ -385,11 +495,11 @@ where
                     self.cur_goals += 1;
                 }
 
-                // Refresh team info (may have changed after a reset).
-                self.player_teams[player_start..player_start + n].copy_from_slice(&teams);
+                self.np[game_idx] = n;
+                self.player_teams[player_start..player_start + n].copy_from_slice(&result.teams);
 
-                self.next_obs.extend(obs);
-                self.next_masks.extend(masks);
+                self.next_obs.extend(result.obs);
+                self.next_masks.extend(result.masks);
             }
 
             total_ticks += self.tick_skip as u64;
@@ -399,7 +509,6 @@ where
             }
         }
 
-        // ── Continuation / finalisation ───────────────────────────
         if self.cur_goals < num_arenas && total_ticks < max_ticks {
             #[cfg(not(feature = "tui"))]
             println!(
@@ -414,7 +523,6 @@ where
             self.cur_goals = 0;
         }
 
-        // ── Console report ───────────────────────────────────────
         #[cfg(not(feature = "tui"))]
         for (mode, &rating) in &self.cur_ratings.data {
             let prev = prev_ratings
@@ -434,20 +542,202 @@ where
         }
     }
 
-    /// Reset all arenas to a fresh kickoff.
+    /// Reset all arenas.
     fn reset_all_arenas(&mut self) {
         self.next_obs.clear();
         self.next_masks.clear();
         self.player_teams.clear();
 
-        for game_idx in 0..self.config.num_arenas {
-            let (obs, masks) = self.games[game_idx].reset();
-            let teams = self.games[game_idx].player_teams();
-            let n = teams.len();
-            self.np[game_idx] = n;
-            self.next_obs.extend(obs);
-            self.next_masks.extend(masks);
-            self.player_teams.extend(teams);
+        for worker_tx in &self.worker_txs {
+            worker_tx.send(SkillWorkerCmd::Reset).unwrap();
+        }
+
+        let mut arena_results = Vec::with_capacity(self.config.num_arenas);
+        for _ in 0..self.config.num_arenas {
+            arena_results.push(self.worker_rx.recv().unwrap());
+        }
+        arena_results.sort_by_key(|result| result.arena_idx);
+
+        for result in arena_results {
+            let n = result.teams.len();
+            self.np[result.arena_idx] = n;
+            self.next_obs.extend(result.obs);
+            self.next_masks.extend(result.masks);
+            self.player_teams.extend(result.teams);
+        }
+    }
+}
+
+impl<B, OBS, ACT, SI> Drop for SkillTracker<B, OBS, ACT, SI>
+where
+    B: Backend,
+    OBS: Obs<SI>,
+    ACT: Action<SI, Input = usize>,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+{
+    fn drop(&mut self) {
+        for worker_tx in &self.worker_txs {
+            let _ = worker_tx.send(SkillWorkerCmd::Shutdown);
+        }
+
+        while let Some(worker) = self.workers.pop() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl<B, OBS, ACT, SI> AsyncSkillTracker<B, OBS, ACT, SI>
+where
+    B: Backend + Send + 'static,
+    OBS: Obs<SI>,
+    ACT: Action<SI, Input = usize>,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+{
+    pub fn new<F>(
+        config: SkillTrackerConfig,
+        create_arena: F,
+        device: B::Device,
+        metric_tx: Sender<SkillTrackerUpdate>,
+    ) -> Self
+    where
+        F: Fn(usize) -> (Arena, OBS, ACT, SI) + Clone + Send + 'static,
+        B::Device: Send,
+    {
+        let (job_tx, job_rx) = sync_channel(1);
+        let (result_tx, result_rx) = channel();
+        let tracker_config = config.clone();
+
+        let worker = thread::spawn(move || {
+            let mut tracker = SkillTracker::new(tracker_config, create_arena, device);
+
+            while let Ok(job) = job_rx.recv() {
+                match job {
+                    AsyncSkillTrackerJob::Run {
+                        eval_id,
+                        current_model,
+                        mut versions,
+                        cur_ratings,
+                    } => {
+                        tracker.cur_ratings = cur_ratings;
+                        tracker.run_matches(&current_model, &mut versions);
+
+                        let version_ratings = versions
+                            .into_iter()
+                            .map(|version| (version.timesteps, version.ratings))
+                            .collect();
+
+                        let update = SkillTrackerUpdate {
+                            eval_id,
+                            cur_ratings: tracker.cur_ratings.clone(),
+                        };
+
+                        let _ = metric_tx.send(update.clone());
+                        let _ = result_tx.send(AsyncSkillTrackerResult {
+                            update,
+                            version_ratings,
+                        });
+                    }
+                    AsyncSkillTrackerJob::Shutdown => break,
+                }
+            }
+        });
+
+        Self {
+            config,
+            job_tx,
+            result_rx,
+            worker: Some(worker),
+            cur_ratings: SkillRating::default(),
+            iterations_since_ran: 0,
+            next_eval_id: 0,
+            running_eval_id: None,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn on_iteration(
+        &mut self,
+        current_model: &Actic<B>,
+        versions: &[PolicyVersion<B>],
+    ) -> Option<u64> {
+        if !self.config.enabled || versions.is_empty() || self.running_eval_id.is_some() {
+            return None;
+        }
+
+        self.iterations_since_ran += 1;
+        if self.iterations_since_ran < self.config.update_interval {
+            return None;
+        }
+
+        let eval_id = self.next_eval_id;
+        let job = AsyncSkillTrackerJob::Run {
+            eval_id,
+            current_model: current_model.clone(),
+            versions: versions.to_vec(),
+            cur_ratings: self.cur_ratings.clone(),
+        };
+
+        match self.job_tx.try_send(job) {
+            Ok(()) => {
+                self.iterations_since_ran = 0;
+                self.next_eval_id += 1;
+                self.running_eval_id = Some(eval_id);
+                Some(eval_id)
+            }
+            Err(TrySendError::Full(_)) => None,
+            Err(TrySendError::Disconnected(_)) => None,
+        }
+    }
+
+    pub fn poll_updates(&mut self, versions: &mut [PolicyVersion<B>]) -> Vec<SkillTrackerUpdate> {
+        let mut updates = Vec::new();
+
+        while let Ok(result) = self.result_rx.try_recv() {
+            self.cur_ratings = result.update.cur_ratings.clone();
+            if self.running_eval_id == Some(result.update.eval_id) {
+                self.running_eval_id = None;
+            }
+
+            for (timesteps, ratings) in result.version_ratings {
+                if let Some(version) = versions.iter_mut().find(|v| v.timesteps == timesteps) {
+                    version.ratings = ratings;
+                }
+            }
+
+            updates.push(result.update);
+        }
+
+        updates
+    }
+
+    pub fn report_ratings(&self, report: &mut Report) {
+        for (mode, &rating) in &self.cur_ratings.data {
+            let key = format!("Rating/{mode}");
+            report[key.as_str()] = rating.into();
+        }
+    }
+
+    pub fn join(mut self, versions: &mut [PolicyVersion<B>]) -> SkillRating {
+        let _ = self.job_tx.send(AsyncSkillTrackerJob::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.poll_updates(versions);
+        self.cur_ratings.clone()
+    }
+}
+
+impl<B, OBS, ACT, SI> Drop for AsyncSkillTracker<B, OBS, ACT, SI>
+where
+    B: Backend,
+    OBS: Obs<SI>,
+    ACT: Action<SI, Input = usize>,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+{
+    fn drop(&mut self) {
+        let _ = self.job_tx.send(AsyncSkillTrackerJob::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }

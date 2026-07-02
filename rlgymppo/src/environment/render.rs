@@ -80,7 +80,7 @@ where
     }
 
     pub fn run(&mut self) {
-        let (mut model, mut deterministic) = {
+        let mut model = {
             let (controller, start_var) = &*self.controller;
 
             let mut guard = controller.lock();
@@ -88,8 +88,27 @@ where
                 return;
             }
 
-            if guard.model.is_none() {
+            while guard.model.is_none() || !guard.render {
                 start_var.wait(&mut guard);
+                if guard.quit {
+                    return;
+                }
+            }
+
+            guard.model.take().unwrap().to_device(&self.device)
+        };
+
+        self.game.set_rlviser_enabled(true);
+
+        let tick_rate = Duration::from_secs_f32(ACT::get_tick_skip() as f32 * consts::TICK_TIME);
+        let mut next_time = Instant::now();
+
+        loop {
+            let (controller, start_var) = &*self.controller;
+            let mut guard = controller.lock();
+
+            if guard.quit {
+                break;
             }
 
             while !guard.render {
@@ -97,47 +116,15 @@ where
                 if guard.quit {
                     return;
                 }
+                next_time = Instant::now();
             }
 
-            (
-                guard.model.take().unwrap().to_device(&self.device),
-                guard.deterministic,
-            )
-        };
-
-        self.game.set_rlviser_enabled(true);
-
-        let mut last_controls_update_time = Instant::now();
-        let controls_update_rate = Duration::from_secs(1);
-        let tick_rate = Duration::from_secs_f32(ACT::get_tick_skip() as f32 * consts::TICK_TIME);
-        let mut next_time = Instant::now();
-
-        loop {
-            // check for model updates every now and then
-            let now = Instant::now();
-            if now - last_controls_update_time >= controls_update_rate {
-                let (controller, start_var) = &*self.controller;
-                let mut guard = controller.lock();
-
-                if guard.quit {
-                    break;
-                }
-
-                while !guard.render {
-                    start_var.wait(&mut guard);
-                    if guard.quit {
-                        return;
-                    }
-                    next_time = Instant::now();
-                }
-
-                if let Some(new_model) = guard.model.take() {
-                    model = new_model.to_device(&self.device);
-                }
-
-                deterministic = guard.deterministic;
-                last_controls_update_time = now;
+            if let Some(new_model) = guard.model.take() {
+                model = new_model.to_device(&self.device);
             }
+
+            let deterministic = guard.deterministic;
+            drop(guard);
 
             let actions = if deterministic {
                 model.react_deterministic(&self.last_obs, &[], &self.device)

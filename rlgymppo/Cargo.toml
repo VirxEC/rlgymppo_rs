@@ -3,15 +3,11 @@ name = "rlgymppo"
 version = "0.1.0"
 edition = "2024"
 
-[[example]]
-name = "generic"
-required-features = ["torch"]
-
 [dependencies]
 rustc-hash = "2.1.1"
 arrayvec = "0.7.6"
 burn = { version = "0.21.0", features = ["autodiff"] }
-itertools = "0.14.0"
+itertools = "0.15.0"
 parking_lot = "0.12.4"
 rand = "0.10.1"
 ringbuffer = "0.16.0"

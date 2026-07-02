@@ -6,10 +6,13 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -28,6 +31,25 @@ pub struct TuiDisplay {
     notification: String,
     /// Previous iteration's values, used to compute deltas (e.g. Rating).
     prev_vals: HashMap<String, f64>,
+    closed: bool,
+}
+
+/// Thread-owned TUI controller.
+pub struct TuiHandle {
+    tx: Sender<TuiCommand>,
+    thread: Option<JoinHandle<io::Result<()>>>,
+}
+
+/// Cloneable sender for immediate TUI notifications from background threads.
+#[derive(Clone)]
+pub struct TuiNotifier {
+    tx: Sender<TuiCommand>,
+}
+
+enum TuiCommand {
+    Update(HashMap<String, f64>),
+    Notify(String),
+    Close,
 }
 
 /// Category grouping information for the display layout.
@@ -97,6 +119,7 @@ impl TuiDisplay {
             terminal,
             notification: String::new(),
             prev_vals: HashMap::new(),
+            closed: false,
         })
     }
 
@@ -149,6 +172,11 @@ impl TuiDisplay {
 
     /// Close the display and restore the terminal to its normal state.
     pub fn close(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+
+        self.closed = true;
         disable_raw_mode()?;
         execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
@@ -159,6 +187,152 @@ impl TuiDisplay {
 impl Drop for TuiDisplay {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+impl TuiHandle {
+    /// Spawn a background TUI thread.
+    ///
+    /// Metric updates can be sent from the training loop with [`update`](Self::update),
+    /// while notifications can be sent from any thread via [`TuiNotifier`]. Every
+    /// update or notification triggers an immediate redraw using the latest metrics.
+    pub fn new() -> io::Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let (init_tx, init_rx) = mpsc::sync_channel(1);
+
+        let thread = thread::Builder::new()
+            .name("tui".into())
+            .spawn(move || {
+                let mut display = match TuiDisplay::new() {
+                    Ok(display) => {
+                        let _ = init_tx.send(Ok(()));
+                        display
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        let _ = init_tx.send(Err(io::Error::new(e.kind(), message.clone())));
+                        return Err(io::Error::new(e.kind(), message));
+                    }
+                };
+
+                let mut latest_metrics = HashMap::new();
+                let mut last_size = terminal::size()?;
+
+                loop {
+                    let mut should_redraw = false;
+
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(TuiCommand::Update(metrics)) => {
+                            latest_metrics = metrics;
+                            should_redraw = true;
+                        }
+                        Ok(TuiCommand::Notify(message)) => {
+                            display.notify(message);
+                            should_redraw = true;
+                        }
+                        Ok(TuiCommand::Close) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+
+                    while let Ok(command) = rx.try_recv() {
+                        match command {
+                            TuiCommand::Update(metrics) => {
+                                latest_metrics = metrics;
+                                should_redraw = true;
+                            }
+                            TuiCommand::Notify(message) => {
+                                display.notify(message);
+                                should_redraw = true;
+                            }
+                            TuiCommand::Close => {
+                                display.close()?;
+                                return Ok(());
+                            }
+                        }
+                    }
+
+                    let size = terminal::size()?;
+                    if size != last_size {
+                        last_size = size;
+                        should_redraw = true;
+                    }
+
+                    if should_redraw {
+                        display.update(&latest_metrics)?;
+                    }
+                }
+
+                display.close()
+            })
+            .map_err(|e| io::Error::other(format!("failed to spawn TUI thread: {e}")))?;
+
+        match init_rx
+            .recv()
+            .map_err(|e| io::Error::other(format!("TUI thread failed to initialize: {e}")))?
+        {
+            Ok(()) => Ok(Self {
+                tx,
+                thread: Some(thread),
+            }),
+            Err(e) => {
+                let _ = thread.join();
+                Err(e)
+            }
+        }
+    }
+
+    /// Send a metrics update to the TUI thread. This returns once the update is queued.
+    pub fn update(&self, metrics: HashMap<String, f64>) -> io::Result<()> {
+        self.tx
+            .send(TuiCommand::Update(metrics))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
+    }
+
+    /// Send a notification to the TUI thread and redraw immediately.
+    pub fn notify(&self, msg: impl Into<String>) -> io::Result<()> {
+        self.tx
+            .send(TuiCommand::Notify(msg.into()))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
+    }
+
+    /// Create a cloneable notification sender for use by other threads.
+    pub fn notifier(&self) -> TuiNotifier {
+        TuiNotifier {
+            tx: self.tx.clone(),
+        }
+    }
+
+    /// Stop the TUI thread and restore the terminal.
+    pub fn close(mut self) -> io::Result<()> {
+        let _ = self.tx.send(TuiCommand::Close);
+
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| io::Error::other("TUI thread panicked"))??;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for TuiHandle {
+    fn drop(&mut self) {
+        let _ = self.tx.send(TuiCommand::Close);
+
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl TuiNotifier {
+    /// Send a notification to the TUI thread and redraw immediately.
+    pub fn notify(&self, msg: impl Into<String>) -> io::Result<()> {
+        self.tx
+            .send(TuiCommand::Notify(msg.into()))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
     }
 }
 
@@ -213,90 +387,132 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, metrics: &HashMap<Strin
     );
 }
 
-/// Render all metric groups in a grid.  Uses 2 columns by default, or 3
-/// when the terminal is significantly wider than it is tall.  Groups that
-/// have no entries in `metrics` are hidden to keep the display clean.
+/// Render all metric groups in a responsive grid.
+///
+/// The grid chooses a column count from the current width, then greedily packs
+/// groups by their desired height so dense groups do not all land in one column.
 fn render_metrics_grid(
     frame: &mut ratatui::Frame,
     area: Rect,
     metrics: &HashMap<String, f64>,
     prev_vals: &HashMap<String, f64>,
 ) {
-    // Only keep groups that currently have data.
-    let populated: Vec<&MetricGroup> = GROUPS
+    let groups: Vec<MetricGroupView<'_>> = GROUPS
         .iter()
-        .filter(|g| !group_entries(metrics, g.key_prefix).is_empty())
+        .filter_map(|group| {
+            let entries = group_entries(metrics, group.key_prefix);
+            if entries.is_empty() {
+                None
+            } else {
+                Some(MetricGroupView { group, entries })
+            }
+        })
         .collect();
 
-    if populated.is_empty() {
+    if groups.is_empty() || area.width == 0 || area.height == 0 {
         return;
     }
 
-    // Use 3 columns when the terminal is noticeably wider than it is tall.
-    let num_cols = if area.width > area.height * 2 { 3 } else { 2 };
+    let num_cols = responsive_column_count(area.width).min(groups.len());
+    let mut columns: Vec<Vec<MetricGroupView<'_>>> = (0..num_cols).map(|_| Vec::new()).collect();
+    let mut col_heights = vec![0_u16; num_cols];
 
-    let col_constraints: Vec<Constraint> = (0..num_cols)
-        .map(|_| Constraint::Ratio(1, num_cols as u32))
-        .collect();
-    let cols = Layout::horizontal(&col_constraints).split(area);
+    // Pack tallest groups first for balanced columns, then restore each
+    // column's original display order for predictable scanning.
+    let mut group_indices: Vec<usize> = (0..groups.len()).collect();
+    group_indices
+        .sort_by_key(|&idx| std::cmp::Reverse(desired_group_height(groups[idx].entries.len())));
 
-    // Compute how many groups go in each column.  With 2 columns we bias
-    // toward the right (≈1/3–2/3 split, e.g. 3-5 not 4-4).  With 3 columns
-    // any remainder goes to the rightmost columns (2-3-3 not 3-3-2).
-    let col_sizes: Vec<usize> = if num_cols == 2 {
-        let left = (populated.len() + 1) / 3;
-        vec![left, populated.len() - left]
-    } else {
-        let base = populated.len() / num_cols;
-        let extra = populated.len() % num_cols;
-        (0..num_cols)
-            .map(|i| if i < num_cols - extra { base } else { base + 1 })
-            .collect()
-    };
+    for idx in group_indices {
+        let col_idx = col_heights
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, height)| **height)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        col_heights[col_idx] =
+            col_heights[col_idx].saturating_add(desired_group_height(groups[idx].entries.len()));
+        columns[col_idx].push(groups[idx].clone());
+    }
 
-    let mut start = 0;
-    for (col_idx, col_area) in cols.iter().enumerate() {
-        let take = col_sizes[col_idx];
-        if take > 0 {
-            render_column(
-                frame,
-                *col_area,
-                metrics,
-                prev_vals,
-                &populated[start..start + take],
-            );
-            start += take;
-        }
+    for column in &mut columns {
+        column.sort_by_key(|view| group_order(view.group.key_prefix));
+    }
+
+    let col_constraints = vec![Constraint::Ratio(1, num_cols as u32); num_cols];
+    let cols = Layout::horizontal(col_constraints).split(area);
+
+    for (column, col_area) in columns.iter().zip(cols.iter()) {
+        render_column(frame, *col_area, prev_vals, column);
     }
 }
 
-/// Render a column of metric groups.
-///
-/// Vertical space is split proportional to the number of entries in each
-/// group, so groups with many metrics (e.g. Collect, Loss) get more room.
+/// Render a column of metric groups using content-aware heights.
 fn render_column(
     frame: &mut ratatui::Frame,
     area: Rect,
-    metrics: &HashMap<String, f64>,
     prev_vals: &HashMap<String, f64>,
-    groups: &[&MetricGroup],
+    groups: &[MetricGroupView<'_>],
 ) {
-    // Pre-compute entry lists so we only sort once per group.
-    let group_entries: Vec<Vec<(&str, f64)>> = groups
-        .iter()
-        .map(|g| group_entries(metrics, g.key_prefix))
-        .collect();
-    let total: usize = group_entries.iter().map(|e| e.len()).sum();
+    if groups.is_empty() {
+        return;
+    }
 
-    let constraints: Vec<Constraint> = group_entries
+    let desired_heights: Vec<u16> = groups
         .iter()
-        .map(|e| Constraint::Ratio(e.len() as u32, total as u32))
+        .map(|view| desired_group_height(view.entries.len()))
         .collect();
+    let desired_total: u16 = desired_heights.iter().sum();
+
+    let constraints: Vec<Constraint> = if desired_total <= area.height {
+        desired_heights
+            .into_iter()
+            .map(Constraint::Length)
+            .chain(std::iter::once(Constraint::Min(0)))
+            .collect()
+    } else {
+        groups
+            .iter()
+            .map(|view| {
+                Constraint::Ratio(
+                    desired_group_height(view.entries.len()) as u32,
+                    desired_total as u32,
+                )
+            })
+            .collect()
+    };
+
     let rows = Layout::vertical(constraints).split(area);
 
-    for (i, group) in groups.iter().enumerate() {
-        render_group(frame, rows[i], group, &group_entries[i], prev_vals);
+    for (i, view) in groups.iter().enumerate() {
+        render_group(frame, rows[i], view.group, &view.entries, prev_vals);
     }
+}
+
+#[derive(Clone)]
+struct MetricGroupView<'a> {
+    group: &'a MetricGroup,
+    entries: Vec<(&'a str, f64)>,
+}
+
+fn responsive_column_count(width: u16) -> usize {
+    match width {
+        0..=79 => 1,
+        80..=139 => 2,
+        _ => 3,
+    }
+}
+
+fn desired_group_height(entry_count: usize) -> u16 {
+    // Top/bottom border + title/padding, then one row per metric.
+    (entry_count as u16).saturating_add(2).max(3)
+}
+
+fn group_order(prefix: &str) -> usize {
+    GROUPS
+        .iter()
+        .position(|group| group.key_prefix == prefix)
+        .unwrap_or(usize::MAX)
 }
 
 /// Render a single metric group as a bordered block.

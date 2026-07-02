@@ -5,20 +5,21 @@ mod environment;
 
 pub mod utils;
 
+use std::collections::VecDeque;
 use std::io::{Read, stdin};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent::Ppo;
 pub use agent::config::PpoLearnerConfig;
 use agent::model::Actic;
 pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
-use agent::skill_tracker::SkillTracker;
 pub use agent::skill_tracker::SkillTrackerConfig;
+use agent::skill_tracker::{AsyncSkillTracker, SkillTrackerUpdate};
 use base::TerminalState;
 pub use burn::backend;
 use burn::module::{AutodiffModule, Module, Quantizer};
@@ -33,6 +34,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng, rng};
 pub use rlgym::{self, rocketsim};
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
+use utils::Report;
 use utils::running_stat::Stats;
 use utils::serde::{latest_checkpoint_folder, load_latest_model, save_checkpoint};
 use utils::shared_info::{SharedInfoReport, SharedInfoRng};
@@ -41,11 +43,39 @@ use utils::shared_info::{SharedInfoReport, SharedInfoRng};
 enum HumanInput {
     Save,
     Quit,
-    ToggleRender,
-    ToggleDeterministic,
+    RenderToggled,
+    DeterministicToggled,
 }
 
-fn stdin_reader(s: Sender<HumanInput>) {
+struct PendingMetricReport {
+    waiting_for_skill_eval: Option<u64>,
+    report: Report,
+}
+
+enum MetricEvent {
+    Report(PendingMetricReport),
+    Shutdown,
+}
+
+#[cfg(feature = "tui")]
+type TuiNotifier = rlgymppo_tui::TuiNotifier;
+
+#[cfg(not(feature = "tui"))]
+#[derive(Clone)]
+struct TuiNotifier;
+
+#[cfg(not(feature = "tui"))]
+impl TuiNotifier {
+    fn notify(&self, _msg: impl Into<String>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn stdin_reader<B: burn::prelude::Backend>(
+    s: Sender<HumanInput>,
+    renderer_controls: Arc<(Mutex<RendererControls<B>>, Condvar)>,
+    tui_notifier: Option<TuiNotifier>,
+) {
     let mut buffer = [0; 1];
     while stdin().read_exact(&mut buffer).is_ok() {
         match char::from(buffer[0]).to_ascii_lowercase() {
@@ -61,20 +91,149 @@ fn stdin_reader(s: Sender<HumanInput>) {
                 s.send(HumanInput::Save).unwrap();
             }
             'r' => {
+                let (controls, start_renderer) = &*renderer_controls;
+                let mut guard = controls.lock();
+                guard.render = !guard.render;
+                let render = guard.render;
+                drop(guard);
+
+                start_renderer.notify_all();
+
                 #[cfg(not(feature = "tui"))]
-                println!("Renderer will be toggled after this iteration...");
-                s.send(HumanInput::ToggleRender).unwrap();
+                if render {
+                    println!("Starting renderer...");
+                } else {
+                    println!("Stopping renderer...");
+                }
+
+                if let Some(notifier) = &tui_notifier {
+                    let _ = notifier.notify(if render {
+                        "Renderer enabled."
+                    } else {
+                        "Renderer disabled."
+                    });
+                }
+
+                s.send(HumanInput::RenderToggled).unwrap();
             }
             'd' => {
+                let (controls, start_renderer) = &*renderer_controls;
+                let mut guard = controls.lock();
+                guard.deterministic = !guard.deterministic;
+                let deterministic = guard.deterministic;
+                drop(guard);
+
+                start_renderer.notify_all();
+
                 #[cfg(not(feature = "tui"))]
-                println!(
-                    "Toggling deterministic mode for the rendered model after this iteration..."
-                );
-                s.send(HumanInput::ToggleDeterministic).unwrap();
+                println!("Rendering deterministic: {deterministic}");
+
+                if let Some(notifier) = &tui_notifier {
+                    let _ = notifier.notify(if deterministic {
+                        "Deterministic mode enabled."
+                    } else {
+                        "Deterministic mode disabled."
+                    });
+                }
+
+                s.send(HumanInput::DeterministicToggled).unwrap();
             }
             _ => {}
         }
     }
+}
+
+fn spawn_metrics_actor(
+    metric_rx: Receiver<MetricEvent>,
+    skill_rx: Receiver<SkillTrackerUpdate>,
+    #[cfg(feature = "tui")] tui_display: Option<rlgymppo_tui::TuiHandle>,
+    #[cfg(feature = "wandb")] wandb_tx: Option<
+        std::sync::mpsc::SyncSender<std::collections::HashMap<String, f64>>,
+    >,
+    #[cfg(feature = "wandb")] wandb_handle: Option<thread::JoinHandle<()>>,
+    #[cfg(all(feature = "tui", feature = "wandb"))] wandb_run_id: Option<String>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        #[cfg(all(feature = "tui", feature = "wandb"))]
+        if let Some(ref tui) = tui_display
+            && let Some(ref id) = wandb_run_id
+        {
+            let _ = tui.notify(format!("Wandb run started: {id}"));
+        }
+
+        let mut pending_reports: VecDeque<PendingMetricReport> = VecDeque::new();
+        let mut shutting_down = false;
+
+        loop {
+            while let Ok(update) = skill_rx.try_recv() {
+                for pending in &mut pending_reports {
+                    pending.report.remove_keys_with_prefix("Rating/");
+                    for (mode, &rating) in &update.cur_ratings.data {
+                        let key = format!("Rating/{mode}");
+                        pending.report[key.as_str()] = rating.into();
+                    }
+
+                    if pending.waiting_for_skill_eval == Some(update.eval_id) {
+                        pending.waiting_for_skill_eval = None;
+                    }
+                }
+            }
+
+            while pending_reports
+                .front()
+                .is_some_and(|pending| pending.waiting_for_skill_eval.is_none())
+            {
+                let metrics = pending_reports.pop_front().unwrap().report;
+
+                #[cfg(feature = "wandb")]
+                if let Some(ref tx) = wandb_tx {
+                    let flat = metrics.to_flat_map();
+                    let _ = tx.try_send(flat);
+                }
+
+                #[cfg(feature = "tui")]
+                if let Some(ref tui) = tui_display {
+                    let flat = metrics.to_flat_map();
+                    if let Err(e) = tui.update(flat) {
+                        eprintln!("Warning: TUI display update failed: {e}");
+                    }
+                }
+
+                #[cfg(not(feature = "tui"))]
+                println!("{metrics}");
+            }
+
+            if shutting_down && pending_reports.is_empty() {
+                break;
+            }
+
+            match metric_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(MetricEvent::Report(report)) => pending_reports.push_back(report),
+                Ok(MetricEvent::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                    shutting_down = true;
+                    for pending in &mut pending_reports {
+                        pending.waiting_for_skill_eval = None;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+
+        #[cfg(feature = "tui")]
+        if let Some(tui) = tui_display
+            && let Err(e) = tui.close()
+        {
+            eprintln!("Warning: TUI display close failed: {e}");
+        }
+
+        #[cfg(feature = "wandb")]
+        {
+            drop(wandb_tx);
+            if let Some(handle) = wandb_handle {
+                handle.join().expect("wandb-sender thread panicked");
+            }
+        }
+    })
 }
 
 /// Which normalization layer to apply after each hidden linear layer.
@@ -162,7 +321,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             render_device: B::Device::default(),
             policy_layer_sizes: vec![256; 3],
             critic_layer_sizes: vec![256; 3],
-            norm: NormSelection::LayerNorm,
+            norm: NormSelection::RmsNorm,
             shared_head_layer_sizes: vec![256],
             checkpoints_limit: None,
             timesteps_per_save: 1_000_000,
@@ -255,6 +414,8 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             max_reward_samples: self.ppo.max_reward_samples,
         };
 
+        let (skill_metric_tx, skill_metric_rx) = channel();
+
         let skill_tracker = if self.skill_tracker.enabled {
             let create_env_skill = create_env.clone();
             let create_arena = move |game_idx: usize| {
@@ -263,10 +424,11 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
                 (env.arena, env.observations, env.action, env.shared_info)
             };
 
-            Some(SkillTracker::new(
+            Some(AsyncSkillTracker::new(
                 self.skill_tracker.clone(),
                 create_arena,
                 self.device.clone(),
+                skill_metric_tx,
             ))
         } else {
             None
@@ -313,6 +475,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             self_play_config,
             version_mgr,
             skill_tracker,
+            skill_metric_rx: Some(skill_metric_rx),
         }
     }
 }
@@ -349,7 +512,8 @@ where
     self_play_config: SelfPlayConfig,
     version_mgr: VersionManager<B::InnerBackend>,
     // ── Skill Tracker ────────────────────────────────────────────
-    skill_tracker: Option<SkillTracker<B::InnerBackend, OBS, ACT, SI>>,
+    skill_tracker: Option<AsyncSkillTracker<B::InnerBackend, OBS, ACT, SI>>,
+    skill_metric_rx: Option<Receiver<SkillTrackerUpdate>>,
 
     collector: ThreadSim<B::InnerBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
 }
@@ -422,35 +586,32 @@ where
                 );
                 self.version_mgr.save_versions();
             }
-            HumanInput::ToggleRender => {
-                let (controls, start_renderer) = &*self.renderer_controls;
-                let mut guard = controls.lock();
-                let render = !guard.render;
-                guard.render = render;
-                drop(guard);
-
-                #[cfg(not(feature = "tui"))]
-                if render {
-                    println!("Starting renderer...");
-                } else {
-                    println!("Stopping renderer...");
-                }
-
-                if render {
-                    start_renderer.notify_all();
-                }
-            }
-            HumanInput::ToggleDeterministic => {
-                let (controls, _) = &*self.renderer_controls;
-                let mut guard = controls.lock();
-                guard.deterministic = !guard.deterministic;
-                #[cfg(not(feature = "tui"))]
-                println!("Rendering deterministic: {}", guard.deterministic);
-                drop(guard);
-            }
+            HumanInput::RenderToggled | HumanInput::DeterministicToggled => {}
         }
 
         true
+    }
+
+    fn drain_input(&mut self, r: &Receiver<HumanInput>) -> (bool, Vec<HumanInput>) {
+        let mut keep_running = true;
+        let mut handled = Vec::new();
+
+        for input in r.try_iter() {
+            keep_running = self.handle_input(input);
+            handled.push(input);
+
+            if !keep_running {
+                break;
+            }
+        }
+
+        (keep_running, handled)
+    }
+
+    fn notify_input(tui: &TuiNotifier, input: HumanInput) {
+        if matches!(input, HumanInput::Save) {
+            let _ = tui.notify("Saved model.");
+        }
     }
 
     /// Train the model, and automatically saves it before exiting.
@@ -517,7 +678,7 @@ where
 
         // Initialise the TUI display (ratatui-based terminal dashboard).
         #[cfg(feature = "tui")]
-        let mut tui_display = match rlgymppo_tui::TuiDisplay::new() {
+        let tui_display = match rlgymppo_tui::TuiHandle::new() {
             Ok(tui) => Some(tui),
             Err(e) => {
                 eprintln!("Warning: Failed to initialise TUI display: {e}",);
@@ -526,19 +687,36 @@ where
             }
         };
 
-        // Show the wandb run ID in the TUI now that it's active.
-        #[cfg(all(feature = "tui", feature = "wandb"))]
-        if let Some(ref mut tui) = tui_display
-            && let Some(ref id) = wandb_run_id
-        {
-            tui.notify(format!("Wandb run started: {id}"));
-        }
+        #[cfg(feature = "tui")]
+        let tui_notifier = tui_display.as_ref().map(|tui| tui.notifier());
+        #[cfg(not(feature = "tui"))]
+        let tui_notifier = None;
+
+        let (metric_tx, metric_rx) = channel();
+        let skill_metric_rx = self.skill_metric_rx.take().unwrap();
+
+        let metrics_actor = spawn_metrics_actor(
+            metric_rx,
+            skill_metric_rx,
+            #[cfg(feature = "tui")]
+            tui_display,
+            #[cfg(feature = "wandb")]
+            wandb_tx,
+            #[cfg(feature = "wandb")]
+            wandb_handle,
+            #[cfg(all(feature = "tui", feature = "wandb"))]
+            wandb_run_id,
+        );
 
         let (s, r) = channel();
 
-        thread::spawn(move || {
-            stdin_reader(s);
-        });
+        {
+            let renderer_controls = self.renderer_controls.clone();
+            let input_tui_notifier = tui_notifier.clone();
+            thread::spawn(move || {
+                stdin_reader(s, renderer_controls, input_tui_notifier);
+            });
+        }
 
         #[cfg(not(feature = "tui"))]
         println!("Running for the first time. This might be slow at first...");
@@ -611,6 +789,10 @@ where
             let prev_timesteps = self.stats.cumulative_timesteps - num_new_steps as u64;
             let nodiff_model_snapshot = self.model.valid();
 
+            if let Some(ref mut st) = self.skill_tracker {
+                st.poll_updates(&mut self.version_mgr.versions);
+            }
+
             // Skill tracker ratings (if enabled) are frozen into new versions.
             let cur_ratings = self.skill_tracker.as_ref().map(|st| &st.cur_ratings);
             self.version_mgr.on_iteration(
@@ -619,13 +801,6 @@ where
                 prev_timesteps,
                 cur_ratings,
             );
-
-            // ── Skill tracker: run evaluation matches if due ──────
-            if let Some(ref mut st) = self.skill_tracker {
-                st.on_iteration(&nodiff_model_snapshot, &mut self.version_mgr.versions);
-                // Always report current ratings so the TUI displays them.
-                st.report_ratings(&mut metrics);
-            }
 
             // Episode length = total_steps / number of NORMAL terminals.
             let n_term = (0..memory.len())
@@ -649,54 +824,37 @@ where
             metrics["Cumulative/epochs"] = self.stats.cumulative_epochs.into();
             metrics["Cumulative/updates"] = self.stats.cumulative_model_updates.into();
 
-            #[cfg(feature = "wandb")]
-            if let Some(ref tx) = wandb_tx {
-                let flat = metrics.to_flat_map();
-                // Non-blocking send; silently drop if the background
-                // wandb thread is still busy with the previous batch.
-                let _ = tx.try_send(flat);
+            let waiting_for_skill_eval = if let Some(ref mut st) = self.skill_tracker {
+                let eval_id = st.on_iteration(&nodiff_model_snapshot, &self.version_mgr.versions);
+                if eval_id.is_none() {
+                    st.report_ratings(&mut metrics);
+                }
+                eval_id
+            } else {
+                None
+            };
+
+            let _ = metric_tx.send(MetricEvent::Report(PendingMetricReport {
+                waiting_for_skill_eval,
+                report: metrics,
+            }));
+
+            let (keep_running, handled_inputs) = self.drain_input(&r);
+            if let Some(ref notifier) = tui_notifier {
+                for input in handled_inputs {
+                    Self::notify_input(notifier, input);
+                }
+            } else {
+                drop(handled_inputs);
             }
 
-            // ── Update TUI dashboard (or fall back to plain print) ─
-            #[cfg(feature = "tui")]
-            if let Some(ref mut tui) = tui_display {
-                let flat = metrics.to_flat_map();
-                if let Err(e) = tui.update(&flat) {
-                    eprintln!("Warning: TUI display update failed: {e}");
-                }
-            }
-
-            #[cfg(not(feature = "tui"))]
-            println!("{metrics}");
-
-            for input in r.try_iter() {
-                #[cfg(feature = "tui")]
-                let was_save = matches!(input, HumanInput::Save);
-                #[cfg(feature = "tui")]
-                let was_toggle_render = matches!(input, HumanInput::ToggleRender);
-                #[cfg(feature = "tui")]
-                let was_toggle_det = matches!(input, HumanInput::ToggleDeterministic);
-
-                if !self.handle_input(input) {
-                    break 'train;
-                }
-
-                #[cfg(feature = "tui")]
-                if let Some(ref mut tui) = tui_display {
-                    if was_save {
-                        tui.notify("Saved model.");
-                    } else if was_toggle_render {
-                        tui.notify("Renderer toggled.");
-                    } else if was_toggle_det {
-                        tui.notify("Deterministic mode toggled.");
-                    }
-                }
+            if !keep_running {
+                break 'train;
             }
 
             if self.stats.cumulative_timesteps - self.last_save_timestep > self.timesteps_per_save {
-                #[cfg(feature = "tui")]
-                if let Some(ref mut tui) = tui_display {
-                    tui.notify("Auto-saving model...");
+                if let Some(ref notifier) = tui_notifier {
+                    let _ = notifier.notify("Auto-saving model...");
                 }
 
                 // Serialise skill tracker ratings into the stats.
@@ -729,9 +887,9 @@ where
             start_renderer.notify_all();
         }
 
-        // Serialise skill tracker ratings before final save.
-        if let Some(ref st) = self.skill_tracker {
-            self.stats.skill_ratings = Some(st.cur_ratings.data.clone());
+        if let Some(st) = self.skill_tracker.take() {
+            let ratings = st.join(&mut self.version_mgr.versions);
+            self.stats.skill_ratings = Some(ratings.data);
         }
 
         save_checkpoint(
@@ -743,23 +901,8 @@ where
         );
         self.version_mgr.save_versions();
 
-        // Close the TUI display (restores normal terminal).
-        #[cfg(feature = "tui")]
-        if let Some(mut tui) = tui_display
-            && let Err(e) = tui.close()
-        {
-            eprintln!("Warning: TUI display close failed: {e}");
-        }
-
-        // Close the wandb channel so the background thread exits, which
-        // drops the MetricSender and calls `wandb.finish()`.
-        #[cfg(feature = "wandb")]
-        {
-            drop(wandb_tx);
-            if let Some(handle) = wandb_handle {
-                handle.join().expect("wandb-sender thread panicked");
-            }
-        }
+        let _ = metric_tx.send(MetricEvent::Shutdown);
+        let _ = metrics_actor.join();
 
         println!("Waiting for threads to exit...");
         self.collector.join();
@@ -772,9 +915,12 @@ where
     pub fn render(mut self) {
         let (s, r) = channel();
 
-        thread::spawn(move || {
-            stdin_reader(s);
-        });
+        {
+            let renderer_controls = self.renderer_controls.clone();
+            thread::spawn(move || {
+                stdin_reader(s, renderer_controls, None);
+            });
+        }
 
         Self::print_controls_prompt();
 

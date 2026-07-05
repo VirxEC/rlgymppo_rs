@@ -135,6 +135,7 @@ pub(crate) struct SkillTrackerUpdate {
     pub cur_ratings: SkillRating,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AsyncSkillTrackerJob<B: Backend> {
     Run {
         eval_id: u64,

@@ -9,6 +9,7 @@ use burn::tensor::backend::AutodiffBackend;
 use super::running_stat::Stats;
 use crate::agent::Ppo;
 use crate::agent::model::Actic;
+use burn::optim::SimpleOptimizer;
 
 /// Save a model checkpoint (model weights + training stats).
 pub fn save_model<B: Backend, P: AsRef<Path>>(
@@ -83,9 +84,13 @@ pub fn save_model<B: Backend, P: AsRef<Path>>(
 /// Save a full checkpoint: model weights, training stats, and optimizer states.
 /// The model may use the inner backend (without gradients) while the Ppo
 /// uses the autodiff backend.
-pub fn save_checkpoint<BAutodiff: AutodiffBackend, P: AsRef<Path>>(
+pub fn save_checkpoint<
+    BAutodiff: AutodiffBackend,
+    O: SimpleOptimizer<BAutodiff::InnerBackend>,
+    P: AsRef<Path>,
+>(
     model: Actic<BAutodiff::InnerBackend>,
-    ppo: &Ppo<BAutodiff>,
+    ppo: &Ppo<BAutodiff, O>,
     running_stats: &Stats,
     base_folder: P,
     limit: Option<usize>,

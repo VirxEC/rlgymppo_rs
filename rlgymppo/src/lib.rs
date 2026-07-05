@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use agent::Ppo;
 pub use agent::config::PpoLearnerConfig;
-use agent::model::Actic;
+use agent::model::{Actic, Net};
 pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
 pub use agent::skill_tracker::SkillTrackerConfig;
@@ -25,6 +25,8 @@ pub use burn::backend;
 use burn::module::{AutodiffModule, Module, Quantizer};
 use burn::nn::modules::norm::NormalizationConfig;
 use burn::nn::{LayerNormConfig, RmsNormConfig};
+use burn::optim::adaptor::OptimizerAdaptor;
+use burn::optim::{Adam, AdamConfig, SimpleOptimizer};
 use burn::tensor::backend::AutodiffBackend;
 use environment::render::{Renderer, RendererControls};
 use environment::sim::RewardSamplingConfig;
@@ -247,7 +249,13 @@ pub enum NormSelection {
     RmsNorm,
 }
 
-pub struct LearnerConfig<B: AutodiffBackend> {
+/// A stored optimizer factory inside [`LearnerConfig`].
+///
+/// The closure is called three times during `init()` (once per sub-network)
+/// and must return a freshly created [`OptimizerAdaptor`] each time.
+pub type MakeOptim<B, O> = Box<dyn Fn() -> OptimizerAdaptor<O, Net<B>, B>>;
+
+pub struct LearnerConfig<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend> = Adam> {
     /// Hyperparameters for the PPO learner.
     pub ppo: PpoLearnerConfig,
     /// Where to load/save checkpoints.
@@ -290,18 +298,15 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// RocketSim's built-in renderer is used for visualization.
     pub render: bool,
 
-    // ── Self‑Play ─────────────────────────────────────────────────────
     /// Configuration for saving old policy versions and occasionally
     /// training against them (self-play).
     pub self_play: SelfPlayConfig,
 
-    // ── Skill Tracker ────────────────────────────────────────────────
     /// Elo-based skill rating system that periodically evaluates the
     /// current policy against old versions.  Reports `"Rating/1v1"`,
     /// `"Rating/2v2"`, etc.
     pub skill_tracker: SkillTrackerConfig,
 
-    // ── Weights & Biases ─────────────────────────────────────────────
     /// Project name for wandb (requires the `wandb` feature).
     /// When `None`, wandb logging is disabled.
     pub wandb_project_name: Option<String>,
@@ -309,9 +314,15 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub wandb_group_name: Option<String>,
     /// Run name for wandb (default: `"rlgymppo-run"`).
     pub wandb_run_name: Option<String>,
+
+    /// Factory that creates the optimizer.
+    ///
+    /// Called three times during `init()` (once per sub-network).
+    /// Set via [`LearnerConfig::with_optimizer`]; defaults to Adam.
+    pub make_optim: MakeOptim<B, O>,
 }
 
-impl<B: AutodiffBackend> Default for LearnerConfig<B> {
+impl<B: AutodiffBackend> Default for LearnerConfig<B, Adam> {
     fn default() -> Self {
         Self {
             ppo: PpoLearnerConfig::default(),
@@ -335,15 +346,16 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             wandb_project_name: None,
             wandb_group_name: None,
             wandb_run_name: None,
+            make_optim: Box::new(|| AdamConfig::new().with_epsilon(1e-8).init()),
         }
     }
 }
 
-impl<B: AutodiffBackend> LearnerConfig<B> {
+impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> LearnerConfig<B, O> {
     pub fn init<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         self,
         create_env: F,
-    ) -> Learner<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         SS: StateSetter<SI>,
@@ -455,7 +467,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         );
 
         Learner {
-            ppo: self.ppo.init(self.device.clone()),
+            ppo: self.ppo.init_with(self.device.clone(), self.make_optim),
             rng: SmallRng::from_rng(&mut rng()),
             stats: Stats::default(),
             device: self.device,
@@ -480,8 +492,17 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     }
 }
 
-pub struct Learner<B: AutodiffBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
-where
+pub struct Learner<
+    B: AutodiffBackend,
+    O: SimpleOptimizer<B::InnerBackend>,
+    SS,
+    OBS,
+    ACT,
+    REW,
+    TERM,
+    TRUNC,
+    SI,
+> where
     SS: StateSetter<SI>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
     OBS: Obs<SI>,
@@ -490,7 +511,7 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    ppo: Ppo<B>,
+    ppo: Ppo<B, O>,
     rng: SmallRng,
     stats: Stats,
     device: B::Device,
@@ -518,8 +539,8 @@ where
     collector: ThreadSim<B::InnerBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
 }
 
-impl<B: AutodiffBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
-    Learner<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+    Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,

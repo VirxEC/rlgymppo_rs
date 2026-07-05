@@ -11,6 +11,3 @@ opt-level = 3
 
 [profile.release]
 debug = true
-
-[patch."https://github.com/ZealanL/RocketSim.git"]
-rocketsim = { git = "https://github.com/VirxEC/RocketSim.git", branch = "col_test" }

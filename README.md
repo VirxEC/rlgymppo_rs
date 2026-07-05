@@ -7,41 +7,67 @@ training, built on [RocketSim v3](https://github.com/ZealanL/RocketSim/tree/v3-r
 
 ### Project structure
 
-The workspace is split into three crates:
+The workspace is split into four crates:
 
 | Crate | Purpose |
 |---|---|
 | `rlgymppo` | Core PPO learner, multi-threaded environment runner, and training loop. |
 | `rlgymppo-tui` | Terminal-based dashboard that renders live training metrics (ratatui). |
 | `rlgymppo-wandb` | Weights & Biases integration via an embedded Python interpreter (pyo3). |
+| `rlgymppo-trainer` | Bundled training example with shared logic, self-play, and skill tracking. |
 
 ### Quick start
 
-See [`rlgymppo/examples/generic.rs`](rlgymppo/examples/generic.rs) for a
-complete training example. It includes:
+See [`rlgymppo-trainer/examples/run.rs`](rlgymppo-trainer/examples/run.rs) for a
+complete training example. The core logic lives in
+[`rlgymppo-trainer/src/lib.rs`](rlgymppo-trainer/src/lib.rs). It includes:
 
 - A custom `SharedInfo` that tracks player metrics (distance to ball, speed,
-  boost, air time, demo status)
-- A `MyObs` builder with a zero-padded multi-agent observation space
+  boost, air time, demo status, touch height)
 - 1v1, 2v2, and 3v3 random game selection
 - Several state setters (kickoff, random positions) weighted by probability
-- Combined rewards (face ball + velocity to ball)
-- Terminal conditions (goal scored, game time elapsed, no-touch timeout)
+- Combined rewards (air time, face ball, velocity to ball)
+- Terminal conditions (goal scored, random game end, no-touch timeout)
+- `SelfPlayConfig` & `SkillTrackerConfig` for policy versioning and Elo rating
+
+Run with your chosen backend (replace `torch` with `cuda`, `wgpu`, `metal`, etc.):
+
+```sh
+cargo run -p rlgymppo-trainer --example run --features torch
+```
 
 At a high level, training looks like this:
 
 ```rust
-let config = LearnerConfig::<Autodiff<LibTorch>> {
+let config = LearnerConfig {
     num_threads: 4,
     num_games_per_thread: 64,
     ppo: PpoLearnerConfig {
-        batch_size: 50_000,
-        mini_batch_size: 50_000,
-        learning_rate: 2e-4,
-        entropy_scale: 0.035,
+        batch_size: 80_000,
+        mini_batch_size: 40_000,
+        epochs: 1,
+        learning_rate: 1.5e-4,
+        entropy_scale: 0.036,
+        ..Default::default()
+    },
+    shared_head_layer_sizes: vec![256; 2],
+    policy_layer_sizes: vec![256; 3],
+    critic_layer_sizes: vec![256; 3],
+    timesteps_per_save: 10_000_000,
+    checkpoints_limit: Some(10),
+    self_play: SelfPlayConfig {
+        save_policy_versions: true,
+        ts_per_version: 100_000_000,
+        ..Default::default()
+    },
+    skill_tracker: SkillTrackerConfig {
+        enabled: true,
         ..Default::default()
     },
     device: LibTorchDevice::Cuda(0),
+    render_device: LibTorchDevice::Cpu,
+    wandb_project_name: Some("rlgym-ppo".into()),
+    wandb_run_name: Some("ppo-bot-v1".into()),
     ..Default::default()
 };
 
@@ -92,10 +118,23 @@ this is `pip install wandb`, then find where wandb was installed and set
 `_WANDB_CORE_PATH` to the directory containing the `wandb-core` binary
 (e.g. `/path/to/venv/lib/python3.12/site-packages/wandb/bin`).
 
-### torch
+### Backends
 
-Using the `torch` backend is recommended — it's the most mature, fastest backend
-and supports a wide range of devices.
+The project uses [Burn](https://burn.dev) and supports all its backends. Enable
+exactly one via a feature flag:
+
+| Feature | Backend | Device types |
+|---|---|---|
+| `torch` | LibTorch (libtorch C++) | `Cuda(N)`, `Cpu`, `Mps`, `Vulkan` |
+| `cuda` | Pure Rust CUDA | `CudaDevice` |
+| `metal` | Apple Metal | `WgpuDevice` |
+| `rocm` | AMD ROCm | `RocmDevice` |
+| `wgpu` | Cross-platform GPU | `WgpuDevice` |
+| `flex` | CPU fallback | `Default` |
+| `candle` | Candle ML framework | `CandleDevice` |
+
+**torch** is the most mature and fastest backend, supporting CUDA, CPU, MPS,
+and Vulkan devices.
 
 To point Rust to your LibTorch installation, you may need to set environment
 variables like `LIBTORCH`, `LIBTORCH_INCLUDE`, and `LIBTORCH_LIB`. See

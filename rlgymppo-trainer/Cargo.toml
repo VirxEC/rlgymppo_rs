@@ -14,7 +14,7 @@ name = "run"
 required-features = ["backend"]
 
 [features]
-default = ["wandb", "tui"]
+default = ["wandb", "tui", "torch"]
 backend = []
 wandb = ["rlgymppo/wandb"]
 tui = ["rlgymppo/tui"]

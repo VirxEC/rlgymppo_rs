@@ -389,7 +389,7 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, metrics: &HashMap<Strin
 
 /// Render all metric groups in a responsive grid.
 ///
-/// The grid chooses a column count from the current width, then greedily packs
+/// The grid chooses the largest content-fitting column count, then greedily packs
 /// groups by their desired height so dense groups do not all land in one column.
 fn render_metrics_grid(
     frame: &mut ratatui::Frame,
@@ -413,31 +413,8 @@ fn render_metrics_grid(
         return;
     }
 
-    let num_cols = responsive_column_count(area.width).min(groups.len());
-    let mut columns: Vec<Vec<MetricGroupView<'_>>> = (0..num_cols).map(|_| Vec::new()).collect();
-    let mut col_heights = vec![0_u16; num_cols];
-
-    // Pack tallest groups first for balanced columns, then restore each
-    // column's original display order for predictable scanning.
-    let mut group_indices: Vec<usize> = (0..groups.len()).collect();
-    group_indices
-        .sort_by_key(|&idx| std::cmp::Reverse(desired_group_height(groups[idx].entries.len())));
-
-    for idx in group_indices {
-        let col_idx = col_heights
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, height)| **height)
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        col_heights[col_idx] =
-            col_heights[col_idx].saturating_add(desired_group_height(groups[idx].entries.len()));
-        columns[col_idx].push(groups[idx].clone());
-    }
-
-    for column in &mut columns {
-        column.sort_by_key(|view| group_order(view.group.key_prefix));
-    }
+    let num_cols = content_fit_column_count(area.width, &groups, prev_vals);
+    let columns = pack_metric_groups(&groups, num_cols);
 
     let col_constraints = vec![Constraint::Ratio(1, num_cols as u32); num_cols];
     let cols = Layout::horizontal(col_constraints).split(area);
@@ -495,12 +472,76 @@ struct MetricGroupView<'a> {
     entries: Vec<(&'a str, f64)>,
 }
 
-fn responsive_column_count(width: u16) -> usize {
-    match width {
-        0..=79 => 1,
-        80..=139 => 2,
-        _ => 3,
+fn content_fit_column_count(
+    width: u16,
+    groups: &[MetricGroupView<'_>],
+    prev_vals: &HashMap<String, f64>,
+) -> usize {
+    for num_cols in (1..=groups.len()).rev() {
+        let constraints = vec![Constraint::Ratio(1, num_cols as u32); num_cols];
+        let layout_area = Rect::new(0, 0, width, 1);
+        let col_areas = Layout::horizontal(constraints).split(layout_area);
+        let columns = pack_metric_groups(groups, num_cols);
+
+        let all_columns_fit = columns.iter().zip(col_areas.iter()).all(|(column, area)| {
+            column
+                .iter()
+                .all(|view| required_group_width(view, prev_vals) <= area.width)
+        });
+
+        if all_columns_fit {
+            return num_cols;
+        }
     }
+
+    1
+}
+
+fn pack_metric_groups<'a>(
+    groups: &[MetricGroupView<'a>],
+    num_cols: usize,
+) -> Vec<Vec<MetricGroupView<'a>>> {
+    let mut columns: Vec<Vec<MetricGroupView<'_>>> = (0..num_cols).map(|_| Vec::new()).collect();
+    let mut col_heights = vec![0_u16; num_cols];
+
+    // Pack tallest groups first for balanced columns, then restore each
+    // column's original display order for predictable scanning.
+    let mut group_indices: Vec<usize> = (0..groups.len()).collect();
+    group_indices
+        .sort_by_key(|&idx| std::cmp::Reverse(desired_group_height(groups[idx].entries.len())));
+
+    for idx in group_indices {
+        let col_idx = col_heights
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, height)| **height)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        col_heights[col_idx] =
+            col_heights[col_idx].saturating_add(desired_group_height(groups[idx].entries.len()));
+        columns[col_idx].push(groups[idx].clone());
+    }
+
+    for column in &mut columns {
+        column.sort_by_key(|view| group_order(view.group.key_prefix));
+    }
+
+    columns
+}
+
+fn required_group_width(view: &MetricGroupView<'_>, prev_vals: &HashMap<String, f64>) -> u16 {
+    let title_width = view.group.name.chars().count() + 4;
+    let row_width = view
+        .entries
+        .iter()
+        .map(|(name, value)| {
+            let value = metric_value_display(view.group, name, *value, prev_vals);
+            name.chars().count() + value.chars().count() + 7
+        })
+        .max()
+        .unwrap_or(" (no data)".chars().count() + 4);
+
+    title_width.max(row_width).min(u16::MAX as usize) as u16
 }
 
 fn desired_group_height(entry_count: usize) -> u16 {
@@ -531,37 +572,12 @@ fn render_group(
             Span::raw("  "),
         ];
 
-        if group.key_prefix == "Rating" {
-            // Show delta alongside the current rating (1 decimal).
-            let full_key = format!("Rating/{name}");
-            let prev = prev_vals.get(&full_key).copied().unwrap_or(value);
-            let delta = value - prev;
-            let val_str = format!("{value:.1}");
-            if delta.abs() >= 0.05 {
-                let sign = if delta >= 0.0 { '+' } else { '-' };
-                let delta_str = format!("{:.1}", delta.abs());
-                spans.push(Span::styled(
-                    format!("{val_str} ({sign}{delta_str})"),
-                    Style::default()
-                        .fg(group.color)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    val_str,
-                    Style::default()
-                        .fg(group.color)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-        } else {
-            spans.push(Span::styled(
-                format_num(value),
-                Style::default()
-                    .fg(group.color)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
+        spans.push(Span::styled(
+            metric_value_display(group, name, value, prev_vals),
+            Style::default()
+                .fg(group.color)
+                .add_modifier(Modifier::BOLD),
+        ));
 
         lines.push(Line::from(spans));
     }
@@ -608,6 +624,30 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, notification: &str)
             Style::default().fg(Color::Yellow),
         ));
         frame.render_widget(Paragraph::new(text), area);
+    }
+}
+
+fn metric_value_display(
+    group: &MetricGroup,
+    name: &str,
+    value: f64,
+    prev_vals: &HashMap<String, f64>,
+) -> String {
+    if group.key_prefix == "Rating" {
+        // Show delta alongside the current rating (1 decimal).
+        let full_key = format!("Rating/{name}");
+        let prev = prev_vals.get(&full_key).copied().unwrap_or(value);
+        let delta = value - prev;
+        let val_str = format!("{value:.1}");
+        if delta.abs() >= 0.05 {
+            let sign = if delta >= 0.0 { '+' } else { '-' };
+            let delta_str = format!("{:.1}", delta.abs());
+            format!("{val_str} ({sign}{delta_str})")
+        } else {
+            val_str
+        }
+    } else {
+        format_num(value)
     }
 }
 

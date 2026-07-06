@@ -84,12 +84,22 @@ fn stdin_reader<B: burn::prelude::Backend>(
             'q' => {
                 #[cfg(not(feature = "tui"))]
                 println!("Finishing iteration, saving, then exiting...");
+
+                if let Some(notifier) = &tui_notifier {
+                    let _ = notifier.notify("Quit requested. Waiting for this iteration to complete...");
+                }
+
                 s.send(HumanInput::Quit).unwrap();
                 return;
             }
             's' => {
                 #[cfg(not(feature = "tui"))]
                 println!("Saving model after this iteration...");
+
+                if let Some(notifier) = &tui_notifier {
+                    let _ = notifier.notify("Save requested. Waiting for this iteration to complete...");
+                }
+
                 s.send(HumanInput::Save).unwrap();
             }
             'r' => {

@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -24,11 +23,6 @@ struct PlayerTraj {
     action_masks: Vec<Vec<bool>>,
 }
 
-struct PendingPlayerTraj {
-    traj: PlayerTraj,
-    trunc_next_state: Option<Vec<f32>>,
-}
-
 pub struct BatchSim<B: Backend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
@@ -44,7 +38,6 @@ where
     next_obs: Vec<Vec<f32>>,
     next_masks: Vec<Vec<bool>>,
     player_trajs: Vec<PlayerTraj>,
-    pending_trajs: VecDeque<PendingPlayerTraj>,
     metrics: Report,
     device: B::Device,
     max_episode_length: Option<usize>,
@@ -105,19 +98,10 @@ where
             games,
             np,
             player_trajs,
-            pending_trajs: VecDeque::new(),
             device,
             player_teams,
             max_episode_length,
         }
-    }
-
-    pub fn drain_pending(&mut self, memory_capacity_hint: usize) -> Memory {
-        let mut memory = Memory::with_capacity(memory_capacity_hint);
-        while let Some(pending) = self.pending_trajs.pop_front() {
-            Self::push_traj(&mut memory, pending.traj, pending.trunc_next_state);
-        }
-        memory
     }
 
     /// Collect complete episodes until the shared iteration budget is exhausted.
@@ -280,10 +264,7 @@ where
                                     trunc_next,
                                 );
                             } else {
-                                self.pending_trajs.push_back(PendingPlayerTraj {
-                                    traj: mem::take(&mut self.player_trajs[ti]),
-                                    trunc_next_state: trunc_next,
-                                });
+                                let _ = mem::take(&mut self.player_trajs[ti]);
                             }
                         } else {
                             // Discard untracked player's buffers.

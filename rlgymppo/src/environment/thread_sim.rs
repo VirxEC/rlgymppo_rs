@@ -22,7 +22,6 @@ pub struct DataResponse {
 
 #[derive(Clone)]
 enum ThreadCommand<B: Backend> {
-    DrainPending,
     Run {
         model: Arc<Actic<B>>,
         self_play: Option<(Arc<Actic<B>>, usize)>,
@@ -59,6 +58,7 @@ where
     metrics: Report,
     memory: Memory,
     batch_size: usize,
+    pending_responses: usize,
     _marker: PhantomData<fn(SS, OBS, ACT, REW, TERM, TRUNC, SI)>,
 }
 
@@ -88,7 +88,7 @@ where
     {
         let (sender, recv) = channel();
         let control = Arc::new(ThreadControl {
-            command: RwLock::new(ThreadCommand::DrainPending),
+            command: RwLock::new(ThreadCommand::Shutdown),
             remaining_steps: AtomicUsize::new(0),
             barrier: Barrier::new(num_threads + 1),
         });
@@ -120,15 +120,6 @@ where
                     };
 
                     match command {
-                        ThreadCommand::DrainPending => {
-                            let memory = batch_sim.drain_pending(batch_size * 2);
-                            sender
-                                .send(DataResponse {
-                                    memory,
-                                    metrics: Report::default(),
-                                })
-                                .unwrap();
-                        }
                         ThreadCommand::Run { model, self_play } => {
                             let (memory, metrics) = batch_sim.run_with_budget(
                                 model.as_ref(),
@@ -153,6 +144,7 @@ where
             memory: Memory::with_capacity(batch_size * 2),
             metrics: Report::default(),
             batch_size,
+            pending_responses: 0,
             _marker: PhantomData,
         }
     }
@@ -168,42 +160,45 @@ where
         model: Actic<B>,
         self_play: Option<(Actic<B>, usize)>,
     ) -> (&Memory, Report) {
+        self.discard_pending_responses();
         self.metrics.clear();
         self.memory.clear();
 
-        // First gather trajectories that completed after the previous
-        // iteration's budget was full. They count toward this iteration before
-        // any new rollout starts.
-        *self.control.command.write() = ThreadCommand::DrainPending;
+        self.control
+            .remaining_steps
+            .store(self.batch_size, Ordering::Release);
+        *self.control.command.write() = ThreadCommand::Run {
+            model: Arc::new(model),
+            self_play: self_play.map(|(model, team)| (Arc::new(model), team)),
+        };
         self.control.barrier.wait();
 
-        for _ in 0..self.threads.len() {
+        let mut received = 0;
+        while received < self.threads.len() {
             let response = self.recv.recv().unwrap();
+            received += 1;
             self.memory.merge(response.memory);
-        }
+            self.metrics += response.metrics;
 
-        let additional_steps = self.batch_size.saturating_sub(self.memory.len());
-        if additional_steps > 0 {
-            self.control
-                .remaining_steps
-                .store(additional_steps, Ordering::Release);
-            *self.control.command.write() = ThreadCommand::Run {
-                model: Arc::new(model),
-                self_play: self_play.map(|(model, team)| (Arc::new(model), team)),
-            };
-            self.control.barrier.wait();
-
-            for _ in 0..self.threads.len() {
-                let response = self.recv.recv().unwrap();
-                self.memory.merge(response.memory);
-                self.metrics += response.metrics;
+            if self.memory.len() >= self.batch_size {
+                break;
             }
         }
+        self.pending_responses = self.threads.len() - received;
 
         (&self.memory, self.metrics.clone())
     }
 
-    pub fn join(self) {
+    fn discard_pending_responses(&mut self) {
+        for _ in 0..self.pending_responses {
+            let _ = self.recv.recv().unwrap();
+        }
+        self.pending_responses = 0;
+    }
+
+    pub fn join(mut self) {
+        self.discard_pending_responses();
+
         // Signal shutdown.
         *self.control.command.write() = ThreadCommand::Shutdown;
         self.control.barrier.wait();

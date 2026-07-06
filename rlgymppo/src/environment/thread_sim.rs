@@ -20,13 +20,19 @@ pub struct DataResponse {
     pub metrics: Report,
 }
 
-/// Shared model state passed to collector threads via the barrier.
-/// The `model` field carries the current policy; `self_play`
-/// optionally carries an old policy version and the team it
-/// controls (0 = Blue, 1 = Orange).
+#[derive(Clone)]
+enum ThreadCommand<B: Backend> {
+    DrainPending,
+    Run {
+        model: Arc<Actic<B>>,
+        self_play: Option<(Arc<Actic<B>>, usize)>,
+    },
+    Shutdown,
+}
+
+/// Shared rollout state passed to collector threads via the barrier.
 struct ThreadControl<B: Backend> {
-    model: RwLock<Option<Actic<B>>>,
-    self_play: RwLock<Option<(Actic<B>, usize)>>,
+    command: RwLock<ThreadCommand<B>>,
     remaining_steps: AtomicUsize,
     barrier: Barrier,
 }
@@ -82,8 +88,7 @@ where
     {
         let (sender, recv) = channel();
         let control = Arc::new(ThreadControl {
-            model: RwLock::new(None),
-            self_play: RwLock::new(None),
+            command: RwLock::new(ThreadCommand::DrainPending),
             remaining_steps: AtomicUsize::new(0),
             barrier: Barrier::new(num_threads + 1),
         });
@@ -108,28 +113,34 @@ where
                 );
 
                 loop {
-                    control.barrier.wait(); // wait for model to be set
-                    let model = {
-                        let guard = control.model.read();
-                        guard.clone()
-                    };
-                    let Some(model) = model else {
-                        break; // None signals shutdown
-                    };
-
-                    let self_play = {
-                        let guard = control.self_play.read();
+                    control.barrier.wait();
+                    let command = {
+                        let guard = control.command.read();
                         guard.clone()
                     };
 
-                    let (memory, metrics) = batch_sim.run_with_budget(
-                        &model,
-                        &control.remaining_steps,
-                        batch_size * 2,
-                        self_play.as_ref().map(|(m, t)| (m, *t)),
-                    );
+                    match command {
+                        ThreadCommand::DrainPending => {
+                            let memory = batch_sim.drain_pending(batch_size * 2);
+                            sender
+                                .send(DataResponse {
+                                    memory,
+                                    metrics: Report::default(),
+                                })
+                                .unwrap();
+                        }
+                        ThreadCommand::Run { model, self_play } => {
+                            let (memory, metrics) = batch_sim.run_with_budget(
+                                model.as_ref(),
+                                &control.remaining_steps,
+                                batch_size * 2,
+                                self_play.as_ref().map(|(m, t)| (m.as_ref(), *t)),
+                            );
 
-                    sender.send(DataResponse { memory, metrics }).unwrap();
+                            sender.send(DataResponse { memory, metrics }).unwrap();
+                        }
+                        ThreadCommand::Shutdown => break,
+                    }
                 }
             });
             threads.push(thread);
@@ -160,23 +171,33 @@ where
         self.metrics.clear();
         self.memory.clear();
 
-        // Publish the model, self-play assignment, and shared timestep budget
-        // for all threads. Workers atomically claim completed trajectories from
-        // this budget so only the trajectory that crosses zero can overshoot.
-        *self.control.model.write() = Some(model);
-        *self.control.self_play.write() = self_play;
-        self.control
-            .remaining_steps
-            .store(self.batch_size, Ordering::Release);
-
-        // Wake all collector threads.
+        // First gather trajectories that completed after the previous
+        // iteration's budget was full. They count toward this iteration before
+        // any new rollout starts.
+        *self.control.command.write() = ThreadCommand::DrainPending;
         self.control.barrier.wait();
 
-        // Collect results from every thread.
         for _ in 0..self.threads.len() {
             let response = self.recv.recv().unwrap();
             self.memory.merge(response.memory);
-            self.metrics += response.metrics;
+        }
+
+        let additional_steps = self.batch_size.saturating_sub(self.memory.len());
+        if additional_steps > 0 {
+            self.control
+                .remaining_steps
+                .store(additional_steps, Ordering::Release);
+            *self.control.command.write() = ThreadCommand::Run {
+                model: Arc::new(model),
+                self_play: self_play.map(|(model, team)| (Arc::new(model), team)),
+            };
+            self.control.barrier.wait();
+
+            for _ in 0..self.threads.len() {
+                let response = self.recv.recv().unwrap();
+                self.memory.merge(response.memory);
+                self.metrics += response.metrics;
+            }
         }
 
         (&self.memory, self.metrics.clone())
@@ -184,7 +205,7 @@ where
 
     pub fn join(self) {
         // Signal shutdown.
-        *self.control.model.write() = None;
+        *self.control.command.write() = ThreadCommand::Shutdown;
         self.control.barrier.wait();
 
         for thread in self.threads {

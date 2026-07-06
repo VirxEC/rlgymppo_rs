@@ -112,6 +112,14 @@ where
         }
     }
 
+    pub fn drain_pending(&mut self, memory_capacity_hint: usize) -> Memory {
+        let mut memory = Memory::with_capacity(memory_capacity_hint);
+        while let Some(pending) = self.pending_trajs.pop_front() {
+            Self::push_traj(&mut memory, pending.traj, pending.trunc_next_state);
+        }
+        memory
+    }
+
     /// Collect complete episodes until the shared iteration budget is exhausted.
     ///
     /// When `self_play` is `Some((old_model, old_team))`, the players on
@@ -136,7 +144,6 @@ where
         };
 
         let mut memory = Memory::with_capacity(memory_capacity_hint);
-        self.drain_pending_trajs(remaining_steps, &mut memory);
 
         let mut total_infer_time = 0.0_f64;
         let mut total_env_step_time = 0.0_f64;
@@ -316,18 +323,6 @@ where
         report["Collect/env step time"] = total_env_step_time.into();
 
         (memory, report)
-    }
-
-    fn drain_pending_trajs(&mut self, remaining_steps: &AtomicUsize, memory: &mut Memory) {
-        while let Some(pending) = self.pending_trajs.pop_front() {
-            let traj_len = pending.traj.states.len();
-            if Self::claim_steps(remaining_steps, traj_len) {
-                Self::push_traj(memory, pending.traj, pending.trunc_next_state);
-            } else {
-                self.pending_trajs.push_front(pending);
-                break;
-            }
-        }
     }
 
     fn claim_steps(remaining_steps: &AtomicUsize, steps: usize) -> bool {

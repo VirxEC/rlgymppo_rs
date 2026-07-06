@@ -86,7 +86,8 @@ fn stdin_reader<B: burn::prelude::Backend>(
                 println!("Finishing iteration, saving, then exiting...");
 
                 if let Some(notifier) = &tui_notifier {
-                    let _ = notifier.notify("Quit requested. Waiting for this iteration to complete...");
+                    let _ = notifier
+                        .notify("Quit requested. Waiting for this iteration to complete...");
                 }
 
                 s.send(HumanInput::Quit).unwrap();
@@ -97,7 +98,8 @@ fn stdin_reader<B: burn::prelude::Backend>(
                 println!("Saving model after this iteration...");
 
                 if let Some(notifier) = &tui_notifier {
-                    let _ = notifier.notify("Save requested. Waiting for this iteration to complete...");
+                    let _ = notifier
+                        .notify("Save requested. Waiting for this iteration to complete...");
                 }
 
                 s.send(HumanInput::Save).unwrap();

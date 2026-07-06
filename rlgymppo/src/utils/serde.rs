@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use burn::optim::SimpleOptimizer;
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use burn::tensor::backend::AutodiffBackend;
@@ -9,7 +10,6 @@ use burn::tensor::backend::AutodiffBackend;
 use super::running_stat::Stats;
 use crate::agent::Ppo;
 use crate::agent::model::Actic;
-use burn::optim::SimpleOptimizer;
 
 /// Save a model checkpoint (model weights + training stats).
 pub fn save_model<B: Backend, P: AsRef<Path>>(

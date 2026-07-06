@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -26,6 +27,7 @@ pub struct DataResponse {
 struct ThreadControl<B: Backend> {
     model: RwLock<Option<Actic<B>>>,
     self_play: RwLock<Option<(Actic<B>, usize)>>,
+    remaining_steps: AtomicUsize,
     barrier: Barrier,
 }
 
@@ -50,6 +52,7 @@ where
     threads: Vec<thread::JoinHandle<()>>,
     metrics: Report,
     memory: Memory,
+    batch_size: usize,
     _marker: PhantomData<fn(SS, OBS, ACT, REW, TERM, TRUNC, SI)>,
 }
 
@@ -81,10 +84,10 @@ where
         let control = Arc::new(ThreadControl {
             model: RwLock::new(None),
             self_play: RwLock::new(None),
+            remaining_steps: AtomicUsize::new(0),
             barrier: Barrier::new(num_threads + 1),
         });
 
-        let steps_per_thread = batch_size.div_ceil(num_threads);
         let mut threads = Vec::with_capacity(num_threads);
 
         for t in 0..num_threads {
@@ -119,9 +122,10 @@ where
                         guard.clone()
                     };
 
-                    let (memory, metrics) = batch_sim.run(
+                    let (memory, metrics) = batch_sim.run_with_budget(
                         &model,
-                        steps_per_thread,
+                        &control.remaining_steps,
+                        batch_size * 2,
                         self_play.as_ref().map(|(m, t)| (m, *t)),
                     );
 
@@ -137,6 +141,7 @@ where
             threads,
             memory: Memory::with_capacity(batch_size * 2),
             metrics: Report::default(),
+            batch_size,
             _marker: PhantomData,
         }
     }
@@ -155,9 +160,14 @@ where
         self.metrics.clear();
         self.memory.clear();
 
-        // Publish the model and self-play assignment for all threads.
+        // Publish the model, self-play assignment, and shared timestep budget
+        // for all threads. Workers atomically claim completed trajectories from
+        // this budget so only the trajectory that crosses zero can overshoot.
         *self.control.model.write() = Some(model);
         *self.control.self_play.write() = self_play;
+        self.control
+            .remaining_steps
+            .store(self.batch_size, Ordering::Release);
 
         // Wake all collector threads.
         self.control.barrier.wait();

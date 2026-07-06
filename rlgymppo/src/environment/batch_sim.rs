@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use burn::prelude::*;
@@ -9,7 +12,7 @@ use crate::base::{Memory, TerminalState};
 use crate::utils::Report;
 use crate::utils::shared_info::SharedInfoReport;
 
-/// Per-player trajectory buffer that persists across [`run`] calls
+/// Per-player trajectory buffer that persists across collection calls
 /// so incomplete episodes carry over to the next iteration.
 #[derive(Default)]
 struct PlayerTraj {
@@ -19,6 +22,11 @@ struct PlayerTraj {
     rewards: Vec<f32>,
     terminals: Vec<TerminalState>,
     action_masks: Vec<Vec<bool>>,
+}
+
+struct PendingPlayerTraj {
+    traj: PlayerTraj,
+    trunc_next_state: Option<Vec<f32>>,
 }
 
 pub struct BatchSim<B: Backend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
@@ -36,6 +44,7 @@ where
     next_obs: Vec<Vec<f32>>,
     next_masks: Vec<Vec<bool>>,
     player_trajs: Vec<PlayerTraj>,
+    pending_trajs: VecDeque<PendingPlayerTraj>,
     metrics: Report,
     device: B::Device,
     max_episode_length: Option<usize>,
@@ -96,23 +105,24 @@ where
             games,
             np,
             player_trajs,
+            pending_trajs: VecDeque::new(),
             device,
             player_teams,
             max_episode_length,
         }
     }
 
-    /// Collect complete episodes until at least `min_steps` steps have been
-    /// accumulated.
+    /// Collect complete episodes until the shared iteration budget is exhausted.
     ///
     /// When `self_play` is `Some((old_model, old_team))`, the players on
     /// `old_team` (0 = Blue, 1 = Orange) use `old_model` for inference
     /// while the rest use the current `model`.  Only trajectories from
     /// current-policy players are recorded in the returned [`Memory`].
-    pub fn run(
+    pub fn run_with_budget(
         &mut self,
         model: &Actic<B>,
-        min_steps: usize,
+        remaining_steps: &AtomicUsize,
+        memory_capacity_hint: usize,
         self_play: Option<(&Actic<B>, usize)>,
     ) -> (Memory, Report) {
         let (old_model, old_team) = self_play.unzip();
@@ -125,13 +135,13 @@ where
             vec![true; self.player_teams.len()]
         };
 
-        let mut memory = Memory::with_capacity(min_steps * 2);
-        let mut collected_steps: usize = 0;
+        let mut memory = Memory::with_capacity(memory_capacity_hint);
+        self.drain_pending_trajs(remaining_steps, &mut memory);
 
         let mut total_infer_time = 0.0_f64;
         let mut total_env_step_time = 0.0_f64;
 
-        while collected_steps < min_steps {
+        while remaining_steps.load(Ordering::Acquire) > 0 {
             let infer_start = Instant::now();
 
             let (actions, log_probs) = if let (Some(old_model), Some(_ot)) = (old_model, old_team) {
@@ -253,21 +263,24 @@ where
                     for p in 0..n {
                         let ti = player_start + p;
                         if player_is_tracked[ti] {
-                            collected_steps += self.player_trajs[ti].states.len();
+                            let traj_len = self.player_trajs[ti].states.len();
                             let trunc_next = (terminal_type == TerminalState::Truncated)
                                 .then(|| result.obs[p].clone());
-                            memory.push_player(
-                                std::mem::take(&mut self.player_trajs[ti].states),
-                                std::mem::take(&mut self.player_trajs[ti].actions),
-                                std::mem::take(&mut self.player_trajs[ti].log_probs),
-                                std::mem::take(&mut self.player_trajs[ti].rewards),
-                                std::mem::take(&mut self.player_trajs[ti].terminals),
-                                std::mem::take(&mut self.player_trajs[ti].action_masks),
-                                trunc_next,
-                            );
+                            if Self::claim_steps(remaining_steps, traj_len) {
+                                Self::push_traj(
+                                    &mut memory,
+                                    mem::take(&mut self.player_trajs[ti]),
+                                    trunc_next,
+                                );
+                            } else {
+                                self.pending_trajs.push_back(PendingPlayerTraj {
+                                    traj: mem::take(&mut self.player_trajs[ti]),
+                                    trunc_next_state: trunc_next,
+                                });
+                            }
                         } else {
                             // Discard untracked player's buffers.
-                            let _ = std::mem::take(&mut self.player_trajs[ti]);
+                            let _ = mem::take(&mut self.player_trajs[ti]);
                         }
                     }
 
@@ -303,6 +316,38 @@ where
         report["Collect/env step time"] = total_env_step_time.into();
 
         (memory, report)
+    }
+
+    fn drain_pending_trajs(&mut self, remaining_steps: &AtomicUsize, memory: &mut Memory) {
+        while let Some(pending) = self.pending_trajs.pop_front() {
+            let traj_len = pending.traj.states.len();
+            if Self::claim_steps(remaining_steps, traj_len) {
+                Self::push_traj(memory, pending.traj, pending.trunc_next_state);
+            } else {
+                self.pending_trajs.push_front(pending);
+                break;
+            }
+        }
+    }
+
+    fn claim_steps(remaining_steps: &AtomicUsize, steps: usize) -> bool {
+        remaining_steps
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                (remaining > 0).then_some(remaining.saturating_sub(steps))
+            })
+            .is_ok()
+    }
+
+    fn push_traj(memory: &mut Memory, traj: PlayerTraj, trunc_next_state: Option<Vec<f32>>) {
+        memory.push_player(
+            traj.states,
+            traj.actions,
+            traj.log_probs,
+            traj.rewards,
+            traj.terminals,
+            traj.action_masks,
+            trunc_next_state,
+        );
     }
 
     fn get_metrics(&mut self) -> Report {

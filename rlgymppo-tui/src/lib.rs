@@ -8,4 +8,4 @@ mod app;
 mod format;
 mod render;
 
-pub use app::{TuiDisplay, TuiHandle, TuiNotifier};
+pub use app::{ScrollCommand, TuiDisplay, TuiHandle, TuiNotifier};

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -24,6 +25,9 @@ pub struct TuiDisplay {
     notification: String,
     /// Previous iteration's values, used to compute deltas (e.g. Rating).
     prev_vals: HashMap<String, f64>,
+    scroll_offset: u16,
+    max_scroll: u16,
+    mouse_capture_enabled: bool,
     closed: bool,
 }
 
@@ -42,7 +46,21 @@ pub struct TuiNotifier {
 enum TuiCommand {
     Update(HashMap<String, f64>),
     Notify(String),
+    Scroll(ScrollCommand),
+    DisableMouseCapture,
     Close,
+}
+
+#[derive(Clone, Copy)]
+pub enum ScrollCommand {
+    Up,
+    Down,
+    MouseUp,
+    MouseDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
 }
 
 impl TuiDisplay {
@@ -53,13 +71,16 @@ impl TuiDisplay {
     pub fn new() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self {
             terminal,
             notification: String::new(),
             prev_vals: HashMap::new(),
+            scroll_offset: 0,
+            max_scroll: 0,
+            mouse_capture_enabled: true,
             closed: false,
         })
     }
@@ -74,6 +95,9 @@ impl TuiDisplay {
         // Snapshot for delta computation.
         let prev_vals = self.prev_vals.clone();
 
+        let mut max_scroll = 0;
+        let scroll_offset = self.scroll_offset;
+
         self.terminal.draw(|frame| {
             let area = frame.area();
 
@@ -85,9 +109,18 @@ impl TuiDisplay {
             .split(area);
 
             render_header(frame, chunks[0], metrics);
-            render_metrics_grid(frame, chunks[1], metrics, &prev_vals);
-            render_status_bar(frame, chunks[2], &notification);
+            max_scroll = render_metrics_grid(frame, chunks[1], metrics, &prev_vals, scroll_offset);
+            render_status_bar(
+                frame,
+                chunks[2],
+                &notification,
+                scroll_offset.min(max_scroll),
+                max_scroll,
+            );
         })?;
+
+        self.max_scroll = max_scroll;
+        self.scroll_offset = self.scroll_offset.min(self.max_scroll);
 
         // Stash current values for delta computation next iteration.
         self.prev_vals = metrics.keys().map(|k| (k.clone(), metrics[k])).collect();
@@ -101,6 +134,40 @@ impl TuiDisplay {
         self.notification = msg.into();
     }
 
+    fn scroll_up(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    fn scroll_down(&mut self, lines: u16) {
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_add(lines)
+            .min(self.max_scroll);
+    }
+
+    fn scroll_home(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    fn scroll_end(&mut self) {
+        self.scroll_offset = self.max_scroll;
+    }
+
+    pub fn disable_mouse_capture(&mut self) -> io::Result<()> {
+        if !self.mouse_capture_enabled {
+            return Ok(());
+        }
+
+        self.mouse_capture_enabled = false;
+        execute!(self.terminal.backend_mut(), DisableMouseCapture)?;
+        write!(
+            self.terminal.backend_mut(),
+            "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l"
+        )?;
+        self.terminal.backend_mut().flush()?;
+        Ok(())
+    }
+
     /// Close the display and restore the terminal to its normal state.
     pub fn close(&mut self) -> io::Result<()> {
         if self.closed {
@@ -108,8 +175,10 @@ impl TuiDisplay {
         }
 
         self.closed = true;
-        disable_raw_mode()?;
+        self.disable_mouse_capture()?;
+        drain_pending_events();
         execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        disable_raw_mode()?;
         self.terminal.show_cursor()?;
         Ok(())
     }
@@ -161,6 +230,17 @@ impl TuiHandle {
                             display.notify(message);
                             should_redraw = true;
                         }
+                        Ok(TuiCommand::Scroll(command)) => {
+                            apply_scroll_command(
+                                &mut display,
+                                command,
+                                last_size.1.saturating_sub(4).max(1),
+                            );
+                            should_redraw = true;
+                        }
+                        Ok(TuiCommand::DisableMouseCapture) => {
+                            display.disable_mouse_capture()?;
+                        }
                         Ok(TuiCommand::Close) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -175,6 +255,17 @@ impl TuiHandle {
                             TuiCommand::Notify(message) => {
                                 display.notify(message);
                                 should_redraw = true;
+                            }
+                            TuiCommand::Scroll(command) => {
+                                apply_scroll_command(
+                                    &mut display,
+                                    command,
+                                    last_size.1.saturating_sub(4).max(1),
+                                );
+                                should_redraw = true;
+                            }
+                            TuiCommand::DisableMouseCapture => {
+                                display.disable_mouse_capture()?;
                             }
                             TuiCommand::Close => {
                                 display.close()?;
@@ -264,5 +355,36 @@ impl TuiNotifier {
         self.tx
             .send(TuiCommand::Notify(msg.into()))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
+    }
+
+    pub fn scroll(&self, command: ScrollCommand) -> io::Result<()> {
+        self.tx
+            .send(TuiCommand::Scroll(command))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
+    }
+
+    pub fn disable_mouse_capture(&self) -> io::Result<()> {
+        self.tx
+            .send(TuiCommand::DisableMouseCapture)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
+    }
+}
+
+fn apply_scroll_command(display: &mut TuiDisplay, command: ScrollCommand, page_height: u16) {
+    match command {
+        ScrollCommand::Up => display.scroll_up(1),
+        ScrollCommand::Down => display.scroll_down(1),
+        ScrollCommand::MouseUp => display.scroll_up(3),
+        ScrollCommand::MouseDown => display.scroll_down(3),
+        ScrollCommand::PageUp => display.scroll_up(page_height),
+        ScrollCommand::PageDown => display.scroll_down(page_height),
+        ScrollCommand::Home => display.scroll_home(),
+        ScrollCommand::End => display.scroll_end(),
+    }
+}
+
+fn drain_pending_events() {
+    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        let _ = event::read();
     }
 }

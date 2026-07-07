@@ -6,6 +6,7 @@ mod environment;
 pub mod utils;
 
 use std::collections::VecDeque;
+#[cfg(not(feature = "tui"))]
 use std::io::{Read, stdin};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,6 +63,9 @@ enum MetricEvent {
 #[cfg(feature = "tui")]
 type TuiNotifier = rlgymppo_tui::TuiNotifier;
 
+#[cfg(feature = "tui")]
+type TuiScrollCommand = rlgymppo_tui::ScrollCommand;
+
 #[cfg(not(feature = "tui"))]
 #[derive(Clone)]
 struct TuiNotifier;
@@ -71,8 +75,51 @@ impl TuiNotifier {
     fn notify(&self, _msg: impl Into<String>) -> std::io::Result<()> {
         Ok(())
     }
+
+    fn disable_mouse_capture(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
+#[cfg(feature = "tui")]
+fn stdin_reader<B: burn::prelude::Backend>(
+    s: Sender<HumanInput>,
+    renderer_controls: Arc<(Mutex<RendererControls<B>>, Condvar)>,
+    tui_notifier: Option<TuiNotifier>,
+) {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind, read};
+
+    while let Ok(event) = read() {
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char(ch) => {
+                    if handle_input_char(ch, &s, &renderer_controls, tui_notifier.as_ref()) {
+                        return;
+                    }
+                }
+                KeyCode::Up => scroll_tui(tui_notifier.as_ref(), TuiScrollCommand::Up),
+                KeyCode::Down => scroll_tui(tui_notifier.as_ref(), TuiScrollCommand::Down),
+                KeyCode::PageUp => scroll_tui(tui_notifier.as_ref(), TuiScrollCommand::PageUp),
+                KeyCode::PageDown => scroll_tui(tui_notifier.as_ref(), TuiScrollCommand::PageDown),
+                KeyCode::Home => scroll_tui(tui_notifier.as_ref(), TuiScrollCommand::Home),
+                KeyCode::End => scroll_tui(tui_notifier.as_ref(), TuiScrollCommand::End),
+                _ => {}
+            },
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    scroll_tui(tui_notifier.as_ref(), TuiScrollCommand::MouseUp)
+                }
+                MouseEventKind::ScrollDown => {
+                    scroll_tui(tui_notifier.as_ref(), TuiScrollCommand::MouseDown)
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+#[cfg(not(feature = "tui"))]
 fn stdin_reader<B: burn::prelude::Backend>(
     s: Sender<HumanInput>,
     renderer_controls: Arc<(Mutex<RendererControls<B>>, Condvar)>,
@@ -80,80 +127,117 @@ fn stdin_reader<B: burn::prelude::Backend>(
 ) {
     let mut buffer = [0; 1];
     while stdin().read_exact(&mut buffer).is_ok() {
-        match char::from(buffer[0]).to_ascii_lowercase() {
-            'q' => {
-                #[cfg(not(feature = "tui"))]
-                println!("Finishing iteration, saving, then exiting...");
-
-                if let Some(notifier) = &tui_notifier {
-                    let _ = notifier
-                        .notify("Quit requested. Waiting for this iteration to complete...");
-                }
-
-                s.send(HumanInput::Quit).unwrap();
-                return;
-            }
-            's' => {
-                #[cfg(not(feature = "tui"))]
-                println!("Saving model after this iteration...");
-
-                if let Some(notifier) = &tui_notifier {
-                    let _ = notifier
-                        .notify("Save requested. Waiting for this iteration to complete...");
-                }
-
-                s.send(HumanInput::Save).unwrap();
-            }
-            'r' => {
-                let (controls, start_renderer) = &*renderer_controls;
-                let mut guard = controls.lock();
-                guard.render = !guard.render;
-                let render = guard.render;
-                drop(guard);
-
-                start_renderer.notify_all();
-
-                #[cfg(not(feature = "tui"))]
-                if render {
-                    println!("Starting renderer...");
-                } else {
-                    println!("Stopping renderer...");
-                }
-
-                if let Some(notifier) = &tui_notifier {
-                    let _ = notifier.notify(if render {
-                        "Renderer enabled."
-                    } else {
-                        "Renderer disabled."
-                    });
-                }
-
-                s.send(HumanInput::RenderToggled).unwrap();
-            }
-            'd' => {
-                let (controls, start_renderer) = &*renderer_controls;
-                let mut guard = controls.lock();
-                guard.deterministic = !guard.deterministic;
-                let deterministic = guard.deterministic;
-                drop(guard);
-
-                start_renderer.notify_all();
-
-                #[cfg(not(feature = "tui"))]
-                println!("Rendering deterministic: {deterministic}");
-
-                if let Some(notifier) = &tui_notifier {
-                    let _ = notifier.notify(if deterministic {
-                        "Deterministic mode enabled."
-                    } else {
-                        "Deterministic mode disabled."
-                    });
-                }
-
-                s.send(HumanInput::DeterministicToggled).unwrap();
-            }
-            _ => {}
+        if handle_input_char(
+            char::from(buffer[0]),
+            &s,
+            &renderer_controls,
+            tui_notifier.as_ref(),
+        ) {
+            return;
         }
+    }
+}
+
+fn handle_input_char<B: burn::prelude::Backend>(
+    ch: char,
+    s: &Sender<HumanInput>,
+    renderer_controls: &Arc<(Mutex<RendererControls<B>>, Condvar)>,
+    tui_notifier: Option<&TuiNotifier>,
+) -> bool {
+    match ch.to_ascii_lowercase() {
+        'q' => {
+            #[cfg(not(feature = "tui"))]
+            println!("Finishing iteration, saving, then exiting...");
+
+            if let Some(notifier) = tui_notifier {
+                let _ = notifier.disable_mouse_capture();
+                let _ =
+                    notifier.notify("Quit requested. Waiting for this iteration to complete...");
+            }
+
+            s.send(HumanInput::Quit).unwrap();
+            true
+        }
+        's' => {
+            #[cfg(not(feature = "tui"))]
+            println!("Saving model after this iteration...");
+
+            if let Some(notifier) = tui_notifier {
+                let _ =
+                    notifier.notify("Save requested. Waiting for this iteration to complete...");
+            }
+
+            s.send(HumanInput::Save).unwrap();
+            false
+        }
+        'r' => {
+            let (controls, start_renderer) = &**renderer_controls;
+            let mut guard = controls.lock();
+            guard.render = !guard.render;
+            let render = guard.render;
+            drop(guard);
+
+            start_renderer.notify_all();
+
+            #[cfg(not(feature = "tui"))]
+            if render {
+                println!("Starting renderer...");
+            } else {
+                println!("Stopping renderer...");
+            }
+
+            if let Some(notifier) = tui_notifier {
+                let _ = notifier.notify(if render {
+                    "Renderer enabled."
+                } else {
+                    "Renderer disabled."
+                });
+            }
+
+            s.send(HumanInput::RenderToggled).unwrap();
+            false
+        }
+        'd' => {
+            let (controls, start_renderer) = &**renderer_controls;
+            let mut guard = controls.lock();
+            guard.deterministic = !guard.deterministic;
+            let deterministic = guard.deterministic;
+            drop(guard);
+
+            start_renderer.notify_all();
+
+            #[cfg(not(feature = "tui"))]
+            println!("Rendering deterministic: {deterministic}");
+
+            if let Some(notifier) = tui_notifier {
+                let _ = notifier.notify(if deterministic {
+                    "Deterministic mode enabled."
+                } else {
+                    "Deterministic mode disabled."
+                });
+            }
+
+            s.send(HumanInput::DeterministicToggled).unwrap();
+            false
+        }
+        #[cfg(feature = "tui")]
+        'k' => {
+            scroll_tui(tui_notifier, TuiScrollCommand::Up);
+            false
+        }
+        #[cfg(feature = "tui")]
+        'j' => {
+            scroll_tui(tui_notifier, TuiScrollCommand::Down);
+            false
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "tui")]
+fn scroll_tui(tui_notifier: Option<&TuiNotifier>, command: TuiScrollCommand) {
+    if let Some(notifier) = tui_notifier {
+        let _ = notifier.scroll(command);
     }
 }
 

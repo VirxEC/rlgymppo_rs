@@ -13,7 +13,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 
-use crate::render::{render_header, render_metrics_grid, render_status_bar};
+use crate::render::{
+    MetricHistory, SPARKLINE_HISTORY_LEN, render_header, render_metrics_grid, render_status_bar,
+};
 
 /// A terminal-based metrics dashboard using ratatui.
 ///
@@ -25,6 +27,7 @@ pub struct TuiDisplay {
     notification: String,
     /// Previous iteration's values, used to compute deltas (e.g. Rating).
     prev_vals: HashMap<String, f64>,
+    metric_history: MetricHistory,
     scroll_offset: u16,
     max_scroll: u16,
     mouse_capture_enabled: bool,
@@ -44,7 +47,10 @@ pub struct TuiNotifier {
 }
 
 enum TuiCommand {
-    Update(HashMap<String, f64>),
+    Update {
+        metrics: HashMap<String, f64>,
+        fresh_rating: bool,
+    },
     Notify(String),
     Scroll(ScrollCommand),
     DisableMouseCapture,
@@ -78,6 +84,7 @@ impl TuiDisplay {
             terminal,
             notification: String::new(),
             prev_vals: HashMap::new(),
+            metric_history: HashMap::new(),
             scroll_offset: 0,
             max_scroll: 0,
             mouse_capture_enabled: true,
@@ -90,6 +97,22 @@ impl TuiDisplay {
     /// Call this once per training iteration.  `metrics` should be a flat
     /// `{ "Group/key": value }` map (the same shape used for wandb).
     pub fn update(&mut self, metrics: &HashMap<String, f64>) -> io::Result<()> {
+        self.update_with_fresh_rating(metrics, false)
+    }
+
+    /// Render the latest metrics and mark `Rating/*` values as freshly updated.
+    pub fn update_with_fresh_rating(
+        &mut self,
+        metrics: &HashMap<String, f64>,
+        fresh_rating: bool,
+    ) -> io::Result<()> {
+        update_metric_history(&mut self.metric_history, metrics, fresh_rating);
+        self.render(metrics)?;
+        self.prev_vals = metrics.keys().map(|k| (k.clone(), metrics[k])).collect();
+        Ok(())
+    }
+
+    fn render(&mut self, metrics: &HashMap<String, f64>) -> io::Result<()> {
         let notification = std::mem::take(&mut self.notification);
 
         // Snapshot for delta computation.
@@ -109,7 +132,14 @@ impl TuiDisplay {
             .split(area);
 
             render_header(frame, chunks[0], metrics);
-            max_scroll = render_metrics_grid(frame, chunks[1], metrics, &prev_vals, scroll_offset);
+            max_scroll = render_metrics_grid(
+                frame,
+                chunks[1],
+                metrics,
+                &prev_vals,
+                &self.metric_history,
+                scroll_offset,
+            );
             render_status_bar(
                 frame,
                 chunks[2],
@@ -121,9 +151,6 @@ impl TuiDisplay {
 
         self.max_scroll = max_scroll;
         self.scroll_offset = self.scroll_offset.min(self.max_scroll);
-
-        // Stash current values for delta computation next iteration.
-        self.prev_vals = metrics.keys().map(|k| (k.clone(), metrics[k])).collect();
 
         Ok(())
     }
@@ -216,14 +243,21 @@ impl TuiHandle {
                 };
 
                 let mut latest_metrics = HashMap::new();
+                let mut latest_fresh_rating = false;
                 let mut last_size = terminal::size()?;
 
                 loop {
                     let mut should_redraw = false;
+                    let mut metrics_updated = false;
 
                     match rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(TuiCommand::Update(metrics)) => {
+                        Ok(TuiCommand::Update {
+                            metrics,
+                            fresh_rating,
+                        }) => {
                             latest_metrics = metrics;
+                            latest_fresh_rating = fresh_rating;
+                            metrics_updated = true;
                             should_redraw = true;
                         }
                         Ok(TuiCommand::Notify(message)) => {
@@ -248,8 +282,13 @@ impl TuiHandle {
 
                     while let Ok(command) = rx.try_recv() {
                         match command {
-                            TuiCommand::Update(metrics) => {
+                            TuiCommand::Update {
+                                metrics,
+                                fresh_rating,
+                            } => {
                                 latest_metrics = metrics;
+                                latest_fresh_rating = fresh_rating;
+                                metrics_updated = true;
                                 should_redraw = true;
                             }
                             TuiCommand::Notify(message) => {
@@ -281,7 +320,21 @@ impl TuiHandle {
                     }
 
                     if should_redraw {
-                        display.update(&latest_metrics)?;
+                        if metrics_updated {
+                            update_metric_history(
+                                &mut display.metric_history,
+                                &latest_metrics,
+                                latest_fresh_rating,
+                            );
+                            latest_fresh_rating = false;
+                        }
+                        display.render(&latest_metrics)?;
+                        if metrics_updated {
+                            display.prev_vals = latest_metrics
+                                .keys()
+                                .map(|k| (k.clone(), latest_metrics[k]))
+                                .collect();
+                        }
                     }
                 }
 
@@ -306,8 +359,20 @@ impl TuiHandle {
 
     /// Send a metrics update to the TUI thread. This returns once the update is queued.
     pub fn update(&self, metrics: HashMap<String, f64>) -> io::Result<()> {
+        self.update_with_fresh_rating(metrics, false)
+    }
+
+    /// Send a metrics update whose `Rating/*` values came from a completed skill eval.
+    pub fn update_with_fresh_rating(
+        &self,
+        metrics: HashMap<String, f64>,
+        fresh_rating: bool,
+    ) -> io::Result<()> {
         self.tx
-            .send(TuiCommand::Update(metrics))
+            .send(TuiCommand::Update {
+                metrics,
+                fresh_rating,
+            })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
     }
 
@@ -381,6 +446,32 @@ fn apply_scroll_command(display: &mut TuiDisplay, command: ScrollCommand, page_h
         ScrollCommand::Home => display.scroll_home(),
         ScrollCommand::End => display.scroll_end(),
     }
+}
+
+fn update_metric_history(
+    history: &mut MetricHistory,
+    metrics: &HashMap<String, f64>,
+    fresh_rating: bool,
+) {
+    for (key, value) in metrics {
+        if !should_track_metric_history(key, fresh_rating) || !value.is_finite() {
+            continue;
+        }
+
+        let values = history.entry(key.clone()).or_default();
+        values.push_back(*value);
+        while values.len() > SPARKLINE_HISTORY_LEN {
+            values.pop_front();
+        }
+    }
+}
+
+fn should_track_metric_history(key: &str, fresh_rating: bool) -> bool {
+    (fresh_rating && key.starts_with("Rating/"))
+        || key.starts_with("Loss/")
+        || key.starts_with("GAE/")
+        || key.starts_with("Update/")
+        || matches!(key, "Collect/avg step reward" | "Collect/episode length")
 }
 
 fn drain_pending_events() {

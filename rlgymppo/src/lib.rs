@@ -52,6 +52,8 @@ enum HumanInput {
 
 struct PendingMetricReport {
     waiting_for_skill_eval: Option<u64>,
+    #[cfg(feature = "tui")]
+    fresh_rating: bool,
     report: Report,
 }
 
@@ -273,6 +275,10 @@ fn spawn_metrics_actor(
 
                     if pending.waiting_for_skill_eval == Some(update.eval_id) {
                         pending.waiting_for_skill_eval = None;
+                        #[cfg(feature = "tui")]
+                        {
+                            pending.fresh_rating = true;
+                        }
                     }
                 }
             }
@@ -281,24 +287,25 @@ fn spawn_metrics_actor(
                 .front()
                 .is_some_and(|pending| pending.waiting_for_skill_eval.is_none())
             {
-                let metrics = pending_reports.pop_front().unwrap().report;
+                let metrics = pending_reports.pop_front().unwrap();
 
                 #[cfg(feature = "wandb")]
                 if let Some(ref tx) = wandb_tx {
-                    let flat = metrics.to_flat_map();
+                    let flat = metrics.report.to_flat_map();
                     let _ = tx.try_send(flat);
                 }
 
                 #[cfg(feature = "tui")]
                 if let Some(ref tui) = tui_display {
-                    let flat = metrics.to_flat_map();
-                    if let Err(e) = tui.update(flat) {
+                    let fresh_rating = metrics.fresh_rating;
+                    let flat = metrics.report.to_flat_map();
+                    if let Err(e) = tui.update_with_fresh_rating(flat, fresh_rating) {
                         eprintln!("Warning: TUI display update failed: {e}");
                     }
                 }
 
                 #[cfg(not(feature = "tui"))]
-                println!("{metrics}");
+                println!("{}", metrics.report);
             }
 
             if shutting_down && pending_reports.is_empty() {
@@ -953,6 +960,8 @@ where
 
             let _ = metric_tx.send(MetricEvent::Report(PendingMetricReport {
                 waiting_for_skill_eval,
+                #[cfg(feature = "tui")]
+                fresh_rating: false,
                 report: metrics,
             }));
 

@@ -1,9 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+
+pub(crate) type MetricHistory = HashMap<String, VecDeque<f64>>;
+
+pub(crate) const SPARKLINE_HISTORY_LEN: usize = 12;
+const SPARKLINE_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 use crate::format::{display_width, format_num, metric_value_display};
 
@@ -11,7 +16,7 @@ use crate::format::{display_width, format_num, metric_value_display};
 pub(crate) struct MetricGroup {
     pub(crate) name: &'static str,
     pub(crate) key_prefix: &'static str,
-    color: Color,
+    pub(crate) color: Color,
 }
 
 /// Pre-defined groups in display order. Metrics whose keys start with a
@@ -121,6 +126,7 @@ pub(crate) fn render_metrics_grid(
     area: Rect,
     metrics: &HashMap<String, f64>,
     prev_vals: &HashMap<String, f64>,
+    history: &MetricHistory,
     scroll_offset: u16,
 ) -> u16 {
     let groups: Vec<MetricGroupView<'_>> = GROUPS
@@ -139,22 +145,43 @@ pub(crate) fn render_metrics_grid(
         return 0;
     }
 
-    let num_cols = content_fit_column_count(area.width, &groups, prev_vals);
-    let columns = pack_metric_groups(&groups, num_cols);
+    let columns = plan_metric_columns(area.width, area.height, &groups, prev_vals, history);
 
     let content_height = columns
         .iter()
-        .map(|column| desired_column_height(column))
+        .map(|column| column.height)
         .max()
         .unwrap_or(0);
     let max_scroll = content_height.saturating_sub(area.height);
     let scroll_offset = scroll_offset.min(max_scroll);
 
-    let col_constraints = vec![Constraint::Ratio(1, num_cols as u32); num_cols];
-    let cols = Layout::horizontal(col_constraints).split(area);
+    let total_width: u16 = columns
+        .iter()
+        .map(|column| column.width)
+        .fold(0_u16, u16::saturating_add);
+    let extra_width = area.width.saturating_sub(total_width);
+    let base_extra = extra_width / columns.len() as u16;
+    let extra_remainder = extra_width % columns.len() as u16;
+    let mut x = area.x;
 
-    for (column, col_area) in columns.iter().zip(cols.iter()) {
-        render_column(frame, *col_area, prev_vals, column, scroll_offset);
+    for (idx, column) in columns.iter().enumerate() {
+        let remaining_width = area.x.saturating_add(area.width).saturating_sub(x);
+        if remaining_width == 0 {
+            break;
+        }
+
+        let extra = base_extra + u16::from((idx as u16) < extra_remainder);
+        let width = column.width.saturating_add(extra).min(remaining_width);
+        let col_area = Rect::new(x, area.y, width, area.height);
+        render_column(
+            frame,
+            col_area,
+            prev_vals,
+            history,
+            &column.groups,
+            scroll_offset,
+        );
+        x = x.saturating_add(width);
     }
 
     max_scroll
@@ -165,6 +192,7 @@ fn render_column(
     frame: &mut ratatui::Frame,
     area: Rect,
     prev_vals: &HashMap<String, f64>,
+    history: &MetricHistory,
     groups: &[MetricGroupView<'_>],
     scroll_offset: u16,
 ) {
@@ -180,6 +208,7 @@ fn render_column(
             view.group,
             &view.entries,
             prev_vals,
+            history,
         ));
     }
 
@@ -195,64 +224,227 @@ struct MetricGroupView<'a> {
     entries: Vec<(&'a str, f64)>,
 }
 
-fn content_fit_column_count(
+#[derive(Clone)]
+struct ColumnPlan<'a> {
+    groups: Vec<MetricGroupView<'a>>,
     width: u16,
-    groups: &[MetricGroupView<'_>],
+    height: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LayoutScore {
+    overflow: u32,
+    wasted_area: u32,
+    height_imbalance: u32,
+    unused_width: u32,
+    column_penalty: u32,
+    max_height: u32,
+}
+
+fn plan_metric_columns<'a>(
+    width: u16,
+    height: u16,
+    groups: &[MetricGroupView<'a>],
     prev_vals: &HashMap<String, f64>,
-) -> usize {
-    for num_cols in (1..=groups.len()).rev() {
-        let constraints = vec![Constraint::Ratio(1, num_cols as u32); num_cols];
-        let layout_area = Rect::new(0, 0, width, 1);
-        let col_areas = Layout::horizontal(constraints).split(layout_area);
-        let columns = pack_metric_groups(groups, num_cols);
+    history: &MetricHistory,
+) -> Vec<ColumnPlan<'a>> {
+    let group_dims: Vec<GroupDimensions> = groups
+        .iter()
+        .map(|view| GroupDimensions {
+            width: required_group_width(view, prev_vals, history),
+            height: desired_group_height(view.entries.len()),
+        })
+        .collect();
 
-        let all_columns_fit = columns.iter().zip(col_areas.iter()).all(|(column, area)| {
-            column
-                .iter()
-                .all(|view| required_group_width(view, prev_vals) <= area.width)
-        });
+    let mut best: Option<(LayoutScore, Vec<ColumnPlan<'a>>)> = None;
 
-        if all_columns_fit {
-            return num_cols;
+    for num_cols in 1..=groups.len() {
+        if let Some((score, columns)) =
+            best_column_assignment(groups, &group_dims, num_cols, width, height)
+            && best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score < *best_score)
+        {
+            best = Some((score, columns));
         }
     }
 
-    1
+    best.map(|(_, columns)| columns).unwrap_or_else(|| {
+        vec![build_column_plan(
+            groups.to_vec(),
+            &group_dims,
+            (0..groups.len()).collect(),
+        )]
+    })
 }
 
-fn pack_metric_groups<'a>(
+fn best_column_assignment<'a>(
     groups: &[MetricGroupView<'a>],
+    group_dims: &[GroupDimensions],
     num_cols: usize,
-) -> Vec<Vec<MetricGroupView<'a>>> {
-    let mut columns: Vec<Vec<MetricGroupView<'_>>> = (0..num_cols).map(|_| Vec::new()).collect();
+    available_width: u16,
+    available_height: u16,
+) -> Option<(LayoutScore, Vec<ColumnPlan<'a>>)> {
+    let mut assignments = vec![Vec::<usize>::new(); num_cols];
+    let mut col_widths = vec![0_u16; num_cols];
     let mut col_heights = vec![0_u16; num_cols];
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by_key(|&idx| {
+        std::cmp::Reverse((group_dims[idx].width as u32) * (group_dims[idx].height as u32))
+    });
 
-    // Pack tallest groups first for balanced columns, then restore each
-    // column's original display order for predictable scanning.
-    let mut group_indices: Vec<usize> = (0..groups.len()).collect();
-    group_indices
-        .sort_by_key(|&idx| std::cmp::Reverse(desired_group_height(groups[idx].entries.len())));
+    let mut search = ColumnSearch {
+        order: &order,
+        group_dims,
+        available_width,
+        available_height,
+        assignments: &mut assignments,
+        col_widths: &mut col_widths,
+        col_heights: &mut col_heights,
+        best: None,
+    };
+    search.run(0);
 
-    for idx in group_indices {
-        let col_idx = col_heights
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, height)| **height)
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        col_heights[col_idx] =
-            col_heights[col_idx].saturating_add(desired_group_height(groups[idx].entries.len()));
-        columns[col_idx].push(groups[idx].clone());
-    }
-
-    for column in &mut columns {
-        column.sort_by_key(|view| group_order(view.group.key_prefix));
-    }
-
-    columns
+    let (score, assignments) = search.best?;
+    let columns = assignments
+        .into_iter()
+        .map(|indices| {
+            let mut group_indices = indices;
+            group_indices.sort_by_key(|&idx| group_order(groups[idx].group.key_prefix));
+            let column_groups = group_indices
+                .iter()
+                .map(|&idx| groups[idx].clone())
+                .collect();
+            build_column_plan(column_groups, group_dims, group_indices)
+        })
+        .collect();
+    Some((score, columns))
 }
 
-fn required_group_width(view: &MetricGroupView<'_>, prev_vals: &HashMap<String, f64>) -> u16 {
+struct ColumnSearch<'a, 'b> {
+    order: &'a [usize],
+    group_dims: &'a [GroupDimensions],
+    available_width: u16,
+    available_height: u16,
+    assignments: &'b mut [Vec<usize>],
+    col_widths: &'b mut [u16],
+    col_heights: &'b mut [u16],
+    best: Option<(LayoutScore, Vec<Vec<usize>>)>,
+}
+
+impl ColumnSearch<'_, '_> {
+    fn run(&mut self, order_idx: usize) {
+        if order_idx == self.order.len() {
+            self.record_complete_assignment();
+            return;
+        }
+
+        let group_idx = self.order[order_idx];
+        let dims = self.group_dims[group_idx];
+
+        for col_idx in 0..self.assignments.len() {
+            if self.assignments[col_idx].is_empty()
+                && self.assignments[..col_idx].iter().any(Vec::is_empty)
+            {
+                continue;
+            }
+
+            let old_width = self.col_widths[col_idx];
+            let old_height = self.col_heights[col_idx];
+            self.col_widths[col_idx] = self.col_widths[col_idx].max(dims.width);
+            self.col_heights[col_idx] = self.col_heights[col_idx].saturating_add(dims.height);
+
+            let partial_width = self
+                .col_widths
+                .iter()
+                .fold(0_u16, |sum, width| sum.saturating_add(*width));
+            if partial_width <= self.available_width {
+                self.assignments[col_idx].push(group_idx);
+                self.run(order_idx + 1);
+                self.assignments[col_idx].pop();
+            }
+
+            self.col_widths[col_idx] = old_width;
+            self.col_heights[col_idx] = old_height;
+        }
+    }
+
+    fn record_complete_assignment(&mut self) {
+        if self.assignments.iter().any(Vec::is_empty) {
+            return;
+        }
+
+        let total_width = self
+            .col_widths
+            .iter()
+            .fold(0_u16, |sum, width| sum.saturating_add(*width));
+        if total_width > self.available_width {
+            return;
+        }
+
+        let max_height = self.col_heights.iter().copied().max().unwrap_or(0);
+        let min_height = self.col_heights.iter().copied().min().unwrap_or(0);
+        let used_area = self
+            .col_widths
+            .iter()
+            .zip(self.col_heights.iter())
+            .map(|(width, height)| (*width as u32) * (*height as u32))
+            .sum::<u32>();
+        let layout_area = (total_width as u32) * (max_height as u32);
+        let num_cols = self.assignments.len() as u32;
+        let max_possible_cols = self.order.len() as u32;
+        let score = LayoutScore {
+            overflow: max_height.saturating_sub(self.available_height) as u32,
+            wasted_area: layout_area.saturating_sub(used_area),
+            height_imbalance: max_height.saturating_sub(min_height) as u32,
+            unused_width: self.available_width.saturating_sub(total_width) as u32,
+            column_penalty: max_possible_cols.saturating_sub(num_cols),
+            max_height: max_height as u32,
+        };
+
+        if self
+            .best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score < *best_score)
+        {
+            self.best = Some((score, self.assignments.to_vec()));
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GroupDimensions {
+    width: u16,
+    height: u16,
+}
+
+fn build_column_plan<'a>(
+    groups: Vec<MetricGroupView<'a>>,
+    group_dims: &[GroupDimensions],
+    group_indices: Vec<usize>,
+) -> ColumnPlan<'a> {
+    let width = group_indices
+        .iter()
+        .map(|&idx| group_dims[idx].width)
+        .max()
+        .unwrap_or(0);
+    let height = group_indices
+        .iter()
+        .map(|&idx| group_dims[idx].height)
+        .sum();
+
+    ColumnPlan {
+        groups,
+        width,
+        height,
+    }
+}
+
+fn required_group_width(
+    view: &MetricGroupView<'_>,
+    prev_vals: &HashMap<String, f64>,
+    history: &MetricHistory,
+) -> u16 {
     let title_width = display_width(view.group.name) + 4;
     let value_col_width = view
         .entries
@@ -262,12 +454,25 @@ fn required_group_width(view: &MetricGroupView<'_>, prev_vals: &HashMap<String, 
         })
         .max()
         .unwrap_or(0);
-    let row_width = view
+    let name_col_width = view
         .entries
         .iter()
-        .map(|(name, _)| display_width(name) + value_col_width + 7)
+        .map(|(name, _)| display_width(&format!(" {name}")))
         .max()
-        .unwrap_or(display_width(" (no data)") + 4);
+        .unwrap_or(0);
+    let sparkline_col_width = view
+        .entries
+        .iter()
+        .map(|(name, _)| sparkline_required_width(view.group, name, history).saturating_sub(2))
+        .max()
+        .unwrap_or(0);
+    let row_width = if view.entries.is_empty() {
+        display_width(" (no data)") + 4
+    } else {
+        // Left/right borders + name column + name/sparkline gap + sparkline column
+        // + sparkline/value gap + value column.
+        name_col_width + sparkline_col_width + value_col_width + 6
+    };
 
     title_width.max(row_width).min(u16::MAX as usize) as u16
 }
@@ -275,13 +480,6 @@ fn required_group_width(view: &MetricGroupView<'_>, prev_vals: &HashMap<String, 
 fn desired_group_height(entry_count: usize) -> u16 {
     // Top/bottom border + title/padding, then one row per metric.
     (entry_count as u16).saturating_add(2).max(3)
-}
-
-fn desired_column_height(groups: &[MetricGroupView<'_>]) -> u16 {
-    groups
-        .iter()
-        .map(|view| desired_group_height(view.entries.len()))
-        .sum()
 }
 
 fn group_order(prefix: &str) -> usize {
@@ -297,6 +495,7 @@ fn render_group_lines<'a>(
     group: &MetricGroup,
     entries: &[(&str, f64)],
     prev_vals: &HashMap<String, f64>,
+    history: &MetricHistory,
 ) -> Vec<Line<'a>> {
     if width == 0 {
         return Vec::new();
@@ -328,30 +527,62 @@ fn render_group_lines<'a>(
         .map(|(name, value)| display_width(&metric_value_display(group, name, *value, prev_vals)))
         .max()
         .unwrap_or(0);
+    let name_col_width = entries
+        .iter()
+        .map(|(name, _)| display_width(&format!(" {name}")))
+        .max()
+        .unwrap_or(0);
+    let max_sparkline_available_width = inner_width
+        .saturating_sub(name_col_width + value_col_width + 4)
+        .min(max_sparkline_width());
+    let sparkline_col_width = entries
+        .iter()
+        .filter_map(|(name, _)| {
+            let full_key = format!("{}/{name}", group.key_prefix);
+            history
+                .get(&full_key)
+                .and_then(|values| sparkline_for_values(values, max_sparkline_available_width))
+                .map(|sparkline| display_width(&sparkline))
+        })
+        .max()
+        .unwrap_or(0);
 
     for &(name, value) in entries {
         let value = metric_value_display(group, name, value, prev_vals);
         let name_text = format!(" {name}");
         let name_width = display_width(&name_text);
         let value_width = display_width(&value);
-        let min_gap = 2;
-        let gap_width = inner_width
-            .saturating_sub(name_width + value_width)
-            .max(min_gap)
-            .max(value_col_width.saturating_sub(value_width) + min_gap);
+        let full_key = format!("{}/{name}", group.key_prefix);
+        let sparkline = history
+            .get(&full_key)
+            .and_then(|values| sparkline_for_values(values, max_sparkline_available_width));
+        let sparkline_width = sparkline.as_deref().map(display_width).unwrap_or(0);
+        let name_padding = name_col_width.saturating_sub(name_width);
+        let value_padding = value_col_width.saturating_sub(value_width);
+        let flexible_gap = inner_width.saturating_sub(
+            name_width + name_padding + sparkline_col_width + 2 + value_padding + value_width,
+        );
+        let sparkline_left_padding = sparkline_col_width.saturating_sub(sparkline_width);
 
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::raw("│"),
             Span::styled(name_text, Style::default().fg(Color::Gray)),
-            Span::raw(" ".repeat(gap_width)),
-            Span::styled(
-                value,
-                Style::default()
-                    .fg(group.color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("│"),
-        ]));
+            Span::raw(" ".repeat(name_padding + flexible_gap + sparkline_left_padding)),
+        ];
+
+        if let Some(sparkline) = sparkline {
+            spans.push(Span::styled(sparkline, Style::default().fg(group.color)));
+        }
+
+        spans.push(Span::raw(" ".repeat(2 + value_padding)));
+        spans.push(Span::styled(
+            value,
+            Style::default()
+                .fg(group.color)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("│"));
+        lines.push(Line::from(spans));
     }
 
     if entries.is_empty() {
@@ -376,6 +607,56 @@ fn render_group_lines<'a>(
     ]));
 
     lines
+}
+
+fn sparkline_required_width(group: &MetricGroup, name: &str, history: &MetricHistory) -> usize {
+    let full_key = format!("{}/{name}", group.key_prefix);
+    history
+        .get(&full_key)
+        .and_then(|values| sparkline_for_values(values, max_sparkline_width()))
+        .map(|sparkline| display_width(&sparkline) + 2)
+        .unwrap_or(0)
+}
+
+fn sparkline_for_values(values: &VecDeque<f64>, max_width: usize) -> Option<String> {
+    if values.len() < 2 || max_width < 2 {
+        return None;
+    }
+
+    let samples = downsample_values(values, max_width);
+    let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+
+    Some(
+        samples
+            .into_iter()
+            .map(|value| {
+                if range <= f64::EPSILON {
+                    SPARKLINE_CHARS[0]
+                } else {
+                    let idx = (((value - min) / range) * (SPARKLINE_CHARS.len() - 1) as f64)
+                        .round()
+                        .clamp(0.0, (SPARKLINE_CHARS.len() - 1) as f64)
+                        as usize;
+                    SPARKLINE_CHARS[idx]
+                }
+            })
+            .collect(),
+    )
+}
+
+fn downsample_values(values: &VecDeque<f64>, max_width: usize) -> Vec<f64> {
+    if values.len() <= max_width {
+        return values.iter().copied().collect();
+    }
+
+    let start = values.len() - max_width;
+    values.iter().skip(start).copied().collect()
+}
+
+fn max_sparkline_width() -> usize {
+    SPARKLINE_HISTORY_LEN
 }
 
 /// Render the status bar at the bottom (notifications + key bindings).

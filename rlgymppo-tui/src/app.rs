@@ -29,8 +29,6 @@ const TUI_COMMAND_BUFFER_SIZE: usize = 128;
 pub struct TuiDisplay {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     notification: Option<Notification>,
-    /// Previous iteration's values, used to compute deltas (e.g. Rating).
-    prev_vals: HashMap<String, f64>,
     metric_history: MetricHistory,
     scroll_offset: u16,
     max_scroll: u16,
@@ -110,7 +108,6 @@ impl TuiDisplay {
         Ok(Self {
             terminal,
             notification: None,
-            prev_vals: HashMap::new(),
             metric_history: HashMap::new(),
             scroll_offset: 0,
             max_scroll: 0,
@@ -135,7 +132,6 @@ impl TuiDisplay {
     ) -> io::Result<()> {
         update_metric_history(&mut self.metric_history, metrics, fresh_rating);
         self.render(metrics)?;
-        self.prev_vals = metrics.keys().map(|k| (k.clone(), metrics[k])).collect();
         Ok(())
     }
 
@@ -145,9 +141,6 @@ impl TuiDisplay {
             .notification
             .as_ref()
             .map(|notification| notification.message.clone());
-
-        // Snapshot for delta computation.
-        let prev_vals = self.prev_vals.clone();
 
         let mut max_scroll = 0;
         let scroll_offset = self.scroll_offset;
@@ -167,7 +160,6 @@ impl TuiDisplay {
                 frame,
                 chunks[1],
                 metrics,
-                &prev_vals,
                 &self.metric_history,
                 scroll_offset,
             );
@@ -399,12 +391,6 @@ impl TuiHandle {
                             latest_fresh_rating = false;
                         }
                         display.render(&latest_metrics)?;
-                        if metrics_updated {
-                            display.prev_vals = latest_metrics
-                                .keys()
-                                .map(|k| (k.clone(), latest_metrics[k]))
-                                .collect();
-                        }
                     }
                 }
 

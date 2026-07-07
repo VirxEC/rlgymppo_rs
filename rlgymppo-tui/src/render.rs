@@ -160,7 +160,6 @@ pub(crate) fn render_metrics_grid(
     frame: &mut ratatui::Frame,
     area: Rect,
     metrics: &HashMap<String, f64>,
-    prev_vals: &HashMap<String, f64>,
     history: &MetricHistory,
     scroll_offset: u16,
 ) -> u16 {
@@ -186,7 +185,7 @@ pub(crate) fn render_metrics_grid(
         return 0;
     }
 
-    let columns = plan_metric_columns(area.width, area.height, &groups, prev_vals, history);
+    let columns = plan_metric_columns(area.width, area.height, &groups, history);
 
     let content_height = columns
         .iter()
@@ -214,14 +213,7 @@ pub(crate) fn render_metrics_grid(
         let extra = base_extra + u16::from((idx as u16) < extra_remainder);
         let width = column.width.saturating_add(extra).min(remaining_width);
         let col_area = Rect::new(x, area.y, width, area.height);
-        render_column(
-            frame,
-            col_area,
-            prev_vals,
-            history,
-            &column.groups,
-            scroll_offset,
-        );
+        render_column(frame, col_area, history, &column.groups, scroll_offset);
         x = x.saturating_add(width);
     }
 
@@ -232,7 +224,6 @@ pub(crate) fn render_metrics_grid(
 fn render_column(
     frame: &mut ratatui::Frame,
     area: Rect,
-    prev_vals: &HashMap<String, f64>,
     history: &MetricHistory,
     groups: &[MetricGroupView<'_>],
     scroll_offset: u16,
@@ -248,7 +239,6 @@ fn render_column(
             area.width,
             view.group,
             &view.entries,
-            prev_vals,
             history,
         ));
     }
@@ -286,13 +276,12 @@ fn plan_metric_columns<'a>(
     width: u16,
     height: u16,
     groups: &[MetricGroupView<'a>],
-    prev_vals: &HashMap<String, f64>,
     history: &MetricHistory,
 ) -> Vec<ColumnPlan<'a>> {
     let group_dims: Vec<GroupDimensions> = groups
         .iter()
         .map(|view| GroupDimensions {
-            width: required_group_width(view, prev_vals, history),
+            width: required_group_width(view, history),
             height: desired_group_height(view.entries.len()),
         })
         .collect();
@@ -481,18 +470,12 @@ fn build_column_plan<'a>(
     }
 }
 
-fn required_group_width(
-    view: &MetricGroupView<'_>,
-    prev_vals: &HashMap<String, f64>,
-    history: &MetricHistory,
-) -> u16 {
+fn required_group_width(view: &MetricGroupView<'_>, history: &MetricHistory) -> u16 {
     let title_width = display_width(&view.group.name) + 4;
     let value_col_width = view
         .entries
         .iter()
-        .map(|(name, value)| {
-            display_width(&metric_value_display(view.group, name, *value, prev_vals))
-        })
+        .map(|(name, value)| display_width(&metric_value_display(view.group, name, *value)))
         .max()
         .unwrap_or(0);
     let name_col_width = view
@@ -558,7 +541,6 @@ fn render_group_lines<'a>(
     width: u16,
     group: &MetricGroup,
     entries: &[(&str, f64)],
-    prev_vals: &HashMap<String, f64>,
     history: &MetricHistory,
 ) -> Vec<Line<'a>> {
     if width == 0 {
@@ -588,7 +570,7 @@ fn render_group_lines<'a>(
 
     let value_col_width = entries
         .iter()
-        .map(|(name, value)| display_width(&metric_value_display(group, name, *value, prev_vals)))
+        .map(|(name, value)| display_width(&metric_value_display(group, name, *value)))
         .max()
         .unwrap_or(0);
     let name_col_width = entries
@@ -612,7 +594,7 @@ fn render_group_lines<'a>(
         .unwrap_or(0);
 
     for &(name, value) in entries {
-        let value = metric_value_display(group, name, value, prev_vals);
+        let value = metric_value_display(group, name, value);
         let name_text = format!(" {name}");
         let name_width = display_width(&name_text);
         let value_width = display_width(&value);
@@ -807,7 +789,7 @@ mod tests {
             color: Color::Red,
         };
         let entries = [("policy", 1.0)];
-        let lines = render_group_lines(2, &group, &entries, &HashMap::new(), &HashMap::new());
+        let lines = render_group_lines(2, &group, &entries, &HashMap::new());
         assert_eq!(lines.len(), desired_group_height(entries.len()) as usize);
     }
 }

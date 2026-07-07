@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use unicode_width::UnicodeWidthStr;
 
 use crate::render::MetricGroup;
@@ -8,25 +6,9 @@ pub(crate) fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-pub(crate) fn metric_value_display(
-    group: &MetricGroup,
-    name: &str,
-    value: f64,
-    prev_vals: &HashMap<String, f64>,
-) -> String {
+pub(crate) fn metric_value_display(group: &MetricGroup, name: &str, value: f64) -> String {
     if group.key_prefix == "Rating" {
-        // Show delta alongside the current rating (1 decimal).
-        let full_key = format!("Rating/{name}");
-        let prev = prev_vals.get(&full_key).copied().unwrap_or(value);
-        let delta = value - prev;
-        let val_str = format!("{value:.1}");
-        if delta.abs() >= 0.05 {
-            let sign = if delta >= 0.0 { '+' } else { '-' };
-            let delta_str = format!("{:.1}", delta.abs());
-            format!("{val_str} ({sign}{delta_str})")
-        } else {
-            val_str
-        }
+        format!("{value:.1}")
     } else if group.key_prefix == "Throughput"
         || (group.key_prefix == "Collect" && name == "episode length")
     {
@@ -79,7 +61,7 @@ mod tests {
 
     #[test]
     fn test_format_num_float() {
-        assert_eq!(format_num(PI), "3.1416");
+        assert_eq!(format_num(PI), "3.14");
         assert_eq!(format_num(0.00123), "0.0012");
     }
 

@@ -3,9 +3,8 @@
 use burn::tensor::backend::AutodiffBackend;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng, rng};
-use rlgym::rocketsim::{ArenaEvent, init_from_default};
 use rlgymppo::rlgym::{Env, GameState, SharedInfoProvider};
-use rlgymppo::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
+use rlgymppo::rocketsim::{Arena, ArenaEvent, CarBodyConfig, GameMode, Team, init_from_default};
 use rlgymppo::utils::actions::DefaultAction;
 use rlgymppo::utils::obs::DefaultObs;
 use rlgymppo::utils::shared_info::{SharedInfoReport, SharedInfoRng};
@@ -160,6 +159,7 @@ pub fn default_config<B: AutodiffBackend>(
         },
         skill_tracker: SkillTrackerConfig {
             enabled: true,
+            num_arenas: 12,
             ..Default::default()
         },
         shared_head_layer_sizes: vec![256; 2],

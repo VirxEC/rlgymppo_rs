@@ -1,6 +1,6 @@
 [workspace]
-members = ["rlgymppo", "rlgymppo-wandb", "rlgymppo-tui", "rlgymppo-trainer"]
 resolver = "2"
+members = ["rlgymppo", "rlgymppo-trainer", "rlgymppo-tui", "rlgymppo-wandb"]
 
 [profile.dev]
 opt-level = 1

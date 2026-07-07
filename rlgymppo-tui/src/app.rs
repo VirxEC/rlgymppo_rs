@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -17,6 +18,9 @@ use crate::render::{
     MetricHistory, SPARKLINE_HISTORY_LEN, render_header, render_metrics_grid, render_status_bar,
 };
 
+const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
+const TUI_COMMAND_BUFFER_SIZE: usize = 128;
+
 /// A terminal-based metrics dashboard using ratatui.
 ///
 /// Create one at the start of training, call [`update`](Self::update) each
@@ -24,7 +28,7 @@ use crate::render::{
 /// toggle, etc.), and call [`close`](Self::close) when done.
 pub struct TuiDisplay {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
-    notification: String,
+    notification: Option<Notification>,
     /// Previous iteration's values, used to compute deltas (e.g. Rating).
     prev_vals: HashMap<String, f64>,
     metric_history: MetricHistory,
@@ -36,21 +40,31 @@ pub struct TuiDisplay {
 
 /// Thread-owned TUI controller.
 pub struct TuiHandle {
-    tx: Sender<TuiCommand>,
+    tx: SyncSender<TuiCommand>,
+    pending_update: PendingUpdateSlot,
     thread: Option<JoinHandle<io::Result<()>>>,
 }
 
 /// Cloneable sender for immediate TUI notifications from background threads.
 #[derive(Clone)]
 pub struct TuiNotifier {
-    tx: Sender<TuiCommand>,
+    tx: SyncSender<TuiCommand>,
+}
+
+type PendingUpdateSlot = Arc<Mutex<Option<PendingUpdate>>>;
+
+struct PendingUpdate {
+    metrics: HashMap<String, f64>,
+    fresh_rating: bool,
+}
+
+struct Notification {
+    message: String,
+    created_at: Instant,
 }
 
 enum TuiCommand {
-    Update {
-        metrics: HashMap<String, f64>,
-        fresh_rating: bool,
-    },
+    WakeUpdate,
     Notify(String),
     Scroll(ScrollCommand),
     DisableMouseCapture,
@@ -77,12 +91,25 @@ impl TuiDisplay {
     pub fn new() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
+
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        let terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(e) => {
+                let mut stdout = io::stdout();
+                let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+                return Err(e);
+            }
+        };
+
         Ok(Self {
             terminal,
-            notification: String::new(),
+            notification: None,
             prev_vals: HashMap::new(),
             metric_history: HashMap::new(),
             scroll_offset: 0,
@@ -113,7 +140,11 @@ impl TuiDisplay {
     }
 
     fn render(&mut self, metrics: &HashMap<String, f64>) -> io::Result<()> {
-        let notification = std::mem::take(&mut self.notification);
+        self.clear_expired_notification();
+        let notification = self
+            .notification
+            .as_ref()
+            .map(|notification| notification.message.clone());
 
         // Snapshot for delta computation.
         let prev_vals = self.prev_vals.clone();
@@ -143,7 +174,7 @@ impl TuiDisplay {
             render_status_bar(
                 frame,
                 chunks[2],
-                &notification,
+                notification.as_deref(),
                 scroll_offset.min(max_scroll),
                 max_scroll,
             );
@@ -155,10 +186,28 @@ impl TuiDisplay {
         Ok(())
     }
 
-    /// Set a notification message shown in the status bar for one
-    /// iteration cycle (until the next [`update`](Self::update)).
+    /// Set a notification message shown in the status bar for a short TTL.
     pub fn notify(&mut self, msg: impl Into<String>) {
-        self.notification = msg.into();
+        self.notification = Some(Notification {
+            message: msg.into(),
+            created_at: Instant::now(),
+        });
+    }
+
+    fn clear_expired_notification(&mut self) {
+        if self
+            .notification
+            .as_ref()
+            .is_some_and(|notification| notification.created_at.elapsed() >= NOTIFICATION_TTL)
+        {
+            self.notification = None;
+        }
+    }
+
+    fn has_expired_notification(&self) -> bool {
+        self.notification
+            .as_ref()
+            .is_some_and(|notification| notification.created_at.elapsed() >= NOTIFICATION_TTL)
     }
 
     fn scroll_up(&mut self, lines: u16) {
@@ -202,12 +251,22 @@ impl TuiDisplay {
         }
 
         self.closed = true;
-        self.disable_mouse_capture()?;
+
+        let mut first_error = None;
+        remember_error(&mut first_error, self.disable_mouse_capture());
         drain_pending_events();
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-        disable_raw_mode()?;
-        self.terminal.show_cursor()?;
-        Ok(())
+        remember_error(
+            &mut first_error,
+            execute!(self.terminal.backend_mut(), LeaveAlternateScreen),
+        );
+        remember_error(&mut first_error, disable_raw_mode());
+        remember_error(&mut first_error, self.terminal.show_cursor());
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -224,8 +283,10 @@ impl TuiHandle {
     /// while notifications can be sent from any thread via [`TuiNotifier`]. Every
     /// update or notification triggers an immediate redraw using the latest metrics.
     pub fn new() -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(TUI_COMMAND_BUFFER_SIZE);
         let (init_tx, init_rx) = mpsc::sync_channel(1);
+        let pending_update: PendingUpdateSlot = Arc::new(Mutex::new(None));
+        let thread_pending_update = Arc::clone(&pending_update);
 
         let thread = thread::Builder::new()
             .name("tui".into())
@@ -251,14 +312,13 @@ impl TuiHandle {
                     let mut metrics_updated = false;
 
                     match rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(TuiCommand::Update {
-                            metrics,
-                            fresh_rating,
-                        }) => {
-                            latest_metrics = metrics;
-                            latest_fresh_rating = fresh_rating;
-                            metrics_updated = true;
-                            should_redraw = true;
+                        Ok(TuiCommand::WakeUpdate) => {
+                            if let Some(update) = take_pending_update(&thread_pending_update) {
+                                latest_metrics = update.metrics;
+                                latest_fresh_rating = update.fresh_rating;
+                                metrics_updated = true;
+                                should_redraw = true;
+                            }
                         }
                         Ok(TuiCommand::Notify(message)) => {
                             display.notify(message);
@@ -276,20 +336,21 @@ impl TuiHandle {
                             display.disable_mouse_capture()?;
                         }
                         Ok(TuiCommand::Close) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            should_redraw = display.has_expired_notification();
+                        }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
 
                     while let Ok(command) = rx.try_recv() {
                         match command {
-                            TuiCommand::Update {
-                                metrics,
-                                fresh_rating,
-                            } => {
-                                latest_metrics = metrics;
-                                latest_fresh_rating = fresh_rating;
-                                metrics_updated = true;
-                                should_redraw = true;
+                            TuiCommand::WakeUpdate => {
+                                if let Some(update) = take_pending_update(&thread_pending_update) {
+                                    latest_metrics = update.metrics;
+                                    latest_fresh_rating = update.fresh_rating;
+                                    metrics_updated = true;
+                                    should_redraw = true;
+                                }
                             }
                             TuiCommand::Notify(message) => {
                                 display.notify(message);
@@ -311,6 +372,15 @@ impl TuiHandle {
                                 return Ok(());
                             }
                         }
+                    }
+
+                    if !metrics_updated
+                        && let Some(update) = take_pending_update(&thread_pending_update)
+                    {
+                        latest_metrics = update.metrics;
+                        latest_fresh_rating = update.fresh_rating;
+                        metrics_updated = true;
+                        should_redraw = true;
                     }
 
                     let size = terminal::size()?;
@@ -348,6 +418,7 @@ impl TuiHandle {
         {
             Ok(()) => Ok(Self {
                 tx,
+                pending_update,
                 thread: Some(thread),
             }),
             Err(e) => {
@@ -368,12 +439,20 @@ impl TuiHandle {
         metrics: HashMap<String, f64>,
         fresh_rating: bool,
     ) -> io::Result<()> {
-        self.tx
-            .send(TuiCommand::Update {
-                metrics,
-                fresh_rating,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
+        let mut pending_update = self
+            .pending_update
+            .lock()
+            .map_err(|_| io::Error::other("TUI update slot lock poisoned"))?;
+        let fresh_rating = fresh_rating
+            || pending_update
+                .as_ref()
+                .is_some_and(|update| update.fresh_rating);
+        *pending_update = Some(PendingUpdate {
+            metrics,
+            fresh_rating,
+        });
+
+        send_wakeup(&self.tx)
     }
 
     /// Send a notification to the TUI thread and redraw immediately.
@@ -484,8 +563,73 @@ fn is_custom_sparkline_group(group: &str) -> bool {
     )
 }
 
+fn take_pending_update(pending_update: &PendingUpdateSlot) -> Option<PendingUpdate> {
+    pending_update.lock().ok()?.take()
+}
+
+fn send_wakeup(tx: &SyncSender<TuiCommand>) -> io::Result<()> {
+    match tx.try_send(TuiCommand::WakeUpdate) {
+        Ok(()) | Err(TrySendError::Full(TuiCommand::WakeUpdate)) => Ok(()),
+        Err(TrySendError::Disconnected(_)) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "TUI thread has exited",
+        )),
+        Err(TrySendError::Full(_)) => unreachable!("send_wakeup only sends wake updates"),
+    }
+}
+
+fn remember_error(first_error: &mut Option<io::Error>, result: io::Result<()>) {
+    if first_error.is_none()
+        && let Err(error) = result
+    {
+        *first_error = Some(error);
+    }
+}
+
 fn drain_pending_events() {
     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
         let _ = event::read();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_metric_history_caps_values() {
+        let mut history = MetricHistory::new();
+        for idx in 0..(SPARKLINE_HISTORY_LEN + 3) {
+            let mut metrics = HashMap::new();
+            metrics.insert("Loss/policy".to_string(), idx as f64);
+            update_metric_history(&mut history, &metrics, false);
+        }
+
+        let values = history.get("Loss/policy").expect("history");
+        assert_eq!(values.len(), SPARKLINE_HISTORY_LEN);
+        assert_eq!(values.front().copied(), Some(3.0));
+    }
+
+    #[test]
+    fn test_rating_history_requires_fresh_rating() {
+        let mut history = MetricHistory::new();
+        let mut metrics = HashMap::new();
+        metrics.insert("Rating/overall".to_string(), 100.0);
+
+        update_metric_history(&mut history, &metrics, false);
+        assert!(!history.contains_key("Rating/overall"));
+
+        update_metric_history(&mut history, &metrics, true);
+        assert_eq!(history["Rating/overall"].len(), 1);
+    }
+
+    #[test]
+    fn test_non_finite_values_are_not_tracked() {
+        let mut history = MetricHistory::new();
+        let mut metrics = HashMap::new();
+        metrics.insert("Loss/policy".to_string(), f64::NAN);
+
+        update_metric_history(&mut history, &metrics, false);
+        assert!(!history.contains_key("Loss/policy"));
     }
 }

@@ -177,7 +177,12 @@ pub(crate) fn render_metrics_grid(
         })
         .collect();
 
-    if groups.is_empty() || area.width == 0 || area.height == 0 {
+    if area.width == 0 || area.height == 0 {
+        return 0;
+    }
+
+    if groups.is_empty() {
+        render_empty_state(frame, area);
         return 0;
     }
 
@@ -719,14 +724,30 @@ fn max_sparkline_width() -> usize {
 }
 
 /// Render the status bar at the bottom (notifications + key bindings).
+fn render_empty_state(frame: &mut ratatui::Frame, area: Rect) {
+    let text = Line::from(Span::styled(
+        " Waiting for metrics… ",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ));
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
+}
+
 pub(crate) fn render_status_bar(
     frame: &mut ratatui::Frame,
     area: Rect,
-    notification: &str,
+    notification: Option<&str>,
     scroll_offset: u16,
     max_scroll: u16,
 ) {
-    if notification.is_empty() {
+    if let Some(notification) = notification.filter(|notification| !notification.is_empty()) {
+        let text = Line::from(Span::styled(
+            format!(" {notification}"),
+            Style::default().fg(Color::Yellow),
+        ));
+        frame.render_widget(Paragraph::new(text), area);
+    } else {
         let scroll_hint = if max_scroll == 0 {
             String::new()
         } else {
@@ -735,12 +756,6 @@ pub(crate) fn render_status_bar(
         let text = Line::from(Span::styled(
             format!(" Q:quit S:save R:toggle-render D:toggle-deterministic{scroll_hint} "),
             Style::default().fg(Color::DarkGray),
-        ));
-        frame.render_widget(Paragraph::new(text), area);
-    } else {
-        let text = Line::from(Span::styled(
-            format!(" {notification}"),
-            Style::default().fg(Color::Yellow),
         ));
         frame.render_widget(Paragraph::new(text), area);
     }
@@ -763,5 +778,36 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, "avg step reward");
         assert_eq!(entries[0].1, 1.23);
+    }
+
+    #[test]
+    fn test_sparkline_for_constant_values() {
+        let values = VecDeque::from([3.0, 3.0, 3.0]);
+        assert_eq!(sparkline_for_values(&values, 8), Some("▁▁▁".to_string()));
+    }
+
+    #[test]
+    fn test_sparkline_respects_max_width() {
+        let values = VecDeque::from([1.0, 2.0, 3.0, 4.0, 5.0]);
+        let sparkline = sparkline_for_values(&values, 3).expect("sparkline");
+        assert_eq!(display_width(&sparkline), 3);
+    }
+
+    #[test]
+    fn test_sparkline_too_narrow_or_short() {
+        assert_eq!(sparkline_for_values(&VecDeque::from([1.0, 2.0]), 1), None);
+        assert_eq!(sparkline_for_values(&VecDeque::from([1.0]), 8), None);
+    }
+
+    #[test]
+    fn test_render_group_lines_handles_narrow_widths() {
+        let group = MetricGroup {
+            name: "Loss".into(),
+            key_prefix: "Loss".into(),
+            color: Color::Red,
+        };
+        let entries = [("policy", 1.0)];
+        let lines = render_group_lines(2, &group, &entries, &HashMap::new(), &HashMap::new());
+        assert_eq!(lines.len(), desired_group_height(entries.len()) as usize);
     }
 }

@@ -55,10 +55,12 @@ pub(crate) fn format_num(val: f64) -> String {
             result.insert(0, '-');
         }
         result
-    } else if val.abs() < 1e-3 && val != 0.0 {
-        format!("{val:.4e}")
-    } else {
+    } else if val.abs() < 1e-3 {
+        format!("{val:.2e}")
+    } else if val.abs() < 1.0 {
         format!("{val:.4}")
+    } else {
+        format!("{val:.2}")
     }
 }
 
@@ -79,5 +81,13 @@ mod tests {
     fn test_format_num_float() {
         assert_eq!(format_num(PI), "3.1416");
         assert_eq!(format_num(0.00123), "0.0012");
+    }
+
+    #[test]
+    fn test_format_num_special_values() {
+        assert_eq!(format_num(f64::NAN), "NaN");
+        assert_eq!(format_num(f64::INFINITY), "inf");
+        assert_eq!(format_num(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_num(-0.0), "0");
     }
 }

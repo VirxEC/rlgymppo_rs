@@ -13,56 +13,91 @@ const SPARKLINE_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '�
 use crate::format::{display_width, format_num, metric_value_display};
 
 /// Category grouping information for the display layout.
+#[derive(Clone)]
 pub(crate) struct MetricGroup {
-    pub(crate) name: &'static str,
-    pub(crate) key_prefix: &'static str,
+    pub(crate) name: String,
+    pub(crate) key_prefix: String,
     pub(crate) color: Color,
 }
 
 /// Pre-defined groups in display order. Metrics whose keys start with a
 /// group's `key_prefix + "/"` are shown under that group.
-const GROUPS: &[MetricGroup] = &[
-    MetricGroup {
+struct KnownMetricGroup {
+    name: &'static str,
+    key_prefix: &'static str,
+    color: Color,
+}
+
+const GROUPS: &[KnownMetricGroup] = &[
+    KnownMetricGroup {
         name: "Collect",
         key_prefix: "Collect",
         color: Color::Cyan,
     },
-    MetricGroup {
+    KnownMetricGroup {
         name: "GAE",
         key_prefix: "GAE",
         color: Color::Green,
     },
-    MetricGroup {
+    KnownMetricGroup {
         name: "Loss",
         key_prefix: "Loss",
         color: Color::Red,
     },
-    MetricGroup {
+    KnownMetricGroup {
         name: "Update",
         key_prefix: "Update",
         color: Color::Yellow,
     },
-    MetricGroup {
+    KnownMetricGroup {
         name: "Timing",
         key_prefix: "Timing",
         color: Color::Magenta,
     },
-    MetricGroup {
+    KnownMetricGroup {
         name: "Throughput",
         key_prefix: "Throughput",
         color: Color::Blue,
     },
-    MetricGroup {
+    KnownMetricGroup {
         name: "Cumulative",
         key_prefix: "Cumulative",
         color: Color::White,
     },
-    MetricGroup {
+    KnownMetricGroup {
         name: "Rating",
         key_prefix: "Rating",
         color: Color::LightYellow,
     },
 ];
+
+fn metric_groups(metrics: &HashMap<String, f64>) -> Vec<MetricGroup> {
+    let mut prefixes: Vec<&str> = metrics
+        .keys()
+        .filter_map(|key| key.split_once('/').map(|(prefix, _)| prefix))
+        .collect();
+    prefixes.sort_unstable_by_key(|prefix| group_sort_key(prefix));
+    prefixes.dedup();
+
+    prefixes
+        .into_iter()
+        .map(|prefix| {
+            if let Some(group) = GROUPS.iter().find(|group| group.key_prefix == prefix) {
+                MetricGroup {
+                    name: group.name.to_string(),
+                    key_prefix: group.key_prefix.to_string(),
+                    color: group.color,
+                }
+            } else {
+                MetricGroup {
+                    name: prefix.to_string(),
+                    key_prefix: prefix.to_string(),
+                    color: custom_group_color(prefix),
+                }
+            }
+        })
+        .collect()
+}
 
 /// Build a sorted list of `(display_name, value)` pairs for a group.
 fn group_entries<'a>(metrics: &'a HashMap<String, f64>, prefix: &str) -> Vec<(&'a str, f64)> {
@@ -129,10 +164,11 @@ pub(crate) fn render_metrics_grid(
     history: &MetricHistory,
     scroll_offset: u16,
 ) -> u16 {
-    let groups: Vec<MetricGroupView<'_>> = GROUPS
+    let metric_groups = metric_groups(metrics);
+    let groups: Vec<MetricGroupView<'_>> = metric_groups
         .iter()
         .filter_map(|group| {
-            let entries = group_entries(metrics, group.key_prefix);
+            let entries = group_entries(metrics, &group.key_prefix);
             if entries.is_empty() {
                 None
             } else {
@@ -310,7 +346,7 @@ fn best_column_assignment<'a>(
         .into_iter()
         .map(|indices| {
             let mut group_indices = indices;
-            group_indices.sort_by_key(|&idx| group_order(groups[idx].group.key_prefix));
+            group_indices.sort_by_key(|&idx| group_order(&groups[idx].group.key_prefix));
             let column_groups = group_indices
                 .iter()
                 .map(|&idx| groups[idx].clone())
@@ -445,7 +481,7 @@ fn required_group_width(
     prev_vals: &HashMap<String, f64>,
     history: &MetricHistory,
 ) -> u16 {
-    let title_width = display_width(view.group.name) + 4;
+    let title_width = display_width(&view.group.name) + 4;
     let value_col_width = view
         .entries
         .iter()
@@ -483,10 +519,33 @@ fn desired_group_height(entry_count: usize) -> u16 {
 }
 
 fn group_order(prefix: &str) -> usize {
+    group_sort_key(prefix).0
+}
+
+fn group_sort_key(prefix: &str) -> (usize, &str) {
     GROUPS
         .iter()
         .position(|group| group.key_prefix == prefix)
-        .unwrap_or(usize::MAX)
+        .map(|idx| (idx, ""))
+        .unwrap_or((GROUPS.len(), prefix))
+}
+
+fn custom_group_color(prefix: &str) -> Color {
+    const COLORS: &[Color] = &[
+        Color::LightBlue,
+        Color::LightGreen,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::LightRed,
+        Color::LightYellow,
+        Color::Gray,
+    ];
+    let idx = prefix
+        .as_bytes()
+        .iter()
+        .fold(0_usize, |acc, byte| acc.wrapping_add(*byte as usize))
+        % COLORS.len();
+    COLORS[idx]
 }
 
 /// Render a single metric group as bordered lines inside a scrollable column.

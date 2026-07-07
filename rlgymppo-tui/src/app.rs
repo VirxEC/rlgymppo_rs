@@ -467,11 +467,21 @@ fn update_metric_history(
 }
 
 fn should_track_metric_history(key: &str, fresh_rating: bool) -> bool {
-    (fresh_rating && key.starts_with("Rating/"))
-        || key.starts_with("Loss/")
-        || key.starts_with("GAE/")
-        || key.starts_with("Update/")
+    let Some((group, _)) = key.split_once('/') else {
+        return false;
+    };
+
+    (fresh_rating && group == "Rating")
+        || matches!(group, "Loss" | "GAE" | "Update")
         || matches!(key, "Collect/avg step reward" | "Collect/episode length")
+        || is_custom_sparkline_group(group)
+}
+
+fn is_custom_sparkline_group(group: &str) -> bool {
+    !matches!(
+        group,
+        "Collect" | "Cumulative" | "GAE" | "Loss" | "Rating" | "Throughput" | "Timing" | "Update"
+    )
 }
 
 fn drain_pending_events() {

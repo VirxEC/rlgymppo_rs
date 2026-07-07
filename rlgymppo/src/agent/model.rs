@@ -4,7 +4,8 @@ use burn::prelude::*;
 use burn::tensor::activation::{log_softmax, relu, softmax};
 
 use crate::utils::{
-    argmax_actions, sample_actions_from_logits, to_mask_tensor_2d, to_state_tensor_2d,
+    argmax_actions, sample_actions_from_logits, to_mask_tensor_2d, to_mask_tensor_2d_indexed,
+    to_state_tensor_2d, to_state_tensor_2d_indexed,
 };
 
 pub struct PPOOutput<B: Backend> {
@@ -156,6 +157,21 @@ impl<B: Backend> Net<B> {
         argmax_actions(self.masked_logits(to_state_tensor_2d(state, device), mask_tensor))
     }
 
+    pub fn react_deterministic_indexed(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        indices: &[usize],
+        device: &B::Device,
+    ) -> Vec<usize> {
+        let mask_tensor =
+            (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
+        argmax_actions(self.masked_logits(
+            to_state_tensor_2d_indexed(state, indices, device),
+            mask_tensor,
+        ))
+    }
+
     pub fn react(
         &self,
         state: &[Vec<f32>],
@@ -165,6 +181,24 @@ impl<B: Backend> Net<B> {
         let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
         sample_actions_from_logits(
             self.masked_logits(to_state_tensor_2d(state, device), mask_tensor),
+            device,
+        )
+    }
+
+    pub fn react_indexed(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        indices: &[usize],
+        device: &B::Device,
+    ) -> (Vec<usize>, Vec<f32>) {
+        let mask_tensor =
+            (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
+        sample_actions_from_logits(
+            self.masked_logits(
+                to_state_tensor_2d_indexed(state, indices, device),
+                mask_tensor,
+            ),
             device,
         )
     }
@@ -249,6 +283,20 @@ impl<B: Backend> Actic<B> {
         sample_actions_from_logits(self.actor.masked_logits(features, mask_tensor), device)
     }
 
+    pub fn react_indexed(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        indices: &[usize],
+        device: &B::Device,
+    ) -> (Vec<usize>, Vec<f32>) {
+        let input = to_state_tensor_2d_indexed(state, indices, device);
+        let features = self.apply_shared_head(input);
+        let mask_tensor =
+            (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
+        sample_actions_from_logits(self.actor.masked_logits(features, mask_tensor), device)
+    }
+
     pub fn react_deterministic(
         &self,
         state: &[Vec<f32>],
@@ -258,6 +306,20 @@ impl<B: Backend> Actic<B> {
         let input = to_state_tensor_2d(state, device);
         let features = self.apply_shared_head(input);
         let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
+        argmax_actions(self.actor.masked_logits(features, mask_tensor))
+    }
+
+    pub fn react_deterministic_indexed(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        indices: &[usize],
+        device: &B::Device,
+    ) -> Vec<usize> {
+        let input = to_state_tensor_2d_indexed(state, indices, device);
+        let features = self.apply_shared_head(input);
+        let mask_tensor =
+            (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
         argmax_actions(self.actor.masked_logits(features, mask_tensor))
     }
 }

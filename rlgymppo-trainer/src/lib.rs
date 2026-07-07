@@ -131,6 +131,8 @@ pub fn create_env(
 pub fn default_config<B: AutodiffBackend>(
     device: B::Device,
     render_device: B::Device,
+    skill_tracker_device: Option<B::Device>,
+    async_skill_tracker: bool,
 ) -> LearnerConfig<B> {
     let mini_batch_size = 40_000;
     let batch_size = mini_batch_size * 2;
@@ -160,6 +162,8 @@ pub fn default_config<B: AutodiffBackend>(
         skill_tracker: SkillTrackerConfig {
             enabled: true,
             num_arenas: 12,
+            update_interval: 10,
+            async_eval: async_skill_tracker,
             ..Default::default()
         },
         shared_head_layer_sizes: vec![256; 2],
@@ -167,6 +171,7 @@ pub fn default_config<B: AutodiffBackend>(
         critic_layer_sizes: vec![256; 3],
         device,
         render_device,
+        skill_tracker_device,
         #[cfg(feature = "wandb")]
         wandb_project_name: Some("rlgym-ppo".into()),
         #[cfg(feature = "wandb")]
@@ -175,10 +180,21 @@ pub fn default_config<B: AutodiffBackend>(
     }
 }
 
-pub fn run<B: AutodiffBackend>(device: B::Device, render_device: B::Device) {
+pub fn run<B: AutodiffBackend>(
+    device: B::Device,
+    render_device: B::Device,
+    skill_tracker_device: Option<B::Device>,
+    async_skill_tracker: bool,
+) {
     init_from_default(cfg!(not(debug_assertions))).unwrap();
 
-    let mut learner = default_config::<B>(device, render_device).init(create_env);
+    let mut learner = default_config::<B>(
+        device,
+        render_device,
+        skill_tracker_device,
+        async_skill_tracker,
+    )
+    .init(create_env);
     learner.load();
     learner.learn();
 }

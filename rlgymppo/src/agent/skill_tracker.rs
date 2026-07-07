@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::thread;
+use std::time::Instant;
 
 use burn::prelude::*;
 use rand::Rng;
@@ -70,6 +71,9 @@ pub struct SkillTrackerConfig {
     pub rating_inc: f32,
     /// Initial rating of the first policy version.
     pub initial_rating: f32,
+    /// Run evaluations on a background worker. When false, evaluations run
+    /// synchronously during the training iteration that triggers them.
+    pub async_eval: bool,
     /// Use deterministic (argmax) inference during evaluation.
     pub deterministic: bool,
 }
@@ -84,6 +88,7 @@ impl Default for SkillTrackerConfig {
             update_interval: 16,
             rating_inc: 5.0,
             initial_rating: 0.0,
+            async_eval: false,
             deterministic: false,
         }
     }
@@ -133,6 +138,7 @@ struct SkillGoalEvent {
 pub(crate) struct SkillTrackerUpdate {
     pub eval_id: u64,
     pub cur_ratings: SkillRating,
+    pub elapsed_secs: f64,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -140,7 +146,7 @@ enum AsyncSkillTrackerJob<B: Backend> {
     Run {
         eval_id: u64,
         current_model: Actic<B>,
-        versions: Vec<PolicyVersion<B>>,
+        old_version: PolicyVersion<B>,
         cur_ratings: SkillRating,
     },
     Shutdown,
@@ -149,6 +155,7 @@ enum AsyncSkillTrackerJob<B: Backend> {
 struct AsyncSkillTrackerResult {
     update: SkillTrackerUpdate,
     version_ratings: Vec<(u64, SkillRating)>,
+    continuation_old_timesteps: Option<u64>,
 }
 
 pub struct AsyncSkillTracker<B: Backend, OBS, ACT, SI>
@@ -161,10 +168,13 @@ where
     job_tx: SyncSender<AsyncSkillTrackerJob<B>>,
     result_rx: Receiver<AsyncSkillTrackerResult>,
     worker: Option<thread::JoinHandle<()>>,
+    device: B::Device,
     pub cur_ratings: SkillRating,
+    last_elapsed_secs: Option<f64>,
     iterations_since_ran: usize,
     next_eval_id: u64,
     running_eval_id: Option<u64>,
+    continuation_old_timesteps: Option<u64>,
     _phantom: PhantomData<(OBS, ACT, SI)>,
 }
 
@@ -190,7 +200,7 @@ where
     cur_goals: usize,
 
     do_continuation: bool,
-    prev_old_version_idx: usize,
+    prev_old_version_timesteps: u64,
     prev_new_team: usize,
     prev_total_ticks: u64,
 
@@ -360,7 +370,7 @@ where
             cur_ratings: SkillRating::default(),
             cur_goals: 0,
             do_continuation: false,
-            prev_old_version_idx: 0,
+            prev_old_version_timesteps: 0,
             prev_new_team: 0,
             prev_total_ticks: 0,
             device,
@@ -369,26 +379,21 @@ where
         }
     }
 
-    fn run_matches(&mut self, current_model: &Actic<B>, versions: &mut [PolicyVersion<B>]) {
+    fn run_matches(&mut self, current_model: &Actic<B>, old_version: &mut PolicyVersion<B>) {
         let num_arenas = self.config.num_arenas;
 
-        let (old_idx, new_team, mut total_ticks) = if self.do_continuation {
-            (
-                self.prev_old_version_idx,
-                self.prev_new_team,
-                self.prev_total_ticks,
-            )
+        let continuing =
+            self.do_continuation && self.prev_old_version_timesteps == old_version.timesteps;
+        let (new_team, mut total_ticks) = if continuing {
+            (self.prev_new_team, self.prev_total_ticks)
         } else {
             let mut rng = rand::rng();
-            let idx = (rng.next_u32() as usize) % versions.len();
             let team = (rng.next_u32() as usize) % 2;
             self.reset_all_arenas();
             self.cur_goals = 0;
-            (idx, team, 0u64)
+            (team, 0u64)
         };
         self.do_continuation = false;
-
-        let old_version = &mut versions[old_idx];
 
         let mut new_players = Vec::new();
         let mut old_players = Vec::new();
@@ -400,8 +405,9 @@ where
             }
         }
 
-        let sim_ticks = (self.config.sim_time_secs * 120.0) as u64;
+        let sim_ticks = ((self.config.sim_time_secs * 120.0) as u64).max(self.tick_skip as u64);
         let max_ticks = (self.config.max_sim_time_secs * 120.0) as u64;
+        let slice_end = total_ticks.saturating_add(sim_ticks).min(max_ticks);
 
         #[cfg(not(feature = "tui"))]
         let prev_ratings = self.cur_ratings.clone();
@@ -412,34 +418,36 @@ where
             self.config.sim_time_secs, new_team, old_version.timesteps,
         );
 
-        let mut slice_start = total_ticks;
-
-        while total_ticks < max_ticks && self.cur_goals < num_arenas {
-            let (no, nm): (Vec<_>, Vec<_>) = new_players
-                .iter()
-                .map(|&i| (self.next_obs[i].clone(), self.next_masks[i].clone()))
-                .unzip();
-            let (oo, om): (Vec<_>, Vec<_>) = old_players
-                .iter()
-                .map(|&i| (self.next_obs[i].clone(), self.next_masks[i].clone()))
-                .unzip();
-
-            let new_actions = if no.is_empty() {
+        while total_ticks < slice_end && self.cur_goals < num_arenas {
+            let new_actions = if new_players.is_empty() {
                 Vec::new()
             } else if self.config.deterministic {
-                current_model.react_deterministic(&no, &nm, &self.device)
+                current_model.react_deterministic_indexed(
+                    &self.next_obs,
+                    &self.next_masks,
+                    &new_players,
+                    &self.device,
+                )
             } else {
-                current_model.react(&no, &nm, &self.device).0
+                current_model
+                    .react_indexed(&self.next_obs, &self.next_masks, &new_players, &self.device)
+                    .0
             };
 
-            let old_actions = if oo.is_empty() {
+            let old_actions = if old_players.is_empty() {
                 Vec::new()
             } else if self.config.deterministic {
+                old_version.model.react_deterministic_indexed(
+                    &self.next_obs,
+                    &self.next_masks,
+                    &old_players,
+                    &self.device,
+                )
+            } else {
                 old_version
                     .model
-                    .react_deterministic(&oo, &om, &self.device)
-            } else {
-                old_version.model.react(&oo, &om, &self.device).0
+                    .react_indexed(&self.next_obs, &self.next_masks, &old_players, &self.device)
+                    .0
             };
 
             let total_players = self.next_obs.len();
@@ -504,10 +512,6 @@ where
             }
 
             total_ticks += self.tick_skip as u64;
-
-            if total_ticks.saturating_sub(slice_start) >= sim_ticks {
-                slice_start = total_ticks;
-            }
         }
 
         if self.cur_goals < num_arenas && total_ticks < max_ticks {
@@ -517,7 +521,7 @@ where
                 self.cur_goals, num_arenas
             );
             self.do_continuation = true;
-            self.prev_old_version_idx = old_idx;
+            self.prev_old_version_timesteps = old_version.timesteps;
             self.prev_new_team = new_team;
             self.prev_total_ticks = total_ticks;
         } else {
@@ -607,35 +611,40 @@ where
         let (job_tx, job_rx) = sync_channel(1);
         let (result_tx, result_rx) = channel();
         let tracker_config = config.clone();
+        let tracker_device = device.clone();
 
         let worker = thread::spawn(move || {
-            let mut tracker = SkillTracker::new(tracker_config, create_arena, device);
+            let mut tracker = SkillTracker::new(tracker_config, create_arena, tracker_device);
 
             while let Ok(job) = job_rx.recv() {
                 match job {
                     AsyncSkillTrackerJob::Run {
                         eval_id,
                         current_model,
-                        mut versions,
+                        mut old_version,
                         cur_ratings,
                     } => {
                         tracker.cur_ratings = cur_ratings;
-                        tracker.run_matches(&current_model, &mut versions);
+                        let start = Instant::now();
+                        tracker.run_matches(&current_model, &mut old_version);
+                        let elapsed_secs = start.elapsed().as_secs_f64();
 
-                        let version_ratings = versions
-                            .into_iter()
-                            .map(|version| (version.timesteps, version.ratings))
-                            .collect();
+                        let version_ratings = vec![(old_version.timesteps, old_version.ratings)];
+                        let continuation_old_timesteps = tracker
+                            .do_continuation
+                            .then_some(tracker.prev_old_version_timesteps);
 
                         let update = SkillTrackerUpdate {
                             eval_id,
                             cur_ratings: tracker.cur_ratings.clone(),
+                            elapsed_secs,
                         };
 
                         let _ = metric_tx.send(update.clone());
                         let _ = result_tx.send(AsyncSkillTrackerResult {
                             update,
                             version_ratings,
+                            continuation_old_timesteps,
                         });
                     }
                     AsyncSkillTrackerJob::Shutdown => break,
@@ -648,10 +657,13 @@ where
             job_tx,
             result_rx,
             worker: Some(worker),
+            device,
             cur_ratings: SkillRating::default(),
+            last_elapsed_secs: None,
             iterations_since_ran: 0,
             next_eval_id: 0,
             running_eval_id: None,
+            continuation_old_timesteps: None,
             _phantom: PhantomData,
         }
     }
@@ -659,7 +671,7 @@ where
     pub fn on_iteration(
         &mut self,
         current_model: &Actic<B>,
-        versions: &[PolicyVersion<B>],
+        versions: &mut [PolicyVersion<B>],
     ) -> Option<u64> {
         if !self.config.enabled || versions.is_empty() || self.running_eval_id.is_some() {
             return None;
@@ -670,23 +682,47 @@ where
             return None;
         }
 
+        let mut old_version = self
+            .continuation_old_timesteps
+            .and_then(|timesteps| versions.iter().find(|v| v.timesteps == timesteps))
+            .unwrap_or_else(|| {
+                let mut rng = rand::rng();
+                &versions[(rng.next_u32() as usize) % versions.len()]
+            })
+            .clone();
+        old_version.model = old_version.model.to_device(&self.device);
+
         let eval_id = self.next_eval_id;
         let job = AsyncSkillTrackerJob::Run {
             eval_id,
-            current_model: current_model.clone(),
-            versions: versions.to_vec(),
+            current_model: current_model.clone().to_device(&self.device),
+            old_version,
             cur_ratings: self.cur_ratings.clone(),
         };
 
-        match self.job_tx.try_send(job) {
-            Ok(()) => {
+        if self.config.async_eval {
+            match self.job_tx.try_send(job) {
+                Ok(()) => {
+                    self.iterations_since_ran = 0;
+                    self.next_eval_id += 1;
+                    self.running_eval_id = Some(eval_id);
+                    Some(eval_id)
+                }
+                Err(TrySendError::Full(_)) => None,
+                Err(TrySendError::Disconnected(_)) => None,
+            }
+        } else {
+            if self.job_tx.send(job).is_err() {
+                return None;
+            }
+            if let Ok(result) = self.result_rx.recv() {
+                self.apply_result(result, versions);
                 self.iterations_since_ran = 0;
                 self.next_eval_id += 1;
-                self.running_eval_id = Some(eval_id);
                 Some(eval_id)
+            } else {
+                None
             }
-            Err(TrySendError::Full(_)) => None,
-            Err(TrySendError::Disconnected(_)) => None,
         }
     }
 
@@ -694,27 +730,40 @@ where
         let mut updates = Vec::new();
 
         while let Ok(result) = self.result_rx.try_recv() {
-            self.cur_ratings = result.update.cur_ratings.clone();
-            if self.running_eval_id == Some(result.update.eval_id) {
-                self.running_eval_id = None;
-            }
-
-            for (timesteps, ratings) in result.version_ratings {
-                if let Some(version) = versions.iter_mut().find(|v| v.timesteps == timesteps) {
-                    version.ratings = ratings;
-                }
-            }
-
-            updates.push(result.update);
+            updates.push(self.apply_result(result, versions));
         }
 
         updates
+    }
+
+    fn apply_result(
+        &mut self,
+        result: AsyncSkillTrackerResult,
+        versions: &mut [PolicyVersion<B>],
+    ) -> SkillTrackerUpdate {
+        self.cur_ratings = result.update.cur_ratings.clone();
+        self.last_elapsed_secs = Some(result.update.elapsed_secs);
+        self.continuation_old_timesteps = result.continuation_old_timesteps;
+        if self.running_eval_id == Some(result.update.eval_id) {
+            self.running_eval_id = None;
+        }
+
+        for (timesteps, ratings) in result.version_ratings {
+            if let Some(version) = versions.iter_mut().find(|v| v.timesteps == timesteps) {
+                version.ratings = ratings;
+            }
+        }
+
+        result.update
     }
 
     pub fn report_ratings(&self, report: &mut Report) {
         for (mode, &rating) in &self.cur_ratings.data {
             let key = format!("Rating/{mode}");
             report[key.as_str()] = rating.into();
+        }
+        if let Some(elapsed_secs) = self.last_elapsed_secs {
+            report["Timing/skill tracker"] = elapsed_secs.into();
         }
     }
 

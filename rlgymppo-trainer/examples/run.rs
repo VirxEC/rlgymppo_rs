@@ -60,7 +60,12 @@ fn main() {
         use burn::backend::libtorch::LibTorchDevice;
         use rlgymppo::backend::Autodiff;
 
-        rlgymppo_trainer::run::<Autodiff<LibTorch>>(LibTorchDevice::Cuda(0), LibTorchDevice::Cpu);
+        rlgymppo_trainer::run::<Autodiff<LibTorch>>(
+            LibTorchDevice::Cuda(0),
+            LibTorchDevice::Cpu,
+            Some(LibTorchDevice::Cpu),
+            true,
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -69,7 +74,12 @@ fn main() {
         use burn::backend::cuda::CudaDevice;
         use rlgymppo::backend::Autodiff;
 
-        rlgymppo_trainer::run::<Autodiff<Cuda>>(CudaDevice::new(0), CudaDevice::default());
+        rlgymppo_trainer::run::<Autodiff<Cuda>>(
+            CudaDevice::new(0),
+            CudaDevice::default(),
+            None,
+            false,
+        );
     }
 
     #[cfg(feature = "metal")]
@@ -78,7 +88,12 @@ fn main() {
         use burn::backend::wgpu::WgpuDevice;
         use rlgymppo::backend::Autodiff;
 
-        rlgymppo_trainer::run::<Autodiff<Metal>>(WgpuDevice::default(), WgpuDevice::default());
+        rlgymppo_trainer::run::<Autodiff<Metal>>(
+            WgpuDevice::default(),
+            WgpuDevice::default(),
+            None,
+            false,
+        );
     }
 
     #[cfg(feature = "rocm")]
@@ -87,7 +102,12 @@ fn main() {
         use burn::backend::rocm::RocmDevice;
         use rlgymppo::backend::Autodiff;
 
-        rlgymppo_trainer::run::<Autodiff<Rocm>>(RocmDevice::new(0), RocmDevice::default());
+        rlgymppo_trainer::run::<Autodiff<Rocm>>(
+            RocmDevice::new(0),
+            RocmDevice::default(),
+            None,
+            false,
+        );
     }
 
     #[cfg(feature = "wgpu")]
@@ -96,7 +116,12 @@ fn main() {
         use burn::backend::wgpu::WgpuDevice;
         use rlgymppo::backend::Autodiff;
 
-        rlgymppo_trainer::run::<Autodiff<Wgpu>>(WgpuDevice::default(), WgpuDevice::default());
+        rlgymppo_trainer::run::<Autodiff<Wgpu>>(
+            WgpuDevice::default(),
+            WgpuDevice::default(),
+            Some(WgpuDevice::Cpu),
+            true,
+        );
     }
 
     #[cfg(feature = "flex")]
@@ -104,7 +129,7 @@ fn main() {
         use burn::backend::Flex;
         use rlgymppo::backend::Autodiff;
 
-        rlgymppo_trainer::run::<Autodiff<Flex>>(Default::default(), Default::default());
+        rlgymppo_trainer::run::<Autodiff<Flex>>(Default::default(), Default::default(), None, true);
     }
 
     #[cfg(feature = "candle")]
@@ -113,6 +138,11 @@ fn main() {
         use burn::backend::candle::CandleDevice;
         use rlgymppo::backend::Autodiff;
 
-        rlgymppo_trainer::run::<Autodiff<Candle>>(CandleDevice::default(), CandleDevice::default());
+        rlgymppo_trainer::run::<Autodiff<Candle>>(
+            CandleDevice::default(),
+            CandleDevice::default(),
+            Some(CandleDevice::Cpu),
+            true,
+        );
     }
 }

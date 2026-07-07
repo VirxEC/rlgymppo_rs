@@ -5,7 +5,7 @@ mod environment;
 
 pub mod utils;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 #[cfg(not(feature = "tui"))]
 use std::io::{Read, stdin};
 use std::path::PathBuf;
@@ -243,6 +243,15 @@ fn scroll_tui(tui_notifier: Option<&TuiNotifier>, command: TuiScrollCommand) {
     }
 }
 
+fn apply_skill_update_to_report(report: &mut Report, update: &SkillTrackerUpdate) {
+    report.remove_keys_with_prefix("Rating/");
+    for (mode, &rating) in &update.cur_ratings.data {
+        let key = format!("Rating/{mode}");
+        report[key.as_str()] = rating.into();
+    }
+    report["Timing/skill tracker"] = update.elapsed_secs.into();
+}
+
 fn spawn_metrics_actor(
     metric_rx: Receiver<MetricEvent>,
     skill_rx: Receiver<SkillTrackerUpdate>,
@@ -262,24 +271,27 @@ fn spawn_metrics_actor(
         }
 
         let mut pending_reports: VecDeque<PendingMetricReport> = VecDeque::new();
+        let mut completed_skill_updates: HashMap<u64, SkillTrackerUpdate> = HashMap::new();
         let mut shutting_down = false;
 
         loop {
             while let Ok(update) = skill_rx.try_recv() {
+                let mut matched_report = false;
                 for pending in &mut pending_reports {
-                    pending.report.remove_keys_with_prefix("Rating/");
-                    for (mode, &rating) in &update.cur_ratings.data {
-                        let key = format!("Rating/{mode}");
-                        pending.report[key.as_str()] = rating.into();
-                    }
+                    apply_skill_update_to_report(&mut pending.report, &update);
 
                     if pending.waiting_for_skill_eval == Some(update.eval_id) {
                         pending.waiting_for_skill_eval = None;
+                        matched_report = true;
                         #[cfg(feature = "tui")]
                         {
                             pending.fresh_rating = true;
                         }
                     }
+                }
+
+                if !matched_report {
+                    completed_skill_updates.insert(update.eval_id, update);
                 }
             }
 
@@ -313,7 +325,19 @@ fn spawn_metrics_actor(
             }
 
             match metric_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(MetricEvent::Report(report)) => pending_reports.push_back(report),
+                Ok(MetricEvent::Report(mut report)) => {
+                    if let Some(eval_id) = report.waiting_for_skill_eval
+                        && let Some(update) = completed_skill_updates.remove(&eval_id)
+                    {
+                        apply_skill_update_to_report(&mut report.report, &update);
+                        report.waiting_for_skill_eval = None;
+                        #[cfg(feature = "tui")]
+                        {
+                            report.fresh_rating = true;
+                        }
+                    }
+                    pending_reports.push_back(report);
+                }
                 Ok(MetricEvent::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                     shutting_down = true;
                     for pending in &mut pending_reports {
@@ -372,6 +396,10 @@ pub struct LearnerConfig<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>
     /// The device to use for rendering.
     /// Will default to the default device from the given backend.
     pub render_device: B::Device,
+    /// The device to use for skill-tracker inference.
+    /// When `None`, uses the training device. Set this to another device from
+    /// the same backend, for example a CPU device while training on GPU.
+    pub skill_tracker_device: Option<B::Device>,
     /// The layer sizes for the policy network.
     pub policy_layer_sizes: Vec<usize>,
     /// The layer sizes for the critic network.
@@ -433,6 +461,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B, Adam> {
             device: B::Device::default(),
             quantizer: None,
             render_device: B::Device::default(),
+            skill_tracker_device: None,
             policy_layer_sizes: vec![256; 3],
             critic_layer_sizes: vec![256; 3],
             norm: NormSelection::RmsNorm,
@@ -539,10 +568,15 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> LearnerConfig<B, O
                 (env.arena, env.observations, env.action, env.shared_info)
             };
 
+            let skill_tracker_device = self
+                .skill_tracker_device
+                .clone()
+                .unwrap_or_else(|| self.device.clone());
+
             Some(AsyncSkillTracker::new(
                 self.skill_tracker.clone(),
                 create_arena,
-                self.device.clone(),
+                skill_tracker_device,
                 skill_metric_tx,
             ))
         } else {
@@ -949,7 +983,8 @@ where
             metrics["Cumulative/updates"] = self.stats.cumulative_model_updates.into();
 
             let waiting_for_skill_eval = if let Some(ref mut st) = self.skill_tracker {
-                let eval_id = st.on_iteration(&nodiff_model_snapshot, &self.version_mgr.versions);
+                let eval_id =
+                    st.on_iteration(&nodiff_model_snapshot, &mut self.version_mgr.versions);
                 if eval_id.is_none() {
                     st.report_ratings(&mut metrics);
                 }

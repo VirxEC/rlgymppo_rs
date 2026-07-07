@@ -29,6 +29,19 @@ pub(crate) fn to_mask_tensor_2d<B: Backend>(
     Tensor::from_data(TensorData::new(data, shape), device)
 }
 
+pub(crate) fn to_mask_tensor_2d_indexed<B: Backend>(
+    masks: &[Vec<bool>],
+    indices: &[usize],
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let cols = masks[indices[0]].len();
+    let mut data = Vec::with_capacity(indices.len() * cols);
+    for &idx in indices {
+        data.extend(masks[idx].iter().map(|&v| if v { 1.0 } else { 0.0 }));
+    }
+    Tensor::from_data(TensorData::new(data, [indices.len(), cols]), device)
+}
+
 pub(crate) fn to_state_tensor_2d<B: Backend>(
     state: &[Vec<f32>],
     device: &B::Device,
@@ -39,6 +52,20 @@ pub(crate) fn to_state_tensor_2d<B: Backend>(
     }
 
     Tensor::from_data(TensorData::new(data, [state.len(), state[0].len()]), device)
+}
+
+pub(crate) fn to_state_tensor_2d_indexed<B: Backend>(
+    state: &[Vec<f32>],
+    indices: &[usize],
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let cols = state[indices[0]].len();
+    let mut data: Vec<f32> = Vec::with_capacity(indices.len() * cols);
+    for &idx in indices {
+        data.extend(&state[idx]);
+    }
+
+    Tensor::from_data(TensorData::new(data, [indices.len(), cols]), device)
 }
 
 pub(crate) fn sample_actions_from_logits<B: Backend>(

@@ -532,7 +532,7 @@ fn update_metric_history(
 }
 
 fn should_track_metric_history(key: &str, fresh_rating: bool) -> bool {
-    let Some((group, _)) = key.split_once('/') else {
+    let Some((group, _)) = key.rsplit_once('/') else {
         return false;
     };
 

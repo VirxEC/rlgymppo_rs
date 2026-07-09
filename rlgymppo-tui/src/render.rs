@@ -74,7 +74,7 @@ const GROUPS: &[KnownMetricGroup] = &[
 fn metric_groups(metrics: &HashMap<String, f64>) -> Vec<MetricGroup> {
     let mut prefixes: Vec<&str> = metrics
         .keys()
-        .filter_map(|key| key.split_once('/').map(|(prefix, _)| prefix))
+        .filter_map(|key| key.rsplit_once('/').map(|(prefix, _)| prefix))
         .collect();
     prefixes.sort_unstable_by_key(|prefix| group_sort_key(prefix));
     prefixes.dedup();

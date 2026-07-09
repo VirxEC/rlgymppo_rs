@@ -7,6 +7,40 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
 pub(crate) type MetricHistory = HashMap<String, VecDeque<f64>>;
 
+#[derive(Default)]
+pub(crate) struct LayoutPlanCache {
+    cached: Option<CachedLayoutPlan>,
+}
+
+#[derive(Clone)]
+struct CachedLayoutPlan {
+    key: LayoutCacheKey,
+    columns: Vec<CachedColumnPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LayoutCacheKey {
+    width: u16,
+    height: u16,
+    groups: Vec<GroupLayoutKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupLayoutKey {
+    name: String,
+    key_prefix: String,
+    entry_names: Vec<String>,
+    width: u16,
+    height: u16,
+}
+
+#[derive(Clone)]
+struct CachedColumnPlan {
+    group_indices: Vec<usize>,
+    width: u16,
+    height: u16,
+}
+
 pub(crate) const SPARKLINE_HISTORY_LEN: usize = 12;
 const SPARKLINE_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -161,6 +195,7 @@ pub(crate) fn render_metrics_grid(
     area: Rect,
     metrics: &HashMap<String, f64>,
     history: &MetricHistory,
+    layout_cache: &mut LayoutPlanCache,
     scroll_offset: u16,
 ) -> u16 {
     let metric_groups = metric_groups(metrics);
@@ -185,7 +220,7 @@ pub(crate) fn render_metrics_grid(
         return 0;
     }
 
-    let columns = plan_metric_columns(area.width, area.height, &groups, history);
+    let columns = layout_cache.plan_metric_columns(area.width, area.height, &groups, history);
 
     let content_height = columns
         .iter()
@@ -272,25 +307,63 @@ struct LayoutScore {
     max_height: u32,
 }
 
-fn plan_metric_columns<'a>(
+impl LayoutPlanCache {
+    fn plan_metric_columns<'a>(
+        &mut self,
+        width: u16,
+        height: u16,
+        groups: &[MetricGroupView<'a>],
+        history: &MetricHistory,
+    ) -> Vec<ColumnPlan<'a>> {
+        let group_dims: Vec<GroupDimensions> = groups
+            .iter()
+            .map(|view| GroupDimensions {
+                width: required_group_width(view, history),
+                height: desired_group_height(view.entries.len()),
+            })
+            .collect();
+        let key = LayoutCacheKey {
+            width,
+            height,
+            groups: group_layout_key(groups, &group_dims),
+        };
+
+        if let Some(cached) = self.cached.as_ref().filter(|cached| cached.key == key) {
+            return cached
+                .columns
+                .iter()
+                .map(|column| build_column_plan_from_indices(groups, column))
+                .collect();
+        }
+
+        let cached_columns = plan_metric_columns_uncached(width, height, groups, &group_dims);
+        let columns = cached_columns
+            .iter()
+            .map(|column| build_column_plan_from_indices(groups, column))
+            .collect();
+        self.cached = Some(CachedLayoutPlan {
+            key,
+            columns: cached_columns,
+        });
+        columns
+    }
+}
+
+fn plan_metric_columns_uncached(
     width: u16,
     height: u16,
-    groups: &[MetricGroupView<'a>],
-    history: &MetricHistory,
-) -> Vec<ColumnPlan<'a>> {
-    let group_dims: Vec<GroupDimensions> = groups
-        .iter()
-        .map(|view| GroupDimensions {
-            width: required_group_width(view, history),
-            height: desired_group_height(view.entries.len()),
-        })
-        .collect();
-
-    let mut best: Option<(LayoutScore, Vec<ColumnPlan<'a>>)> = None;
+    groups: &[MetricGroupView<'_>],
+    group_dims: &[GroupDimensions],
+) -> Vec<CachedColumnPlan> {
+    let mut best: Option<(LayoutScore, Vec<CachedColumnPlan>)> = None;
 
     for num_cols in 1..=groups.len() {
+        if minimum_total_column_width(group_dims, num_cols) > width {
+            break;
+        }
+
         if let Some((score, columns)) =
-            best_column_assignment(groups, &group_dims, num_cols, width, height)
+            best_column_assignment(groups, group_dims, num_cols, width, height)
             && best
                 .as_ref()
                 .is_none_or(|(best_score, _)| score < *best_score)
@@ -300,21 +373,29 @@ fn plan_metric_columns<'a>(
     }
 
     best.map(|(_, columns)| columns).unwrap_or_else(|| {
-        vec![build_column_plan(
-            groups.to_vec(),
-            &group_dims,
+        vec![build_cached_column_plan(
+            group_dims,
             (0..groups.len()).collect(),
         )]
     })
 }
 
-fn best_column_assignment<'a>(
-    groups: &[MetricGroupView<'a>],
+fn minimum_total_column_width(group_dims: &[GroupDimensions], num_cols: usize) -> u16 {
+    let mut widths: Vec<u16> = group_dims.iter().map(|dims| dims.width).collect();
+    widths.sort_unstable();
+    widths
+        .into_iter()
+        .take(num_cols)
+        .fold(0_u16, u16::saturating_add)
+}
+
+fn best_column_assignment(
+    groups: &[MetricGroupView<'_>],
     group_dims: &[GroupDimensions],
     num_cols: usize,
     available_width: u16,
     available_height: u16,
-) -> Option<(LayoutScore, Vec<ColumnPlan<'a>>)> {
+) -> Option<(LayoutScore, Vec<CachedColumnPlan>)> {
     let mut assignments = vec![Vec::<usize>::new(); num_cols];
     let mut col_widths = vec![0_u16; num_cols];
     let mut col_heights = vec![0_u16; num_cols];
@@ -331,6 +412,7 @@ fn best_column_assignment<'a>(
         assignments: &mut assignments,
         col_widths: &mut col_widths,
         col_heights: &mut col_heights,
+        total_width: 0,
         best: None,
     };
     search.run(0);
@@ -338,14 +420,9 @@ fn best_column_assignment<'a>(
     let (score, assignments) = search.best?;
     let columns = assignments
         .into_iter()
-        .map(|indices| {
-            let mut group_indices = indices;
+        .map(|mut group_indices| {
             group_indices.sort_by_key(|&idx| group_order(&groups[idx].group.key_prefix));
-            let column_groups = group_indices
-                .iter()
-                .map(|&idx| groups[idx].clone())
-                .collect();
-            build_column_plan(column_groups, group_dims, group_indices)
+            build_cached_column_plan(group_dims, group_indices)
         })
         .collect();
     Some((score, columns))
@@ -359,11 +436,28 @@ struct ColumnSearch<'a, 'b> {
     assignments: &'b mut [Vec<usize>],
     col_widths: &'b mut [u16],
     col_heights: &'b mut [u16],
+    total_width: u16,
     best: Option<(LayoutScore, Vec<Vec<usize>>)>,
 }
 
 impl ColumnSearch<'_, '_> {
     fn run(&mut self, order_idx: usize) {
+        let remaining_groups = self.order.len().saturating_sub(order_idx);
+        let empty_columns = self.empty_column_count();
+        if remaining_groups < empty_columns
+            || !self.can_fill_empty_columns(order_idx, empty_columns)
+        {
+            return;
+        }
+
+        if self.best_possible_score().is_some_and(|lower_bound| {
+            self.best
+                .as_ref()
+                .is_some_and(|(best_score, _)| lower_bound >= *best_score)
+        }) {
+            return;
+        }
+
         if order_idx == self.order.len() {
             self.record_complete_assignment();
             return;
@@ -381,14 +475,16 @@ impl ColumnSearch<'_, '_> {
 
             let old_width = self.col_widths[col_idx];
             let old_height = self.col_heights[col_idx];
-            self.col_widths[col_idx] = self.col_widths[col_idx].max(dims.width);
+            let old_total_width = self.total_width;
+            let new_width = old_width.max(dims.width);
+            self.total_width = self
+                .total_width
+                .saturating_sub(old_width)
+                .saturating_add(new_width);
+            self.col_widths[col_idx] = new_width;
             self.col_heights[col_idx] = self.col_heights[col_idx].saturating_add(dims.height);
 
-            let partial_width = self
-                .col_widths
-                .iter()
-                .fold(0_u16, |sum, width| sum.saturating_add(*width));
-            if partial_width <= self.available_width {
+            if self.total_width <= self.available_width {
                 self.assignments[col_idx].push(group_idx);
                 self.run(order_idx + 1);
                 self.assignments[col_idx].pop();
@@ -396,6 +492,7 @@ impl ColumnSearch<'_, '_> {
 
             self.col_widths[col_idx] = old_width;
             self.col_heights[col_idx] = old_height;
+            self.total_width = old_total_width;
         }
     }
 
@@ -404,11 +501,7 @@ impl ColumnSearch<'_, '_> {
             return;
         }
 
-        let total_width = self
-            .col_widths
-            .iter()
-            .fold(0_u16, |sum, width| sum.saturating_add(*width));
-        if total_width > self.available_width {
+        if self.total_width > self.available_width {
             return;
         }
 
@@ -420,14 +513,14 @@ impl ColumnSearch<'_, '_> {
             .zip(self.col_heights.iter())
             .map(|(width, height)| (*width as u32) * (*height as u32))
             .sum::<u32>();
-        let layout_area = (total_width as u32) * (max_height as u32);
+        let layout_area = (self.total_width as u32) * (max_height as u32);
         let num_cols = self.assignments.len() as u32;
         let max_possible_cols = self.order.len() as u32;
         let score = LayoutScore {
             overflow: max_height.saturating_sub(self.available_height) as u32,
             wasted_area: layout_area.saturating_sub(used_area),
             height_imbalance: max_height.saturating_sub(min_height) as u32,
-            unused_width: self.available_width.saturating_sub(total_width) as u32,
+            unused_width: self.available_width.saturating_sub(self.total_width) as u32,
             column_penalty: max_possible_cols.saturating_sub(num_cols),
             max_height: max_height as u32,
         };
@@ -440,6 +533,47 @@ impl ColumnSearch<'_, '_> {
             self.best = Some((score, self.assignments.to_vec()));
         }
     }
+
+    fn empty_column_count(&self) -> usize {
+        self.assignments
+            .iter()
+            .filter(|column| column.is_empty())
+            .count()
+    }
+
+    fn can_fill_empty_columns(&self, order_idx: usize, empty_columns: usize) -> bool {
+        self.total_width
+            .saturating_add(self.minimum_width_for_empty_columns(order_idx, empty_columns))
+            <= self.available_width
+    }
+
+    fn minimum_width_for_empty_columns(&self, order_idx: usize, empty_columns: usize) -> u16 {
+        if empty_columns == 0 {
+            return 0;
+        }
+
+        let mut widths: Vec<u16> = self.order[order_idx..]
+            .iter()
+            .map(|&idx| self.group_dims[idx].width)
+            .collect();
+        widths.sort_unstable();
+        widths
+            .into_iter()
+            .take(empty_columns)
+            .fold(0_u16, u16::saturating_add)
+    }
+
+    fn best_possible_score(&self) -> Option<LayoutScore> {
+        let max_height = self.col_heights.iter().copied().max()?;
+        Some(LayoutScore {
+            overflow: max_height.saturating_sub(self.available_height) as u32,
+            wasted_area: 0,
+            height_imbalance: 0,
+            unused_width: 0,
+            column_penalty: (self.order.len() as u32).saturating_sub(self.assignments.len() as u32),
+            max_height: max_height as u32,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -448,11 +582,10 @@ struct GroupDimensions {
     height: u16,
 }
 
-fn build_column_plan<'a>(
-    groups: Vec<MetricGroupView<'a>>,
+fn build_cached_column_plan(
     group_dims: &[GroupDimensions],
     group_indices: Vec<usize>,
-) -> ColumnPlan<'a> {
+) -> CachedColumnPlan {
     let width = group_indices
         .iter()
         .map(|&idx| group_dims[idx].width)
@@ -463,11 +596,47 @@ fn build_column_plan<'a>(
         .map(|&idx| group_dims[idx].height)
         .sum();
 
-    ColumnPlan {
-        groups,
+    CachedColumnPlan {
+        group_indices,
         width,
         height,
     }
+}
+
+fn build_column_plan_from_indices<'a>(
+    groups: &[MetricGroupView<'a>],
+    cached: &CachedColumnPlan,
+) -> ColumnPlan<'a> {
+    ColumnPlan {
+        groups: cached
+            .group_indices
+            .iter()
+            .map(|&idx| groups[idx].clone())
+            .collect(),
+        width: cached.width,
+        height: cached.height,
+    }
+}
+
+fn group_layout_key(
+    groups: &[MetricGroupView<'_>],
+    group_dims: &[GroupDimensions],
+) -> Vec<GroupLayoutKey> {
+    groups
+        .iter()
+        .zip(group_dims.iter())
+        .map(|(view, dims)| GroupLayoutKey {
+            name: view.group.name.clone(),
+            key_prefix: view.group.key_prefix.clone(),
+            entry_names: view
+                .entries
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+            width: dims.width,
+            height: dims.height,
+        })
+        .collect()
 }
 
 fn required_group_width(view: &MetricGroupView<'_>, history: &MetricHistory) -> u16 {

@@ -15,7 +15,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 
 use crate::render::{
-    MetricHistory, SPARKLINE_HISTORY_LEN, render_header, render_metrics_grid, render_status_bar,
+    LayoutPlanCache, MetricHistory, SPARKLINE_HISTORY_LEN, render_header, render_metrics_grid,
+    render_status_bar,
 };
 
 const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
@@ -30,6 +31,7 @@ pub struct TuiDisplay {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     notification: Option<Notification>,
     metric_history: MetricHistory,
+    layout_cache: LayoutPlanCache,
     scroll_offset: u16,
     max_scroll: u16,
     mouse_capture_enabled: bool,
@@ -109,6 +111,7 @@ impl TuiDisplay {
             terminal,
             notification: None,
             metric_history: HashMap::new(),
+            layout_cache: LayoutPlanCache::default(),
             scroll_offset: 0,
             max_scroll: 0,
             mouse_capture_enabled: true,
@@ -161,6 +164,7 @@ impl TuiDisplay {
                 chunks[1],
                 metrics,
                 &self.metric_history,
+                &mut self.layout_cache,
                 scroll_offset,
             );
             render_status_bar(

@@ -247,7 +247,7 @@ fn send_skill_step<OBS, ACT, SI>(
     let (teams, obs, masks, goal) = if result.is_terminal {
         let ball_y = game.last_game_state().ball.pos.y;
         let goal_teams = game.player_teams();
-        let blue_scored = ball_y.is_sign_negative();
+        let blue_scored = ball_y.is_sign_positive();
         let (obs, masks) = game.reset();
         let teams = game.player_teams();
         (

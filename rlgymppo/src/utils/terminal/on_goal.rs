@@ -12,7 +12,10 @@ impl<SI: SharedInfoReport> Terminal<SI> for OnGoalCondition {
 
     fn is_terminal(&mut self, state: &GameState, shared_info: &mut SI) -> bool {
         let scored = state.is_ball_scored();
-        shared_info.report()["Game/Goal Speed"] += AvgTracker::from(state.ball.vel.length());
+
+        if scored {
+            shared_info.report()["Game/Goal Speed"] += AvgTracker::from(state.ball.vel.length());
+        }
 
         scored
     }

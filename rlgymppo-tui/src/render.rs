@@ -197,6 +197,7 @@ pub(crate) fn render_metrics_grid(
     history: &MetricHistory,
     layout_cache: &mut LayoutPlanCache,
     scroll_offset: u16,
+    show_sparklines: bool,
 ) -> u16 {
     let metric_groups = metric_groups(metrics);
     let groups: Vec<MetricGroupView<'_>> = metric_groups
@@ -220,7 +221,14 @@ pub(crate) fn render_metrics_grid(
         return 0;
     }
 
-    let columns = layout_cache.plan_metric_columns(area.width, area.height, &groups, history);
+    let empty_history = MetricHistory::new();
+    let visible_history = if show_sparklines {
+        history
+    } else {
+        &empty_history
+    };
+    let columns =
+        layout_cache.plan_metric_columns(area.width, area.height, &groups, visible_history);
 
     let content_height = columns
         .iter()
@@ -248,7 +256,13 @@ pub(crate) fn render_metrics_grid(
         let extra = base_extra + u16::from((idx as u16) < extra_remainder);
         let width = column.width.saturating_add(extra).min(remaining_width);
         let col_area = Rect::new(x, area.y, width, area.height);
-        render_column(frame, col_area, history, &column.groups, scroll_offset);
+        render_column(
+            frame,
+            col_area,
+            visible_history,
+            &column.groups,
+            scroll_offset,
+        );
         x = x.saturating_add(width);
     }
 
@@ -826,11 +840,11 @@ fn render_group_lines<'a>(
 
 fn sparkline_required_width(group: &MetricGroup, name: &str, history: &MetricHistory) -> usize {
     let full_key = format!("{}/{name}", group.key_prefix);
-    history
-        .get(&full_key)
-        .and_then(|values| sparkline_for_values(values, max_sparkline_width()))
-        .map(|sparkline| display_width(&sparkline) + 2)
-        .unwrap_or(0)
+    if history.contains_key(&full_key) {
+        max_sparkline_width() + 2
+    } else {
+        0
+    }
 }
 
 fn sparkline_for_values(values: &VecDeque<f64>, max_width: usize) -> Option<String> {
@@ -891,6 +905,7 @@ pub(crate) fn render_status_bar(
     notification: Option<&str>,
     scroll_offset: u16,
     max_scroll: u16,
+    show_sparklines: bool,
 ) {
     if let Some(notification) = notification.filter(|notification| !notification.is_empty()) {
         let text = Line::from(Span::styled(
@@ -904,8 +919,11 @@ pub(crate) fn render_status_bar(
         } else {
             format!(" │ wheel/↑/↓ PgUp/PgDn scroll {scroll_offset}/{max_scroll}")
         };
+        let sparkline_state = if show_sparklines { "on" } else { "off" };
         let text = Line::from(Span::styled(
-            format!(" Q:quit S:save R:toggle-render D:toggle-deterministic{scroll_hint} "),
+            format!(
+                " Q:quit S:save R:toggle-render D:toggle-deterministic P:sparklines-{sparkline_state}{scroll_hint} "
+            ),
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(Paragraph::new(text), area);
@@ -929,6 +947,33 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, "avg step reward");
         assert_eq!(entries[0].1, 1.23);
+    }
+
+    #[test]
+    fn test_sparkline_required_width_is_stable_while_history_grows() {
+        let group = MetricGroup {
+            name: "Loss".into(),
+            key_prefix: "Loss".into(),
+            color: Color::Red,
+        };
+        let mut history = MetricHistory::new();
+        history.insert("Loss/policy".into(), VecDeque::from([1.0]));
+
+        assert_eq!(
+            sparkline_required_width(&group, "policy", &history),
+            SPARKLINE_HISTORY_LEN + 2
+        );
+
+        history.insert(
+            "Loss/policy".into(),
+            (0..SPARKLINE_HISTORY_LEN)
+                .map(|value| value as f64)
+                .collect(),
+        );
+        assert_eq!(
+            sparkline_required_width(&group, "policy", &history),
+            SPARKLINE_HISTORY_LEN + 2
+        );
     }
 
     #[test]

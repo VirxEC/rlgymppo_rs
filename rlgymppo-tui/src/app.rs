@@ -35,6 +35,7 @@ pub struct TuiDisplay {
     scroll_offset: u16,
     max_scroll: u16,
     mouse_capture_enabled: bool,
+    show_sparklines: bool,
     closed: bool,
 }
 
@@ -68,6 +69,7 @@ enum TuiCommand {
     Notify(String),
     Scroll(ScrollCommand),
     DisableMouseCapture,
+    ToggleSparklines,
     Close,
 }
 
@@ -115,6 +117,7 @@ impl TuiDisplay {
             scroll_offset: 0,
             max_scroll: 0,
             mouse_capture_enabled: true,
+            show_sparklines: true,
             closed: false,
         })
     }
@@ -166,6 +169,7 @@ impl TuiDisplay {
                 &self.metric_history,
                 &mut self.layout_cache,
                 scroll_offset,
+                self.show_sparklines,
             );
             render_status_bar(
                 frame,
@@ -173,6 +177,7 @@ impl TuiDisplay {
                 notification.as_deref(),
                 scroll_offset.min(max_scroll),
                 max_scroll,
+                self.show_sparklines,
             );
         })?;
 
@@ -331,6 +336,10 @@ impl TuiHandle {
                         Ok(TuiCommand::DisableMouseCapture) => {
                             display.disable_mouse_capture()?;
                         }
+                        Ok(TuiCommand::ToggleSparklines) => {
+                            display.show_sparklines = !display.show_sparklines;
+                            should_redraw = true;
+                        }
                         Ok(TuiCommand::Close) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             should_redraw = display.has_expired_notification();
@@ -362,6 +371,10 @@ impl TuiHandle {
                             }
                             TuiCommand::DisableMouseCapture => {
                                 display.disable_mouse_capture()?;
+                            }
+                            TuiCommand::ToggleSparklines => {
+                                display.show_sparklines = !display.show_sparklines;
+                                should_redraw = true;
                             }
                             TuiCommand::Close => {
                                 display.close()?;
@@ -500,6 +513,12 @@ impl TuiNotifier {
     pub fn disable_mouse_capture(&self) -> io::Result<()> {
         self.tx
             .send(TuiCommand::DisableMouseCapture)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
+    }
+
+    pub fn toggle_sparklines(&self) -> io::Result<()> {
+        self.tx
+            .send(TuiCommand::ToggleSparklines)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI thread has exited"))
     }
 }

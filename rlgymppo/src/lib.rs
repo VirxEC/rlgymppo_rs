@@ -199,6 +199,13 @@ fn handle_input_char<B: burn::prelude::Backend>(
             s.send(HumanInput::RenderToggled).unwrap();
             false
         }
+        #[cfg(feature = "tui")]
+        'p' => {
+            if let Some(notifier) = tui_notifier {
+                let _ = notifier.toggle_sparklines();
+            }
+            false
+        }
         'd' => {
             let (controls, start_renderer) = &**renderer_controls;
             let mut guard = controls.lock();

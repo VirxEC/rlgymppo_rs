@@ -1,0 +1,12 @@
+[package]
+name = "rlgymppo-utils"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrayvec = "0.7.6"
+rand = "0.10.1"
+rlgym = {
+  git = "https://github.com/VirxEC/rlgym_rs.git",
+  branch = "native-rust"
+}

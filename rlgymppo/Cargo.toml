@@ -16,6 +16,7 @@ rlgym = {
   branch = "native-rust"
 }
 rlgymppo-tui = { path = "../rlgymppo-tui", optional = true }
+rlgymppo-utils = { path = "../rlgymppo-utils" }
 rlgymppo-wandb = { path = "../rlgymppo-wandb", optional = true }
 rustc-hash = "2.1.1"
 serde = { version = "1.0.208", features = ["derive"] }

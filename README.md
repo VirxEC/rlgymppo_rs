@@ -7,14 +7,20 @@ training, built on [RocketSim v3](https://github.com/ZealanL/RocketSim/tree/v3-r
 
 ### Project structure
 
-The workspace is split into four crates:
+The workspace is split into five crates:
 
 | Crate | Purpose |
 |---|---|
 | `rlgymppo` | Core PPO learner, multi-threaded environment runner, and training loop. |
+| `rlgymppo-utils` | Reusable RLGym observation builders, action parsers, and shared-info traits, without depending on the PPO learner. |
 | `rlgymppo-tui` | Terminal-based dashboard that renders live training metrics (ratatui). |
 | `rlgymppo-wandb` | Weights & Biases integration via an embedded Python interpreter (pyo3). |
 | `rlgymppo-trainer` | Bundled training example with shared logic, self-play, and skill tracking. |
+
+`rlgymppo-utils` contains the shared `DefaultObs`, `AdvancedObs`, and
+`DefaultAction` implementations used by the trainer. It re-exports `rlgym` and
+RocketSim types so inference applications can reuse the same observation and
+action logic without depending on the PPO training stack.
 
 ### Quick start
 

@@ -95,14 +95,12 @@ impl AddAssign<i64> for Reportable {
 }
 
 impl AddAssign<AvgTracker> for Reportable {
-    fn add_assign(&mut self, mut other: AvgTracker) {
+    fn add_assign(&mut self, other: AvgTracker) {
         match self {
-            Self::Float(a) => {
-                other += *a;
+            Self::Float(_) => {
                 *self = other.into();
             }
-            Self::Int(a) => {
-                other += *a as f64;
+            Self::Int(_) => {
                 *self = other.into();
             }
             Self::Avg(a) => *a += other,

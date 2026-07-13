@@ -137,7 +137,11 @@ fn metric_groups(metrics: &HashMap<String, f64>) -> Vec<MetricGroup> {
 fn group_entries<'a>(metrics: &'a HashMap<String, f64>, prefix: &str) -> Vec<(&'a str, f64)> {
     let mut entries: Vec<(&str, f64)> = metrics
         .iter()
-        .filter_map(|(k, v)| k.strip_prefix(&format!("{prefix}/")).map(|name| (name, *v)))
+        .filter_map(|(k, v)| {
+            k.strip_prefix(&format!("{prefix}/"))
+                .filter(|name| !name.contains('/'))
+                .map(|name| (name, *v))
+        })
         .collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
     entries
@@ -947,6 +951,19 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, "avg step reward");
         assert_eq!(entries[0].1, 1.23);
+    }
+
+    #[test]
+    fn test_group_entries_only_includes_direct_children() {
+        let mut metrics = HashMap::new();
+        metrics.insert("Rewards/NormFactor/Vel2Ball".into(), 1.0);
+        metrics.insert("Rewards/Total".into(), 2.0);
+
+        let rewards = group_entries(&metrics, "Rewards");
+        assert_eq!(rewards, vec![("Total", 2.0)]);
+
+        let normalized_rewards = group_entries(&metrics, "Rewards/NormFactor");
+        assert_eq!(normalized_rewards, vec![("Vel2Ball", 1.0)]);
     }
 
     #[test]

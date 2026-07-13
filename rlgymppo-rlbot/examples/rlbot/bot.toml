@@ -1,0 +1,18 @@
+#:schema https://rlbot.org/schemas/agent.json
+
+[settings]
+name = "rlgymppo-rs"
+loadout_file = "loadout.toml"
+root_dir = ""
+run_command = "cargo run --release -p rlgymppo-rlbot --example rlbot"
+run_command_linux = "cargo run --release -p rlgymppo-rlbot --example rlbot"
+agent_id = "rlgymppo-rs/ppo-bot"
+hivemind = false
+
+[details]
+description = "PPO policy trained with rlgymppo-rs, running with Burn Flex."
+fun_fact = "Its live game state is enriched with RocketSim before every policy decision."
+source_link = "https://github.com/VirxEC/rlgymppo_rs"
+developer = "VirxEC"
+language = "Rust"
+tags = ["1v1", "teamplay"]

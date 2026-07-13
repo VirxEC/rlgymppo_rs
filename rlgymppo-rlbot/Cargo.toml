@@ -1,0 +1,24 @@
+[package]
+name = "rlgymppo-rlbot"
+version = "0.1.0"
+edition = "2024"
+
+[[example]]
+name = "rlbot"
+path = "examples/rlbot/main.rs"
+
+[dependencies]
+burn = {
+  version = "0.21.0",
+  default-features = false,
+  features = ["flex", "std"]
+}
+rand = "0.10.1"
+rlbot-rocketsim = {
+  git = "https://github.com/VirxEC/rlbot-rocketsim.git",
+  rev = "da0746db918cf4154a5ac78ac99d9da97566674a"
+}
+rlgymppo-model = { path = "../rlgymppo-model" }
+rlgymppo-utils = { path = "../rlgymppo-utils" }
+rustc-hash = "2.1.1"
+thiserror = "2.0.18"

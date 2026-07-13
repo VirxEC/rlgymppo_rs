@@ -7,11 +7,13 @@ training, built on [RocketSim v3](https://github.com/ZealanL/RocketSim/tree/v3-r
 
 ### Project structure
 
-The workspace is split into five crates:
+The workspace is split into seven crates:
 
 | Crate | Purpose |
 |---|---|
 | `rlgymppo` | Core PPO learner, multi-threaded environment runner, and training loop. |
+| `rlgymppo-model` | Backend-generic policy/model definitions and checkpoint-compatible inference loading. |
+| `rlgymppo-rlbot` | RLBot v5 agent that runs trained policies with Burn Flex and RocketSim state enrichment. |
 | `rlgymppo-utils` | Reusable RLGym observation builders, action parsers, and shared-info traits, without depending on the PPO learner. |
 | `rlgymppo-tui` | Terminal-based dashboard that renders live training metrics (ratatui). |
 | `rlgymppo-wandb` | Weights & Biases integration via an embedded Python interpreter (pyo3). |

@@ -15,6 +15,7 @@ rlgym = {
   git = "https://github.com/VirxEC/rlgym_rs.git",
   branch = "native-rust"
 }
+rlgymppo-model = { path = "../rlgymppo-model" }
 rlgymppo-tui = { path = "../rlgymppo-tui", optional = true }
 rlgymppo-utils = { path = "../rlgymppo-utils" }
 rlgymppo-wandb = { path = "../rlgymppo-wandb", optional = true }

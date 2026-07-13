@@ -2,11 +2,16 @@
 resolver = "2"
 members = [
   "rlgymppo",
+  "rlgymppo-model",
+  "rlgymppo-rlbot",
   "rlgymppo-trainer",
   "rlgymppo-tui",
   "rlgymppo-utils",
   "rlgymppo-wandb",
 ]
+
+[patch."https://github.com/ZealanL/RocketSim.git"]
+rocketsim = { git = "https://github.com/VirxEC/RocketSim.git", branch = "fix-jump" }
 
 [profile.dev]
 opt-level = 1

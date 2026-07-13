@@ -130,6 +130,11 @@ impl<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8> DefaultAction<MAX_NUM_AGE
         }
     }
 
+    #[must_use]
+    pub fn get_action(&self, action_index: usize) -> CarControls {
+        self.actions_table[action_index]
+    }
+
     /// Returns a per-action validity mask for a given car state.
     ///
     /// Each element in the returned `Vec<bool>` corresponds to an action in

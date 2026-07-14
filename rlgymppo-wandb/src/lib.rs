@@ -65,14 +65,24 @@ impl MetricSender {
 
     /// Send a flat dictionary of scalar metrics to wandb.
     ///
-    /// Equivalent to calling `wandb.log(metrics)` in Python.
+    /// Metrics are logged against the report's cumulative environment steps,
+    /// rather than W&B's implicit per-log-call iteration counter.
     pub fn send(&self, metrics: &HashMap<String, f64>) -> PyResult<()> {
+        let step = metrics.get("Cumulative/steps").copied().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>("missing Cumulative/steps metric")
+        })?;
+
         Python::attach(|py| {
             let dict = PyDict::new(py);
             for (key, val) in metrics {
                 dict.set_item(key.as_str(), *val)?;
             }
-            self.py_run.as_ref().call_method(py, "log", (dict,), None)?;
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("step", step as u64)?;
+            self.py_run
+                .as_ref()
+                .call_method(py, "log", (dict,), Some(&kwargs))?;
             Ok(())
         })
     }

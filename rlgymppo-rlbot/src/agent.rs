@@ -20,6 +20,28 @@ use crate::state::to_rlgym_game_state;
 
 type Backend = Flex;
 
+/// Configures the policy architecture used by an RLBot agent.
+pub trait PpoBotConfig: Send + 'static {
+    /// Build the [`PolicyConfig`] for the given observation and action space sizes.
+    fn policy_config(input_size: usize, action_size: usize) -> PolicyConfig;
+}
+
+/// Default policy architecture from the bundled example:
+/// shared head `[256, 256, 256]`, actor `[256, 256]`, RMSNorm.
+pub struct DefaultConfig;
+
+impl PpoBotConfig for DefaultConfig {
+    fn policy_config(input_size: usize, action_size: usize) -> PolicyConfig {
+        PolicyConfig {
+            input_size,
+            action_size,
+            actor_layer_sizes: vec![256; 2],
+            shared_head_layer_sizes: vec![256; 3],
+            norm: NormSelection::RmsNorm,
+        }
+    }
+}
+
 /// Converts a discrete policy action into RocketSim controls for RLBot.
 pub trait RlbotAction {
     fn get_action(&self, action_index: usize) -> RlgymCarControls;
@@ -34,7 +56,7 @@ impl<const MAX_PLAYERS: usize, const TICK_SKIP: u8> RlbotAction
 }
 
 /// RLBot agent using configurable RLGym observation and action implementations.
-pub struct PpoBot<OBS, ACT, SI> {
+pub struct ConfigurablePpoBot<OBS, ACT, SI, CFG: PpoBotConfig = DefaultConfig> {
     player_index: usize,
     enricher: GameStateEnricher,
     observation: OBS,
@@ -44,13 +66,18 @@ pub struct PpoBot<OBS, ACT, SI> {
     device: FlexDevice,
     held_controls: CarControls,
     next_decision_frame: Option<u32>,
+    _config: std::marker::PhantomData<CFG>,
 }
 
-impl<OBS, ACT, SI> BotAgent for PpoBot<OBS, ACT, SI>
+/// Type alias for the default-architecture RLBot agent.
+pub type PpoBot<OBS, ACT, SI> = ConfigurablePpoBot<OBS, ACT, SI, DefaultConfig>;
+
+impl<OBS, ACT, SI, CFG> BotAgent for ConfigurablePpoBot<OBS, ACT, SI, CFG>
 where
     OBS: Obs<SI> + Default + Send + 'static,
     ACT: Action<SI, Input = usize> + RlbotAction + Default + Send + 'static,
     SI: From<u64> + Send + 'static,
+    CFG: PpoBotConfig,
 {
     fn new(
         _team: u32,
@@ -68,13 +95,10 @@ where
         let shared_info = SI::from(controllable_info.identifier as u64);
         let policy = Policy::<Backend>::load(
             &checkpoint,
-            &PolicyConfig {
-                input_size: observation.get_obs_space(&shared_info),
-                action_size: action_parser.get_action_space(&shared_info),
-                actor_layer_sizes: vec![256; 2],
-                shared_head_layer_sizes: vec![256; 3],
-                norm: NormSelection::RmsNorm,
-            },
+            &CFG::policy_config(
+                observation.get_obs_space(&shared_info),
+                action_parser.get_action_space(&shared_info),
+            ),
             &device,
         )
         .unwrap_or_else(|error| {
@@ -94,6 +118,7 @@ where
             device,
             held_controls: CarControls::default(),
             next_decision_frame: None,
+            _config: std::marker::PhantomData,
         }
     }
 
@@ -120,10 +145,11 @@ where
     }
 }
 
-impl<OBS, ACT, SI> PpoBot<OBS, ACT, SI>
+impl<OBS, ACT, SI, CFG> ConfigurablePpoBot<OBS, ACT, SI, CFG>
 where
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize> + RlbotAction,
+    CFG: PpoBotConfig,
 {
     fn infer(&mut self, frame: u32) {
         let state = to_rlgym_game_state(self.enricher.arena_state());

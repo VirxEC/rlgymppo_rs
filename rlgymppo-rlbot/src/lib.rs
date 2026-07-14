@@ -3,4 +3,4 @@ mod controls;
 
 mod state;
 
-pub use agent::{PpoBot, RlbotAction};
+pub use agent::{ConfigurablePpoBot, DefaultConfig, PpoBot, PpoBotConfig, RlbotAction};

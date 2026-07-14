@@ -3,7 +3,8 @@ use rand::rngs::SmallRng;
 use rlbot_rocketsim::rlbot::RLBotConnection;
 use rlbot_rocketsim::rlbot::agents::run_bot_agents;
 use rlbot_rocketsim::rlbot::util::AgentEnvironment;
-use rlgymppo_rlbot::PpoBot;
+use rlgymppo_model::{NormSelection, PolicyConfig};
+use rlgymppo_rlbot::{ConfigurablePpoBot, PpoBotConfig};
 use rlgymppo_utils::actions::DefaultAction;
 use rlgymppo_utils::obs::DefaultObs;
 use rlgymppo_utils::rocketsim::{GameMode, init_from_mem};
@@ -30,8 +31,24 @@ impl SharedInfoRng for SharedInfo {
     }
 }
 
-// Configure the shared info, observation builder, and discrete action parser used by this bot.
-type Bot = PpoBot<DefaultObs<3>, DefaultAction<6, 8>, SharedInfo>;
+/// Default example architecture:
+/// shared head `[256, 256, 256]`, actor `[256, 256]`, RMSNorm.
+struct ExampleConfig;
+
+impl PpoBotConfig for ExampleConfig {
+    fn policy_config(input_size: usize, action_size: usize) -> PolicyConfig {
+        PolicyConfig {
+            input_size,
+            action_size,
+            actor_layer_sizes: vec![256; 2],
+            shared_head_layer_sizes: vec![256; 3],
+            norm: NormSelection::RmsNorm,
+        }
+    }
+}
+
+// Configure the shared info, observation builder, discrete action parser, and policy architecture.
+type Bot = ConfigurablePpoBot<DefaultObs<3>, DefaultAction<6, 8>, SharedInfo, ExampleConfig>;
 
 const SOCCAR_COLLISION_MESHES: [&[u8]; 16] = [
     include_bytes!("../../../collision_meshes/soccar/mesh_0.cmf"),

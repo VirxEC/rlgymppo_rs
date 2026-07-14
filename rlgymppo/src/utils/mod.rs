@@ -8,7 +8,7 @@ pub mod terminal;
 mod avg_tracker;
 mod report;
 pub(crate) mod running_stat;
-pub(crate) mod serde;
+pub mod serde;
 
 pub use avg_tracker::AvgTracker;
 pub use report::{Report, Reportable};

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use agent::Ppo;
 pub use agent::config::PpoLearnerConfig;
-use agent::model::{Actic, Net};
+pub use agent::model::{Actic, Net};
 pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
 pub use agent::skill_tracker::SkillTrackerConfig;

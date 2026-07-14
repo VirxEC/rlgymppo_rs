@@ -6,7 +6,9 @@ use rlbot_rocketsim::rlbot::util::AgentEnvironment;
 use rlgymppo_rlbot::PpoBot;
 use rlgymppo_utils::actions::DefaultAction;
 use rlgymppo_utils::obs::DefaultObs;
+use rlgymppo_utils::rocketsim::{GameMode, init_from_mem};
 use rlgymppo_utils::shared_info::SharedInfoRng;
+use rustc_hash::FxHashMap;
 
 struct SharedInfo {
     rng: SmallRng,
@@ -31,7 +33,36 @@ impl SharedInfoRng for SharedInfo {
 // Configure the shared info, observation builder, and discrete action parser used by this bot.
 type Bot = PpoBot<DefaultObs<3>, DefaultAction<6, 8>, SharedInfo>;
 
+const SOCCAR_COLLISION_MESHES: [&[u8]; 16] = [
+    include_bytes!("../../../collision_meshes/soccar/mesh_0.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_1.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_2.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_3.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_4.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_5.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_6.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_7.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_8.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_9.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_10.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_11.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_12.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_13.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_14.cmf"),
+    include_bytes!("../../../collision_meshes/soccar/mesh_15.cmf"),
+];
+
 fn main() {
+    let collision_meshes = FxHashMap::from_iter([(
+        GameMode::Soccar,
+        SOCCAR_COLLISION_MESHES
+            .iter()
+            .map(|mesh| mesh.to_vec())
+            .collect(),
+    )]);
+    init_from_mem(collision_meshes, true)
+        .expect("initialize embedded RocketSim Soccar collision meshes");
+
     let AgentEnvironment {
         server_addr,
         agent_id,

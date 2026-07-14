@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use burn::backend::Flex;
 use burn::backend::flex::FlexDevice;
@@ -13,44 +13,12 @@ use rlbot_rocketsim::{GameStateEnricher, MatchContext};
 use rlgymppo_model::{NormSelection, Policy, PolicyConfig};
 use rlgymppo_utils::actions::DefaultAction;
 use rlgymppo_utils::rlgym::{Action, Obs};
-use rlgymppo_utils::rocketsim::{CarControls as RlgymCarControls, GameMode, init_from_mem};
-use rustc_hash::FxHashMap;
+use rlgymppo_utils::rocketsim::CarControls as RlgymCarControls;
 
 use crate::controls::to_rlbot_controls;
-
 use crate::state::to_rlgym_game_state;
 
-static INIT_ROCKETSIM: Once = Once::new();
 type Backend = Flex;
-
-const SOCCAR_COLLISION_MESHES: [&[u8]; 16] = [
-    include_bytes!("../../collision_meshes/soccar/mesh_0.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_1.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_2.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_3.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_4.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_5.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_6.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_7.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_8.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_9.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_10.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_11.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_12.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_13.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_14.cmf"),
-    include_bytes!("../../collision_meshes/soccar/mesh_15.cmf"),
-];
-
-fn soccar_collision_meshes() -> FxHashMap<GameMode, Vec<Vec<u8>>> {
-    FxHashMap::from_iter([(
-        GameMode::Soccar,
-        SOCCAR_COLLISION_MESHES
-            .iter()
-            .map(|mesh| mesh.to_vec())
-            .collect(),
-    )])
-}
 
 /// Converts a discrete policy action into RocketSim controls for RLBot.
 pub trait RlbotAction {
@@ -91,11 +59,6 @@ where
         field_info: Arc<FieldInfo>,
         _packet_queue: &mut PacketQueue,
     ) -> Self {
-        INIT_ROCKETSIM.call_once(|| {
-            init_from_mem(soccar_collision_meshes(), true)
-                .expect("initialize embedded RocketSim Soccar collision meshes");
-        });
-
         let context = MatchContext::new(&match_config, &field_info)
             .expect("create RocketSim context from RLBot match");
         let device = Default::default();
@@ -212,19 +175,4 @@ fn find_asset_directory(name: &str) -> Option<PathBuf> {
         .ancestors()
         .map(|ancestor| ancestor.join(name))
         .find(|candidate| candidate.is_dir())
-}
-
-#[cfg(test)]
-mod tests {
-    use rlgymppo_utils::rocketsim::{Arena, GameMode};
-
-    use super::*;
-
-    #[test]
-    fn embedded_soccar_meshes_initialize() {
-        init_from_mem(soccar_collision_meshes(), true).unwrap();
-        let arena = Arena::new(GameMode::Soccar);
-
-        assert_eq!(arena.game_mode(), GameMode::Soccar);
-    }
 }

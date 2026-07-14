@@ -27,7 +27,7 @@ use burn::module::{AutodiffModule, Module, Quantizer};
 use burn::nn::modules::norm::NormalizationConfig;
 use burn::nn::{LayerNormConfig, RmsNormConfig};
 use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{Adam, AdamConfig, SimpleOptimizer};
+use burn::optim::{Adam, AdamConfig, AdamW, AdamWConfig, SimpleOptimizer};
 use burn::tensor::backend::AutodiffBackend;
 use environment::render::{Renderer, RendererControls};
 use environment::sim::RewardSamplingConfig;
@@ -477,7 +477,6 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B, Adam> {
             timesteps_per_save: 1_000_000,
             num_threads: 4,
             num_games_per_thread: 64,
-
             num_additional_iterations: None,
             render: false,
             self_play: SelfPlayConfig::default(),
@@ -486,6 +485,35 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B, Adam> {
             wandb_group_name: None,
             wandb_run_name: None,
             make_optim: Box::new(|| AdamConfig::new().with_epsilon(1e-8).init()),
+        }
+    }
+}
+
+impl<B: AutodiffBackend> Default for LearnerConfig<B, AdamW> {
+    fn default() -> Self {
+        Self {
+            ppo: PpoLearnerConfig::default(),
+            checkpoints_folder: PathBuf::from("checkpoints"),
+            device: B::Device::default(),
+            quantizer: None,
+            render_device: B::Device::default(),
+            skill_tracker_device: None,
+            policy_layer_sizes: vec![256; 3],
+            critic_layer_sizes: vec![256; 3],
+            norm: NormSelection::RmsNorm,
+            shared_head_layer_sizes: vec![256],
+            checkpoints_limit: None,
+            timesteps_per_save: 1_000_000,
+            num_threads: 4,
+            num_games_per_thread: 64,
+            num_additional_iterations: None,
+            render: false,
+            self_play: SelfPlayConfig::default(),
+            skill_tracker: SkillTrackerConfig::default(),
+            wandb_project_name: None,
+            wandb_group_name: None,
+            wandb_run_name: None,
+            make_optim: Box::new(|| AdamWConfig::new().with_epsilon(1e-8).init()),
         }
     }
 }

@@ -45,7 +45,11 @@ impl<SI: SharedInfoReport> CombinedRewards<SI> {
 }
 
 impl<SI: SharedInfoReport> Reward<SI> for CombinedRewards<SI> {
-    fn reset(&mut self, _initial_state: &GameState, _shared_info: &mut SI) {}
+    fn reset(&mut self, initial_state: &GameState, shared_info: &mut SI) {
+        for (_, reward_fn, _) in &mut self.rewards {
+            reward_fn.reset(initial_state, shared_info);
+        }
+    }
 
     fn get_rewards(&mut self, state: &GameState, shared_info: &mut SI) -> Vec<f32> {
         let mut rewards: Vec<f32> = vec![0.0; state.cars.len()];

@@ -22,7 +22,7 @@ use agent::self_play::VersionManager;
 pub use agent::skill_tracker::SkillTrackerConfig;
 use agent::skill_tracker::{AsyncSkillTracker, SkillTrackerUpdate};
 use base::TerminalState;
-pub use burn::backend;
+pub use burn;
 use burn::module::{AutodiffModule, Module, Quantizer};
 use burn::nn::modules::norm::NormalizationConfig;
 use burn::nn::{LayerNormConfig, RmsNormConfig};

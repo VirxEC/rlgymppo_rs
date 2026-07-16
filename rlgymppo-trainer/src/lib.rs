@@ -134,9 +134,20 @@ pub fn default_config<B: AutodiffBackend>(
     skill_tracker_device: Option<B::Device>,
     async_skill_tracker: bool,
 ) -> LearnerConfig<B> {
-    let mini_batch_size = 40_000;
-    let batch_size = mini_batch_size * 2;
-    let lr = 1.5e-4;
+    // Samples collected before each PPO update. Larger values reduce per-update
+    // overhead but use more CPU memory and make policy updates less frequent.
+    let timesteps_per_iteration = 100_000;
+    // CPU-to-GPU chunk size. Use the largest value that fits VRAM. When it matches
+    // `timesteps_per_iteration`, the full rollout is uploaded once and reused across
+    // all epochs; otherwise each chunk is uploaded and trained separately.
+    let batch_size = timesteps_per_iteration;
+    // Samples per forward/backward/optimizer update. Increase for GPU throughput;
+    // decrease when training runs out of VRAM or learning becomes less stable.
+    let mini_batch_size = 20_000;
+    // Inference-only batch for critic bootstrapping at truncated trajectories.
+    // It can usually be larger than `mini_batch_size` because it holds no gradients.
+    let truncation_value_batch_size = timesteps_per_iteration;
+    let lr = 2e-4;
 
     LearnerConfig {
         render: false,
@@ -145,8 +156,10 @@ pub fn default_config<B: AutodiffBackend>(
         timesteps_per_save: 10_000_000,
         checkpoints_limit: Some(10),
         ppo: PpoLearnerConfig {
+            timesteps_per_iteration,
             batch_size,
             mini_batch_size,
+            truncation_value_batch_size,
             epochs: 1,
             learning_rate: lr,
             entropy_scale: 0.036,

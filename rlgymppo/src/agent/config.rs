@@ -1,6 +1,6 @@
 use burn::grad_clipping::GradientClippingConfig;
 use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{AdamConfig, SimpleOptimizer};
+use burn::optim::{AdamWConfig, SimpleOptimizer};
 use burn::tensor::backend::AutodiffBackend;
 
 use super::Ppo;
@@ -18,13 +18,20 @@ pub struct PpoLearnerConfig {
     pub clip_grad: Option<GradientClippingConfig>,
     /// Learning rate for the optimizer.
     pub learning_rate: f32,
-    /// Number of epochs to train for with the same batch.
+    /// Number of epochs to train for with the same rollout.
     pub epochs: usize,
-    /// Size of the batch to train on.
+    /// Number of environment timesteps to collect before each training iteration.
+    pub timesteps_per_iteration: usize,
+    /// Number of rollout samples transferred from CPU to GPU at once.
+    /// When this equals `timesteps_per_iteration`, the full rollout remains on the
+    /// GPU and is reused across all epochs. This must divide `timesteps_per_iteration`.
     pub batch_size: usize,
-    /// Size to split the batch into mini batches for training.
-    /// This must be a divisor of the batch size.
+    /// Number of GPU-resident samples used per forward, backward, and optimizer step.
+    /// This must divide `batch_size`.
     pub mini_batch_size: usize,
+    /// Number of truncation next-state observations evaluated by the critic at once
+    /// when bootstrapping GAE.
+    pub truncation_value_batch_size: usize,
     /// Extend the last batch to use all remaining experience when it's less than
     /// 2x the batch size.
     pub overbatching: bool,
@@ -62,8 +69,10 @@ impl Default for PpoLearnerConfig {
             max_returns_per_stats_increment: 150,
             learning_rate: 3e-4,
             epochs: 4,
+            timesteps_per_iteration: 60_000,
             batch_size: 60_000,
             mini_batch_size: 20_000,
+            truncation_value_batch_size: 20_000,
             overbatching: true,
             clip_grad: Some(GradientClippingConfig::Norm(0.5)),
             add_rewards_to_metrics: true,
@@ -75,8 +84,13 @@ impl Default for PpoLearnerConfig {
 }
 
 impl PpoLearnerConfig {
-    /// Initialize with the default Adam optimizer.
+    /// Initialize with the default AdamW optimizer.
     pub fn init<B: AutodiffBackend>(self, device: B::Device) -> Ppo<B> {
+        assert_eq!(
+            self.timesteps_per_iteration % self.batch_size,
+            0,
+            "Timesteps per iteration must be divisible by batch size"
+        );
         assert_eq!(
             self.batch_size % self.mini_batch_size,
             0,
@@ -85,7 +99,7 @@ impl PpoLearnerConfig {
 
         let clip_grad = self.clip_grad.clone();
         Ppo::new(self, device, || {
-            let mut cfg = AdamConfig::new().with_epsilon(1e-8);
+            let mut cfg = AdamWConfig::new().with_epsilon(1e-8);
             if let Some(ref clip) = clip_grad {
                 cfg = cfg.with_grad_clipping(Some(clip.clone()));
             }
@@ -102,6 +116,11 @@ impl PpoLearnerConfig {
         device: B::Device,
         make_optim: impl Fn() -> OptimizerAdaptor<O, Net<B>, B>,
     ) -> Ppo<B, O> {
+        assert_eq!(
+            self.timesteps_per_iteration % self.batch_size,
+            0,
+            "Timesteps per iteration must be divisible by batch size"
+        );
         assert_eq!(
             self.batch_size % self.mini_batch_size,
             0,

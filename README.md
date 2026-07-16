@@ -51,6 +51,7 @@ let config = LearnerConfig {
     num_threads: 4,
     num_games_per_thread: 64,
     ppo: PpoLearnerConfig {
+        timesteps_per_iteration: 80_000,
         batch_size: 80_000,
         mini_batch_size: 40_000,
         epochs: 1,

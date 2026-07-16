@@ -389,7 +389,7 @@ pub enum NormSelection {
 /// and must return a freshly created [`OptimizerAdaptor`] each time.
 pub type MakeOptim<B, O> = Box<dyn Fn() -> OptimizerAdaptor<O, Net<B>, B>>;
 
-pub struct LearnerConfig<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend> = Adam> {
+pub struct LearnerConfig<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend> = AdamW> {
     /// Hyperparameters for the PPO learner.
     pub ppo: PpoLearnerConfig,
     /// Where to load/save checkpoints.
@@ -456,7 +456,7 @@ pub struct LearnerConfig<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>
     /// Factory that creates the optimizer.
     ///
     /// Called three times during `init()` (once per sub-network).
-    /// Set via [`LearnerConfig::with_optimizer`]; defaults to Adam.
+    /// Set via [`LearnerConfig::with_optimizer`]; defaults to AdamW.
     pub make_optim: MakeOptim<B, O>,
 }
 
@@ -620,7 +620,7 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> LearnerConfig<B, O
 
         let thread_sim = ThreadSim::new(
             create_env,
-            self.ppo.batch_size,
+            self.ppo.timesteps_per_iteration,
             self.num_threads,
             self.num_games_per_thread,
             self.device.clone(),

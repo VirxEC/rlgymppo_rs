@@ -10,7 +10,7 @@ use burn::module::AutodiffModule;
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::nn::modules::norm::Normalization;
 use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{Adam, GradientsParams, Optimizer, SimpleOptimizer};
+use burn::optim::{AdamW, GradientsParams, Optimizer, SimpleOptimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError};
 use burn::tensor::Transaction;
@@ -28,7 +28,7 @@ use crate::base::{
 use crate::utils::Report;
 use crate::utils::running_stat::Stats;
 
-pub struct Ppo<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend> = Adam> {
+pub struct Ppo<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend> = AdamW> {
     config: PpoLearnerConfig,
     policy_optimizer: OptimizerAdaptor<O, Net<B>, B>,
     value_optimizer: OptimizerAdaptor<O, Net<B>, B>,
@@ -130,16 +130,16 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
         is_first_iteration: bool,
     ) -> (Actic<B>, usize) {
         // When overbatching, use ALL collected experience (the memory may have
-        // slightly more entries than config.batch_size due to the ceil division
-        // in thread_sim, or due to truncation next-states).
+        // slightly more entries than `timesteps_per_iteration` due to the ceil
+        // division in thread_sim, or due to truncation next-states).
         let effective_batch_size =
-            if self.config.overbatching && memory.len() > self.config.batch_size {
+            if self.config.overbatching && memory.len() > self.config.timesteps_per_iteration {
                 memory.len()
             } else {
-                self.config.batch_size
+                self.config.timesteps_per_iteration
             };
 
-        let mut memory_indices = (0..effective_batch_size).collect::<Vec<_>>();
+        let memory_indices = (0..effective_batch_size).collect::<Vec<_>>();
 
         // Snapshot parameters before training for update-magnitude computation.
         let actor_params_before = flatten_net(&net.actor);
@@ -149,7 +149,7 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
         // non-autodiff model clone so no gradient graph accumulates.
         let old_values = {
             let nodiff_net = net.valid();
-            let mb = self.config.mini_batch_size;
+            let mb = self.config.batch_size;
             let n = effective_batch_size;
             let mut values = Vec::with_capacity(n);
             for start in (0..n).step_by(mb) {
@@ -173,14 +173,15 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
         let terminals = get_batch_1d(memory.terminals(), &memory_indices);
 
         // Run the critic on truncation next-state observations for the
-        // bootstrap, mini-batched on a non-autodiff model clone.
+        // bootstrap in configurable batches on a non-autodiff model clone.
         let trunc_val_preds = {
-            let nodiff_net = net.valid();
             if memory.trunc_next_states().is_empty() {
                 Vec::new()
             } else {
-                let mb = self.config.mini_batch_size;
+                let nodiff_net = net.valid();
+                let mb = self.config.truncation_value_batch_size;
                 let n = memory.trunc_next_states().len();
+
                 let mut values = Vec::with_capacity(n);
                 for start in (0..n).step_by(mb) {
                     let end = (start + mb).min(n);
@@ -190,6 +191,7 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
                         &indices,
                         &self.device,
                     );
+
                     let features = nodiff_net.apply_shared_head(batch);
                     let batch_vals = nodiff_net
                         .critic
@@ -247,121 +249,50 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
 
         metrics["GAE/returns STD"] = (stats.return_stat.get_std() as f64).into();
 
-        let mut mean_entropy = 0.0;
-        let mut mean_val_loss = 0.0;
-        let mut mean_clip_fraction = 0.0;
-        let mut mean_rel_entropy_loss = 0.0;
-        let mut mean_policy_loss = 0.0;
-        let mut mean_divergence = 0.0;
+        let mut metric_totals = MetricTotals::new(&self.device);
 
-        for _ in 0..self.config.epochs {
-            memory_indices.shuffle(rng);
-
-            for start_idx in (0..effective_batch_size).step_by(self.config.mini_batch_size) {
-                let end_idx = (start_idx + self.config.mini_batch_size).min(effective_batch_size);
-                let sample_indices = &memory_indices[start_idx..end_idx];
-
-                let state_batch = get_states_batch(memory.states(), sample_indices, &self.device);
-                let action_batch = get_action_batch(memory.actions(), sample_indices, &self.device);
-                let old_log_probs_batch =
-                    get_log_probs_batch(memory.log_probs(), sample_indices, &self.device);
-                let advantage_batch = get_generic_batch(&advantages, sample_indices, &self.device);
-                let target_vals_batch =
-                    get_generic_batch(&target_vals, sample_indices, &self.device);
-
-                // Build action mask tensor for this mini-batch.
-                let mask_batch = (!memory.action_masks().is_empty()).then(|| {
-                    get_action_masks_batch(memory.action_masks(), sample_indices, &self.device)
-                });
-
-                let PPOOutput {
-                    log_probs: log_prob,
-                    values: value_batch,
-                } = net.forward(state_batch, mask_batch);
-
-                // Per-sample entropy normalised by ln(n_actions).
-                let num_actions = log_prob.shape().dims::<2>()[1];
-                let entropy_per_sample = -(log_prob.clone() * log_prob.clone().exp()).sum_dim(1)
-                    / (num_actions as f32).ln();
-                let entropy = entropy_per_sample.mean();
-
-                let action_log_prob = log_prob.gather(1, action_batch.clone());
-                let log_prob_diff = action_log_prob - old_log_probs_batch;
-                let ratios = log_prob_diff.clone().exp();
-
-                let clipped_ratios = ratios
-                    .clone()
-                    .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
-
-                let kl_tensor = (ratios.clone() - 1.0) - log_prob_diff;
-                let kl_mean = kl_tensor.mean();
-
-                let clip_fraction = (ratios.clone() - 1.0)
-                    .abs()
-                    .greater_elem(self.config.clip_range)
-                    .float()
-                    .mean();
-
-                let actor_loss = -(ratios * advantage_batch.clone())
-                    .min_pair(clipped_ratios * advantage_batch)
-                    .mean();
-
-                let batch_size_f = self.config.batch_size as f32;
-                let mb_size_f = (end_idx - start_idx) as f32;
-                let ratio = mb_size_f / batch_size_f;
-                let lr = self.config.learning_rate.into();
-
-                let ppo_loss = actor_loss.clone() - entropy.clone() * self.config.entropy_scale;
-                let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
-
-                let metric_entropy = entropy.detach();
-                let metric_kl = kl_mean.detach();
-                let metric_clip_fraction = clip_fraction.detach();
-                let metric_actor_loss = actor_loss.detach();
-                let metric_critic_loss = critic_loss.clone().detach();
-
-                let combined = (ppo_loss + critic_loss) * ratio;
-                let mut grads = combined.backward();
-
-                let actor_grads = GradientsParams::from_module(&mut grads, &net.actor);
-                net.actor = self.policy_optimizer.step(lr, net.actor, actor_grads);
-
-                let critic_grads = GradientsParams::from_module(&mut grads, &net.critic);
-                net.critic = self.value_optimizer.step(lr, net.critic, critic_grads);
-
-                if let Some(head) = net.shared_head.take() {
-                    let head_grads = GradientsParams::from_module(&mut grads, &head);
-                    net.shared_head = Some(self.shared_head_optimizer.step(lr, head, head_grads));
+        if self.config.batch_size == effective_batch_size {
+            // Upload the complete rollout once, then train all mini-batches in each epoch.
+            let batch = GpuBatch::from_memory(
+                memory,
+                &memory_indices,
+                &advantages,
+                &target_vals,
+                &self.device,
+            );
+            let mut batch_order = (0..batch.len()).collect::<Vec<_>>();
+            for _ in 0..self.config.epochs {
+                self.train_gpu_batch(
+                    &mut net,
+                    &batch,
+                    &mut batch_order,
+                    rng,
+                    effective_batch_size,
+                    &mut metric_totals,
+                );
+            }
+        } else {
+            for batch_start in (0..effective_batch_size).step_by(self.config.batch_size) {
+                let batch_end = (batch_start + self.config.batch_size).min(effective_batch_size);
+                let batch_indices = &memory_indices[batch_start..batch_end];
+                let batch = GpuBatch::from_memory(
+                    memory,
+                    batch_indices,
+                    &advantages,
+                    &target_vals,
+                    &self.device,
+                );
+                let mut batch_order = (0..batch.len()).collect::<Vec<_>>();
+                for _ in 0..self.config.epochs {
+                    self.train_gpu_batch(
+                        &mut net,
+                        &batch,
+                        &mut batch_order,
+                        rng,
+                        effective_batch_size,
+                        &mut metric_totals,
+                    );
                 }
-
-                // Batch all metric syncs into a single device transaction after
-                // backward/optimizer work has been enqueued to avoid forcing an
-                // early GPU synchronization in the hot training path.
-                let [entropy_data, kl_data, clip_data, policy_data, critic_data] =
-                    Transaction::default()
-                        .register(metric_entropy)
-                        .register(metric_kl)
-                        .register(metric_clip_fraction)
-                        .register(metric_actor_loss)
-                        .register(metric_critic_loss)
-                        .execute()
-                        .try_into()
-                        .expect("Correct amount of tensor data");
-
-                let cur_entropy = entropy_data.to_vec::<f32>().unwrap()[0];
-                mean_entropy += cur_entropy;
-                mean_divergence += kl_data.to_vec::<f32>().unwrap()[0];
-                mean_clip_fraction += clip_data.to_vec::<f32>().unwrap()[0];
-
-                let cur_policy_loss = policy_data.to_vec::<f32>().unwrap()[0];
-                mean_policy_loss += cur_policy_loss;
-
-                mean_rel_entropy_loss += (cur_entropy * self.config.entropy_scale)
-                    / cur_policy_loss.abs().max(f32::EPSILON);
-
-                let loss = critic_data.to_vec::<f32>().unwrap()[0];
-                assert!(!loss.is_nan(), "Value loss is NaN: {loss}");
-                mean_val_loss += loss;
             }
         }
 
@@ -373,12 +304,28 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
             .max(effective_batch_size.div_ceil(self.config.mini_batch_size) * self.config.epochs)
             as f32;
 
-        mean_policy_loss /= mini_batch_iters;
-        mean_val_loss /= mini_batch_iters;
-        mean_entropy /= mini_batch_iters;
-        mean_clip_fraction /= mini_batch_iters;
-        mean_rel_entropy_loss /= mini_batch_iters;
-        mean_divergence /= mini_batch_iters;
+        // Synchronize the accumulated scalar metrics only once after all epochs.
+        let [entropy_data, kl_data, clip_data, policy_data, critic_data] = Transaction::default()
+            .register(metric_totals.entropy)
+            .register(metric_totals.divergence)
+            .register(metric_totals.clip_fraction)
+            .register(metric_totals.policy_loss)
+            .register(metric_totals.value_loss)
+            .execute()
+            .try_into()
+            .expect("Correct amount of tensor data");
+
+        let mean_entropy = entropy_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
+        let mean_divergence = kl_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
+        let mean_clip_fraction = clip_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
+        let mean_policy_loss = policy_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
+        let mean_val_loss = critic_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
+        assert!(
+            !mean_val_loss.is_nan(),
+            "Value loss is NaN: {mean_val_loss}"
+        );
+        let mean_rel_entropy_loss =
+            (mean_entropy * self.config.entropy_scale) / mean_policy_loss.abs().max(f32::EPSILON);
 
         // Compute parameter-update magnitudes (L2 norm of param diff).
         let actor_params_after = flatten_net(&net.actor);
@@ -404,6 +351,155 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
         }
 
         (net, effective_batch_size)
+    }
+
+    fn train_gpu_batch<R: Rng>(
+        &mut self,
+        net: &mut Actic<B>,
+        batch: &GpuBatch<B>,
+        batch_order: &mut [usize],
+        rng: &mut R,
+        effective_batch_size: usize,
+        metric_totals: &mut MetricTotals<B>,
+    ) {
+        batch_order.shuffle(rng);
+
+        for mini_batch_start in (0..batch.len()).step_by(self.config.mini_batch_size) {
+            let mini_batch_end = (mini_batch_start + self.config.mini_batch_size).min(batch.len());
+            let indices = Tensor::<B, 1, Int>::from_data(
+                TensorData::new(
+                    batch_order[mini_batch_start..mini_batch_end]
+                        .iter()
+                        .map(|&index| index as i64)
+                        .collect::<Vec<_>>(),
+                    [mini_batch_end - mini_batch_start],
+                ),
+                &self.device,
+            );
+
+            let state_batch = batch.states.clone().select(0, indices.clone());
+            let action_batch = batch.actions.clone().select(0, indices.clone());
+            let old_log_probs_batch = batch.old_log_probs.clone().select(0, indices.clone());
+            let advantage_batch = batch.advantages.clone().select(0, indices.clone());
+            let target_vals_batch = batch.target_vals.clone().select(0, indices.clone());
+            let mask_batch = batch
+                .action_masks
+                .as_ref()
+                .map(|masks| masks.clone().select(0, indices));
+
+            let PPOOutput {
+                log_probs: log_prob,
+                values: value_batch,
+            } = net.forward(state_batch, mask_batch);
+
+            let num_actions = log_prob.shape().dims::<2>()[1];
+            let entropy_per_sample =
+                -(log_prob.clone() * log_prob.clone().exp()).sum_dim(1) / (num_actions as f32).ln();
+            let entropy = entropy_per_sample.mean();
+
+            let action_log_prob = log_prob.gather(1, action_batch.clone());
+            let log_prob_diff = action_log_prob - old_log_probs_batch;
+            let ratios = log_prob_diff.clone().exp();
+            let clipped_ratios = ratios
+                .clone()
+                .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
+            let kl_mean = ((ratios.clone() - 1.0) - log_prob_diff).mean();
+            let clip_fraction = (ratios.clone() - 1.0)
+                .abs()
+                .greater_elem(self.config.clip_range)
+                .float()
+                .mean();
+            let actor_loss = -(ratios * advantage_batch.clone())
+                .min_pair(clipped_ratios * advantage_batch)
+                .mean();
+
+            let ratio = (mini_batch_end - mini_batch_start) as f32 / effective_batch_size as f32;
+            let lr = self.config.learning_rate.into();
+            let ppo_loss = actor_loss.clone() - entropy.clone() * self.config.entropy_scale;
+            let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
+
+            let metric_entropy = entropy.detach();
+            let metric_kl = kl_mean.detach();
+            let metric_clip_fraction = clip_fraction.detach();
+            let metric_actor_loss = actor_loss.detach();
+            let metric_critic_loss = critic_loss.clone().detach();
+
+            let mut grads = ((ppo_loss + critic_loss) * ratio).backward();
+            let actor_grads = GradientsParams::from_module(&mut grads, &net.actor);
+            net.actor = self
+                .policy_optimizer
+                .step(lr, net.actor.clone(), actor_grads);
+
+            let critic_grads = GradientsParams::from_module(&mut grads, &net.critic);
+            net.critic = self
+                .value_optimizer
+                .step(lr, net.critic.clone(), critic_grads);
+
+            if let Some(head) = net.shared_head.take() {
+                let head_grads = GradientsParams::from_module(&mut grads, &head);
+                net.shared_head = Some(self.shared_head_optimizer.step(lr, head, head_grads));
+            }
+
+            metric_totals.entropy = metric_totals.entropy.clone() + metric_entropy;
+            metric_totals.divergence = metric_totals.divergence.clone() + metric_kl;
+            metric_totals.clip_fraction =
+                metric_totals.clip_fraction.clone() + metric_clip_fraction;
+            metric_totals.policy_loss = metric_totals.policy_loss.clone() + metric_actor_loss;
+            metric_totals.value_loss = metric_totals.value_loss.clone() + metric_critic_loss;
+        }
+    }
+}
+
+struct GpuBatch<B: Backend> {
+    states: Tensor<B, 2>,
+    actions: Tensor<B, 2, Int>,
+    old_log_probs: Tensor<B, 2>,
+    advantages: Tensor<B, 2>,
+    target_vals: Tensor<B, 2>,
+    action_masks: Option<Tensor<B, 2>>,
+}
+
+impl<B: Backend> GpuBatch<B> {
+    fn from_memory(
+        memory: &Memory,
+        indices: &[usize],
+        advantages: &[f32],
+        target_vals: &[f32],
+        device: &B::Device,
+    ) -> Self {
+        Self {
+            states: get_states_batch(memory.states(), indices, device),
+            actions: get_action_batch(memory.actions(), indices, device),
+            old_log_probs: get_log_probs_batch(memory.log_probs(), indices, device),
+            advantages: get_generic_batch(advantages, indices, device),
+            target_vals: get_generic_batch(target_vals, indices, device),
+            action_masks: (!memory.action_masks().is_empty())
+                .then(|| get_action_masks_batch(memory.action_masks(), indices, device)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.states.shape().dims::<2>()[0]
+    }
+}
+
+struct MetricTotals<B: Backend> {
+    entropy: Tensor<B, 1>,
+    value_loss: Tensor<B, 1>,
+    clip_fraction: Tensor<B, 1>,
+    policy_loss: Tensor<B, 1>,
+    divergence: Tensor<B, 1>,
+}
+
+impl<B: Backend> MetricTotals<B> {
+    fn new(device: &B::Device) -> Self {
+        Self {
+            entropy: Tensor::zeros([1], device),
+            value_loss: Tensor::zeros([1], device),
+            clip_fraction: Tensor::zeros([1], device),
+            policy_loss: Tensor::zeros([1], device),
+            divergence: Tensor::zeros([1], device),
+        }
     }
 }
 

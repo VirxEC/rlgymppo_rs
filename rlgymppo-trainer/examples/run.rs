@@ -58,7 +58,7 @@ fn main() {
     {
         use burn::backend::LibTorch;
         use burn::backend::libtorch::LibTorchDevice;
-        use rlgymppo::backend::Autodiff;
+        use rlgymppo::burn::backend::Autodiff;
 
         rlgymppo_trainer::run::<Autodiff<LibTorch>>(
             LibTorchDevice::Cuda(0),
@@ -72,7 +72,7 @@ fn main() {
     {
         use burn::backend::Cuda;
         use burn::backend::cuda::CudaDevice;
-        use rlgymppo::backend::Autodiff;
+        use rlgymppo::burn::backend::Autodiff;
 
         rlgymppo_trainer::run::<Autodiff<Cuda>>(
             CudaDevice::new(0),
@@ -86,7 +86,7 @@ fn main() {
     {
         use burn::backend::Metal;
         use burn::backend::wgpu::WgpuDevice;
-        use rlgymppo::backend::Autodiff;
+        use rlgymppo::burn::backend::Autodiff;
 
         rlgymppo_trainer::run::<Autodiff<Metal>>(
             WgpuDevice::default(),
@@ -100,7 +100,7 @@ fn main() {
     {
         use burn::backend::Rocm;
         use burn::backend::rocm::RocmDevice;
-        use rlgymppo::backend::Autodiff;
+        use rlgymppo::burn::backend::Autodiff;
 
         rlgymppo_trainer::run::<Autodiff<Rocm>>(
             RocmDevice::new(0),
@@ -114,7 +114,7 @@ fn main() {
     {
         use burn::backend::Wgpu;
         use burn::backend::wgpu::WgpuDevice;
-        use rlgymppo::backend::Autodiff;
+        use rlgymppo::burn::backend::Autodiff;
 
         rlgymppo_trainer::run::<Autodiff<Wgpu>>(
             WgpuDevice::default(),
@@ -127,7 +127,7 @@ fn main() {
     #[cfg(feature = "flex")]
     {
         use burn::backend::Flex;
-        use rlgymppo::backend::Autodiff;
+        use rlgymppo::burn::backend::Autodiff;
 
         rlgymppo_trainer::run::<Autodiff<Flex>>(Default::default(), Default::default(), None, true);
     }
@@ -136,7 +136,7 @@ fn main() {
     {
         use burn::backend::Candle;
         use burn::backend::candle::CandleDevice;
-        use rlgymppo::backend::Autodiff;
+        use rlgymppo::burn::backend::Autodiff;
 
         rlgymppo_trainer::run::<Autodiff<Candle>>(
             CandleDevice::default(),

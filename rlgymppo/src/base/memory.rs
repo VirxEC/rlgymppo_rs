@@ -21,11 +21,25 @@ pub fn get_states_batch<B: Backend>(
 ) -> Tensor<B, 2> {
     let shape = [indices.len(), data[0].len()];
     let mut states: Vec<f32> = Vec::with_capacity(shape[0] * shape[1]);
-    for i in indices {
-        states.extend(&data[*i]);
+    for &i in indices {
+        states.extend(&data[i]);
     }
 
     Tensor::from_data(TensorData::new(states, shape), device)
+}
+
+pub fn get_states_batch_range<B: Backend>(
+    data: &AllocRingBuffer<Vec<f32>>,
+    start: usize,
+    end: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let width = data[0].len();
+    let mut states: Vec<f32> = Vec::with_capacity((end - start) * width);
+    for i in start..end {
+        states.extend(&data[i]);
+    }
+    Tensor::from_data(TensorData::new(states, [end - start, width]), device)
 }
 
 pub fn get_log_probs_batch<B: Backend>(
@@ -34,11 +48,21 @@ pub fn get_log_probs_batch<B: Backend>(
     device: &B::Device,
 ) -> Tensor<B, 2> {
     let mut states: Vec<f32> = Vec::with_capacity(indices.len());
-    for i in indices {
-        states.push(data[*i]);
+    for &i in indices {
+        states.push(data[i]);
     }
 
     Tensor::from_data(TensorData::new(states, [indices.len(), 1]), device)
+}
+
+pub fn get_log_probs_batch_range<B: Backend>(
+    data: &AllocRingBuffer<f32>,
+    start: usize,
+    end: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let states: Vec<f32> = (start..end).map(|i| data[i]).collect();
+    Tensor::from_data(TensorData::new(states, [end - start, 1]), device)
 }
 
 pub fn get_action_batch<B: Backend>(
@@ -47,12 +71,22 @@ pub fn get_action_batch<B: Backend>(
     device: &B::Device,
 ) -> Tensor<B, 2, Int> {
     let shape = [indices.len(), 1];
-    let mut states: Vec<u32> = Vec::with_capacity(shape[0] * shape[1]);
-    for i in indices {
-        states.push(data[*i] as u32);
+    let mut states: Vec<u32> = Vec::with_capacity(shape[0]);
+    for &i in indices {
+        states.push(data[i] as u32);
     }
 
     Tensor::from_data(TensorData::new(states, shape), device)
+}
+
+pub fn get_action_batch_range<B: Backend>(
+    data: &AllocRingBuffer<usize>,
+    start: usize,
+    end: usize,
+    device: &B::Device,
+) -> Tensor<B, 2, Int> {
+    let states: Vec<u32> = (start..end).map(|i| data[i] as u32).collect();
+    Tensor::from_data(TensorData::new(states, [end - start, 1]), device)
 }
 
 pub fn get_generic_batch<B: Backend>(
@@ -61,11 +95,23 @@ pub fn get_generic_batch<B: Backend>(
     device: &B::Device,
 ) -> Tensor<B, 2> {
     let mut states: Vec<f32> = Vec::with_capacity(indices.len());
-    for i in indices {
-        states.push(data[*i]);
+    for &i in indices {
+        states.push(data[i]);
     }
 
     Tensor::from_data(TensorData::new(states, [indices.len(), 1]), device)
+}
+
+pub fn get_generic_batch_range<B: Backend>(
+    data: &[f32],
+    start: usize,
+    end: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    Tensor::from_data(
+        TensorData::new(data[start..end].to_vec(), [end - start, 1]),
+        device,
+    )
 }
 
 /// Flatten per-player action masks into a [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
@@ -76,12 +122,29 @@ pub fn get_action_masks_batch<B: Backend>(
 ) -> Tensor<B, 2> {
     let shape = [indices.len(), data[0].len()];
     let mut masks: Vec<f32> = Vec::with_capacity(shape[0] * shape[1]);
-    for i in indices {
-        for &v in &data[*i] {
+    for &i in indices {
+        for &v in &data[i] {
             masks.push(if v { 1.0 } else { 0.0 });
         }
     }
+
     Tensor::from_data(TensorData::new(masks, shape), device)
+}
+
+pub fn get_action_masks_batch_range<B: Backend>(
+    data: &AllocRingBuffer<Vec<bool>>,
+    start: usize,
+    end: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let width = data[0].len();
+    let mut masks = Vec::with_capacity((end - start) * width);
+    for i in start..end {
+        for &v in &data[i] {
+            masks.push(if v { 1.0 } else { 0.0 });
+        }
+    }
+    Tensor::from_data(TensorData::new(masks, [end - start, width]), device)
 }
 
 #[derive(Clone)]

@@ -30,7 +30,8 @@ pub struct PpoLearnerConfig {
     /// This must divide `batch_size`.
     pub mini_batch_size: usize,
     /// Number of truncation next-state observations evaluated by the critic at once
-    /// when bootstrapping GAE.
+    /// when bootstrapping GAE. Set this to `batch_size` to use one contiguous
+    /// CPU-to-GPU upload whenever all truncation observations fit in one batch.
     pub truncation_value_batch_size: usize,
     /// Extend the last batch to use all remaining experience when it's less than
     /// 2x the batch size.

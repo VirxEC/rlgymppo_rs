@@ -22,8 +22,9 @@ use ringbuffer::RingBuffer;
 use crate::agent::config::PpoLearnerConfig;
 use crate::agent::model::{Actic, Net, PPOOutput};
 use crate::base::{
-    Memory, TerminalState, get_action_batch, get_action_masks_batch, get_batch_1d,
-    get_generic_batch, get_log_probs_batch, get_states_batch,
+    Memory, TerminalState, get_action_batch, get_action_batch_range, get_action_masks_batch,
+    get_action_masks_batch_range, get_batch_1d, get_generic_batch, get_generic_batch_range,
+    get_log_probs_batch, get_log_probs_batch_range, get_states_batch, get_states_batch_range,
 };
 use crate::utils::Report;
 use crate::utils::running_stat::Stats;
@@ -154,9 +155,12 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
             let mut values = Vec::with_capacity(n);
             for start in (0..n).step_by(mb) {
                 let end = (start + mb).min(n);
-                let slice = &memory_indices[start..end];
-                let states =
-                    get_states_batch::<B::InnerBackend>(memory.states(), slice, &self.device);
+                let states = get_states_batch_range::<B::InnerBackend>(
+                    memory.states(),
+                    start,
+                    end,
+                    &self.device,
+                );
                 let features = nodiff_net.apply_shared_head(states);
                 let batch_vals = nodiff_net.critic.forward(features);
                 values.extend_from_slice(batch_vals.into_data().as_slice().unwrap());
@@ -185,10 +189,10 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
                 let mut values = Vec::with_capacity(n);
                 for start in (0..n).step_by(mb) {
                     let end = (start + mb).min(n);
-                    let indices: Vec<usize> = (start..end).collect();
-                    let batch = get_states_batch::<B::InnerBackend>(
+                    let batch = get_states_batch_range::<B::InnerBackend>(
                         memory.trunc_next_states(),
-                        &indices,
+                        start,
+                        end,
                         &self.device,
                     );
 
@@ -253,9 +257,10 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
 
         if self.config.batch_size == effective_batch_size {
             // Upload the complete rollout once, then train all mini-batches in each epoch.
-            let batch = GpuBatch::from_memory(
+            let batch = GpuBatch::from_memory_range(
                 memory,
-                &memory_indices,
+                0,
+                effective_batch_size,
                 &advantages,
                 &target_vals,
                 &self.device,
@@ -475,6 +480,25 @@ impl<B: Backend> GpuBatch<B> {
             target_vals: get_generic_batch(target_vals, indices, device),
             action_masks: (!memory.action_masks().is_empty())
                 .then(|| get_action_masks_batch(memory.action_masks(), indices, device)),
+        }
+    }
+
+    fn from_memory_range(
+        memory: &Memory,
+        start: usize,
+        end: usize,
+        advantages: &[f32],
+        target_vals: &[f32],
+        device: &B::Device,
+    ) -> Self {
+        Self {
+            states: get_states_batch_range(memory.states(), start, end, device),
+            actions: get_action_batch_range(memory.actions(), start, end, device),
+            old_log_probs: get_log_probs_batch_range(memory.log_probs(), start, end, device),
+            advantages: get_generic_batch_range(advantages, start, end, device),
+            target_vals: get_generic_batch_range(target_vals, start, end, device),
+            action_masks: (!memory.action_masks().is_empty())
+                .then(|| get_action_masks_batch_range(memory.action_masks(), start, end, device)),
         }
     }
 

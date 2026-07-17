@@ -10,7 +10,7 @@ use burn::module::AutodiffModule;
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::nn::modules::norm::Normalization;
 use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{AdamW, GradientsParams, Optimizer};
+use burn::optim::{AdamW, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError};
 use burn::tensor::Transaction;
@@ -23,9 +23,8 @@ use crate::OptimizerNetwork;
 use crate::agent::config::PpoLearnerConfig;
 use crate::agent::model::{Actic, Net, PPOOutput};
 use crate::base::{
-    Memory, TerminalState, get_action_batch, get_action_batch_range, get_action_masks_batch,
-    get_action_masks_batch_range, get_batch_1d, get_generic_batch, get_generic_batch_range,
-    get_log_probs_batch, get_log_probs_batch_range, get_states_batch, get_states_batch_range,
+    Memory, TerminalState, get_action_batch, get_action_masks_batch, get_batch_1d,
+    get_generic_batch, get_log_probs_batch, get_states_batch, get_states_batch_range,
 };
 use crate::utils::Report;
 use crate::utils::running_stat::Stats;
@@ -266,34 +265,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
         let mut metric_totals = MetricTotals::new(&self.device);
 
-        if self.config.gpu_timestep_buffer_size == effective_batch_size {
-            // Upload the complete rollout once, then train all mini-batches in each epoch.
-            let batch = GpuBatch::from_memory_range(
-                memory,
-                0,
-                effective_batch_size,
-                &advantages,
-                &target_vals,
-                &self.device,
-            );
-            let mut batch_order = (0..batch.len()).collect::<Vec<_>>();
-            for _ in 0..self.config.epochs {
-                self.train_gpu_batch(
-                    &mut net,
-                    &batch,
-                    &mut batch_order,
-                    rng,
-                    effective_batch_size,
-                    &mut metric_totals,
-                );
-            }
-        } else {
-            for batch_start in
-                (0..effective_batch_size).step_by(self.config.gpu_timestep_buffer_size)
-            {
-                let batch_end =
-                    (batch_start + self.config.gpu_timestep_buffer_size).min(effective_batch_size);
-                let batch_indices = &memory_indices[batch_start..batch_end];
+        let mut rollout_order = memory_indices;
+        for _ in 0..self.config.epochs {
+            rollout_order.shuffle(rng);
+
+            for batch_indices in rollout_order.chunks(self.config.batch_size) {
                 let batch = GpuBatch::from_memory(
                     memory,
                     batch_indices,
@@ -302,16 +278,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     &self.device,
                 );
                 let mut batch_order = (0..batch.len()).collect::<Vec<_>>();
-                for _ in 0..self.config.epochs {
-                    self.train_gpu_batch(
-                        &mut net,
-                        &batch,
-                        &mut batch_order,
-                        rng,
-                        effective_batch_size,
-                        &mut metric_totals,
-                    );
-                }
+                self.train_gpu_batch(&mut net, &batch, &mut batch_order, rng, &mut metric_totals);
             }
         }
 
@@ -319,8 +286,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         stats.cumulative_epochs += self.config.epochs as u64;
         stats.cumulative_model_updates += 1;
 
-        let mini_batch_iters = 1
-            .max(effective_batch_size.div_ceil(self.config.mini_batch_size) * self.config.epochs)
+        let batch_iters = 1
+            .max(effective_batch_size.div_ceil(self.config.batch_size) * self.config.epochs)
             as f32;
 
         // Synchronize the accumulated scalar metrics only once after all epochs.
@@ -334,11 +301,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             .try_into()
             .expect("Correct amount of tensor data");
 
-        let mean_entropy = entropy_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
-        let mean_divergence = kl_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
-        let mean_clip_fraction = clip_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
-        let mean_policy_loss = policy_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
-        let mean_val_loss = critic_data.to_vec::<f32>().unwrap()[0] / mini_batch_iters;
+        let mean_entropy = entropy_data.to_vec::<f32>().unwrap()[0] / batch_iters;
+        let mean_divergence = kl_data.to_vec::<f32>().unwrap()[0] / batch_iters;
+        let mean_clip_fraction = clip_data.to_vec::<f32>().unwrap()[0] / batch_iters;
+        let mean_policy_loss = policy_data.to_vec::<f32>().unwrap()[0] / batch_iters;
+        let mean_val_loss = critic_data.to_vec::<f32>().unwrap()[0] / batch_iters;
         assert!(
             !mean_val_loss.is_nan(),
             "Value loss is NaN: {mean_val_loss}"
@@ -378,10 +345,13 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         batch: &GpuBatch<B>,
         batch_order: &mut [usize],
         rng: &mut R,
-        effective_batch_size: usize,
         metric_totals: &mut MetricTotals<B>,
     ) {
         batch_order.shuffle(rng);
+
+        let mut actor_gradients = GradientsAccumulator::new();
+        let mut critic_gradients = GradientsAccumulator::new();
+        let mut shared_head_gradients = GradientsAccumulator::new();
 
         for mini_batch_start in (0..batch.len()).step_by(self.config.mini_batch_size) {
             let mini_batch_end = (mini_batch_start + self.config.mini_batch_size).min(batch.len());
@@ -432,8 +402,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 .min_pair(clipped_ratios * advantage_batch)
                 .mean();
 
-            let ratio = (mini_batch_end - mini_batch_start) as f32 / effective_batch_size as f32;
-            let lr = self.config.learning_rate.into();
+            let mini_batch_weight = (mini_batch_end - mini_batch_start) as f32 / batch.len() as f32;
             let ppo_loss = actor_loss.clone() - entropy.clone() * self.config.entropy_scale;
             let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
 
@@ -443,28 +412,43 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             let metric_actor_loss = actor_loss.detach();
             let metric_critic_loss = critic_loss.clone().detach();
 
-            let mut grads = ((ppo_loss + critic_loss) * ratio).backward();
-            let actor_grads = GradientsParams::from_module(&mut grads, &net.actor);
-            net.actor = self
-                .policy_optimizer
-                .step(lr, net.actor.clone(), actor_grads);
-
-            let critic_grads = GradientsParams::from_module(&mut grads, &net.critic);
-            net.critic = self
-                .value_optimizer
-                .step(lr, net.critic.clone(), critic_grads);
-
-            if let Some(head) = net.shared_head.take() {
-                let head_grads = GradientsParams::from_module(&mut grads, &head);
-                net.shared_head = Some(self.shared_head_optimizer.step(lr, head, head_grads));
+            let mut grads = ((ppo_loss + critic_loss) * mini_batch_weight).backward();
+            actor_gradients.accumulate(
+                &net.actor,
+                GradientsParams::from_module(&mut grads, &net.actor),
+            );
+            critic_gradients.accumulate(
+                &net.critic,
+                GradientsParams::from_module(&mut grads, &net.critic),
+            );
+            if let Some(head) = net.shared_head.as_ref() {
+                shared_head_gradients
+                    .accumulate(head, GradientsParams::from_module(&mut grads, head));
             }
 
-            metric_totals.entropy = metric_totals.entropy.clone() + metric_entropy;
-            metric_totals.divergence = metric_totals.divergence.clone() + metric_kl;
-            metric_totals.clip_fraction =
-                metric_totals.clip_fraction.clone() + metric_clip_fraction;
-            metric_totals.policy_loss = metric_totals.policy_loss.clone() + metric_actor_loss;
-            metric_totals.value_loss = metric_totals.value_loss.clone() + metric_critic_loss;
+            metric_totals.add_weighted(
+                metric_entropy,
+                metric_kl,
+                metric_clip_fraction,
+                metric_actor_loss,
+                metric_critic_loss,
+                mini_batch_weight,
+            );
+        }
+
+        let lr = self.config.learning_rate.into();
+        net.actor = self
+            .policy_optimizer
+            .step(lr, net.actor.clone(), actor_gradients.grads());
+        net.critic = self
+            .value_optimizer
+            .step(lr, net.critic.clone(), critic_gradients.grads());
+        if let Some(head) = net.shared_head.take() {
+            net.shared_head = Some(self.shared_head_optimizer.step(
+                lr,
+                head,
+                shared_head_gradients.grads(),
+            ));
         }
     }
 }
@@ -497,25 +481,6 @@ impl<B: Backend> GpuBatch<B> {
         }
     }
 
-    fn from_memory_range(
-        memory: &Memory,
-        start: usize,
-        end: usize,
-        advantages: &[f32],
-        target_vals: &[f32],
-        device: &B::Device,
-    ) -> Self {
-        Self {
-            states: get_states_batch_range(memory.states(), start, end, device),
-            actions: get_action_batch_range(memory.actions(), start, end, device),
-            old_log_probs: get_log_probs_batch_range(memory.log_probs(), start, end, device),
-            advantages: get_generic_batch_range(advantages, start, end, device),
-            target_vals: get_generic_batch_range(target_vals, start, end, device),
-            action_masks: (!memory.action_masks().is_empty())
-                .then(|| get_action_masks_batch_range(memory.action_masks(), start, end, device)),
-        }
-    }
-
     fn len(&self) -> usize {
         self.states.shape().dims::<2>()[0]
     }
@@ -538,6 +503,22 @@ impl<B: Backend> MetricTotals<B> {
             policy_loss: Tensor::zeros([1], device),
             divergence: Tensor::zeros([1], device),
         }
+    }
+
+    fn add_weighted(
+        &mut self,
+        entropy: Tensor<B, 1>,
+        divergence: Tensor<B, 1>,
+        clip_fraction: Tensor<B, 1>,
+        policy_loss: Tensor<B, 1>,
+        value_loss: Tensor<B, 1>,
+        weight: f32,
+    ) {
+        self.entropy = self.entropy.clone() + entropy * weight;
+        self.divergence = self.divergence.clone() + divergence * weight;
+        self.clip_fraction = self.clip_fraction.clone() + clip_fraction * weight;
+        self.policy_loss = self.policy_loss.clone() + policy_loss * weight;
+        self.value_loss = self.value_loss.clone() + value_loss * weight;
     }
 }
 

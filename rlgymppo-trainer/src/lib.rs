@@ -137,13 +137,13 @@ pub fn default_config<B: AutodiffBackend>(
     // Samples collected before each PPO update. Larger values reduce per-update
     // overhead but use more CPU memory and make policy updates less frequent.
     let timesteps_per_iteration = 100_000;
-    // CPU-to-GPU chunk size. Use the largest value that fits VRAM. When it matches
-    // `timesteps_per_iteration`, the full rollout is uploaded once and reused across
-    // all epochs; otherwise each chunk is uploaded and trained separately.
-    let gpu_timestep_buffer_size = timesteps_per_iteration;
-    // Samples per forward/backward/optimizer update. Increase for GPU throughput;
-    // decrease when training runs out of VRAM or learning becomes less stable.
+    // Effective samples per optimizer update. Gradients from its mini-batches are
+    // accumulated before one update.
+    let batch_size = timesteps_per_iteration;
+    // Samples per forward/backward pass. Decrease when training runs out of VRAM.
     let mini_batch_size = 20_000;
+    // CPU-to-GPU staging capacity. It must be at least `batch_size`.
+    let gpu_timestep_buffer_size = timesteps_per_iteration;
     // Inference-only batch for critic bootstrapping at truncated trajectories.
     // It can usually be larger than `mini_batch_size` because it holds no gradients.
     let truncation_value_batch_size = timesteps_per_iteration;
@@ -157,8 +157,9 @@ pub fn default_config<B: AutodiffBackend>(
         checkpoints_limit: Some(10),
         ppo: PpoLearnerConfig {
             timesteps_per_iteration,
-            gpu_timestep_buffer_size,
+            batch_size,
             mini_batch_size,
+            gpu_timestep_buffer_size,
             truncation_value_batch_size,
             epochs: 1,
             learning_rate: lr,

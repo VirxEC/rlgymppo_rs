@@ -4,7 +4,7 @@ pub mod self_play;
 pub mod skill_tracker;
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use burn::module::AutodiffModule;
 use burn::nn::loss::{MseLoss, Reduction};
@@ -264,23 +264,70 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         metrics["GAE/returns STD"] = (stats.return_stat.get_std() as f64).into();
 
         let mut metric_totals = MetricTotals::new(&self.device);
+        let training_start = Instant::now();
+        let mut batch_staging_time = Duration::ZERO;
+        let mut batch_training_time = Duration::ZERO;
 
-        let mut rollout_order = memory_indices;
-        for _ in 0..self.config.epochs {
-            rollout_order.shuffle(rng);
+        if effective_batch_size <= self.config.gpu_timestep_buffer_size {
+            // Keep the entire rollout on the GPU and only reorder it once per epoch.
+            let staging_start = Instant::now();
+            let rollout = GpuBatch::from_memory(
+                memory,
+                &memory_indices,
+                &advantages,
+                &target_vals,
+                &self.device,
+            );
+            batch_staging_time += staging_start.elapsed();
+            let mut rollout_order = memory_indices;
+            for _ in 0..self.config.epochs {
+                rollout_order.shuffle(rng);
+                let staging_start = Instant::now();
+                let shuffled_rollout = rollout.select(&rollout_order, &self.device);
+                batch_staging_time += staging_start.elapsed();
 
-            for batch_indices in rollout_order.chunks(self.config.batch_size) {
-                let batch = GpuBatch::from_memory(
-                    memory,
-                    batch_indices,
-                    &advantages,
-                    &target_vals,
-                    &self.device,
-                );
-                let mut batch_order = (0..batch.len()).collect::<Vec<_>>();
-                self.train_gpu_batch(&mut net, &batch, &mut batch_order, rng, &mut metric_totals);
+                for batch_start in (0..effective_batch_size).step_by(self.config.batch_size) {
+                    let batch_end =
+                        (batch_start + self.config.batch_size).min(effective_batch_size);
+                    let training_start = Instant::now();
+                    self.train_gpu_batch(
+                        &mut net,
+                        &shuffled_rollout.slice(batch_start..batch_end),
+                        &mut metric_totals,
+                    );
+                    batch_training_time += training_start.elapsed();
+                }
+            }
+        } else {
+            let mut rollout_order = memory_indices;
+            for _ in 0..self.config.epochs {
+                rollout_order.shuffle(rng);
+
+                for batch_indices in rollout_order.chunks(self.config.batch_size) {
+                    // Gather and upload each effective batch once, then reorder it on-device.
+                    let staging_start = Instant::now();
+                    let batch = GpuBatch::from_memory(
+                        memory,
+                        batch_indices,
+                        &advantages,
+                        &target_vals,
+                        &self.device,
+                    );
+                    let mut batch_order = (0..batch.len()).collect::<Vec<_>>();
+                    batch_order.shuffle(rng);
+                    let shuffled_batch = batch.select(&batch_order, &self.device);
+                    batch_staging_time += staging_start.elapsed();
+
+                    let training_start = Instant::now();
+                    self.train_gpu_batch(&mut net, &shuffled_batch, &mut metric_totals);
+                    batch_training_time += training_start.elapsed();
+                }
             }
         }
+
+        metrics["PPO/training time"] = training_start.elapsed().as_secs_f64().into();
+        metrics["PPO/batch staging time"] = batch_staging_time.as_secs_f64().into();
+        metrics["PPO/batch training time"] = batch_training_time.as_secs_f64().into();
 
         stats.cumulative_timesteps += effective_batch_size as u64;
         stats.cumulative_epochs += self.config.epochs as u64;
@@ -339,42 +386,43 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         (net, effective_batch_size)
     }
 
-    fn train_gpu_batch<R: Rng>(
+    fn train_gpu_batch(
         &mut self,
         net: &mut Actic<B>,
         batch: &GpuBatch<B>,
-        batch_order: &mut [usize],
-        rng: &mut R,
         metric_totals: &mut MetricTotals<B>,
     ) {
-        batch_order.shuffle(rng);
-
         let mut actor_gradients = GradientsAccumulator::new();
         let mut critic_gradients = GradientsAccumulator::new();
         let mut shared_head_gradients = GradientsAccumulator::new();
 
         for mini_batch_start in (0..batch.len()).step_by(self.config.mini_batch_size) {
             let mini_batch_end = (mini_batch_start + self.config.mini_batch_size).min(batch.len());
-            let indices = Tensor::<B, 1, Int>::from_data(
-                TensorData::new(
-                    batch_order[mini_batch_start..mini_batch_end]
-                        .iter()
-                        .map(|&index| index as i64)
-                        .collect::<Vec<_>>(),
-                    [mini_batch_end - mini_batch_start],
-                ),
-                &self.device,
-            );
 
-            let state_batch = batch.states.clone().select(0, indices.clone());
-            let action_batch = batch.actions.clone().select(0, indices.clone());
-            let old_log_probs_batch = batch.old_log_probs.clone().select(0, indices.clone());
-            let advantage_batch = batch.advantages.clone().select(0, indices.clone());
-            let target_vals_batch = batch.target_vals.clone().select(0, indices.clone());
+            let state_batch = batch
+                .states
+                .clone()
+                .slice_dim(0, mini_batch_start..mini_batch_end);
+            let action_batch = batch
+                .actions
+                .clone()
+                .slice_dim(0, mini_batch_start..mini_batch_end);
+            let old_log_probs_batch = batch
+                .old_log_probs
+                .clone()
+                .slice_dim(0, mini_batch_start..mini_batch_end);
+            let advantage_batch = batch
+                .advantages
+                .clone()
+                .slice_dim(0, mini_batch_start..mini_batch_end);
+            let target_vals_batch = batch
+                .target_vals
+                .clone()
+                .slice_dim(0, mini_batch_start..mini_batch_end);
             let mask_batch = batch
                 .action_masks
                 .as_ref()
-                .map(|masks| masks.clone().select(0, indices));
+                .map(|masks| masks.clone().slice_dim(0, mini_batch_start..mini_batch_end));
 
             let PPOOutput {
                 log_probs: log_prob,
@@ -478,6 +526,45 @@ impl<B: Backend> GpuBatch<B> {
             target_vals: get_generic_batch(target_vals, indices, device),
             action_masks: (!memory.action_masks().is_empty())
                 .then(|| get_action_masks_batch(memory.action_masks(), indices, device)),
+        }
+    }
+
+    fn select(&self, indices: &[usize], device: &B::Device) -> Self {
+        let indices = Tensor::<B, 1, Int>::from_data(
+            TensorData::new(
+                indices
+                    .iter()
+                    .map(|&index| index as i64)
+                    .collect::<Vec<_>>(),
+                [indices.len()],
+            ),
+            device,
+        );
+
+        Self {
+            states: self.states.clone().select(0, indices.clone()),
+            actions: self.actions.clone().select(0, indices.clone()),
+            old_log_probs: self.old_log_probs.clone().select(0, indices.clone()),
+            advantages: self.advantages.clone().select(0, indices.clone()),
+            target_vals: self.target_vals.clone().select(0, indices.clone()),
+            action_masks: self
+                .action_masks
+                .as_ref()
+                .map(|masks| masks.clone().select(0, indices)),
+        }
+    }
+
+    fn slice(&self, range: std::ops::Range<usize>) -> Self {
+        Self {
+            states: self.states.clone().slice_dim(0, range.clone()),
+            actions: self.actions.clone().slice_dim(0, range.clone()),
+            old_log_probs: self.old_log_probs.clone().slice_dim(0, range.clone()),
+            advantages: self.advantages.clone().slice_dim(0, range.clone()),
+            target_vals: self.target_vals.clone().slice_dim(0, range.clone()),
+            action_masks: self
+                .action_masks
+                .as_ref()
+                .map(|masks| masks.clone().slice_dim(0, range)),
         }
     }
 

@@ -140,7 +140,7 @@ pub fn default_config<B: AutodiffBackend>(
     // CPU-to-GPU chunk size. Use the largest value that fits VRAM. When it matches
     // `timesteps_per_iteration`, the full rollout is uploaded once and reused across
     // all epochs; otherwise each chunk is uploaded and trained separately.
-    let batch_size = timesteps_per_iteration;
+    let gpu_timestep_buffer_size = timesteps_per_iteration;
     // Samples per forward/backward/optimizer update. Increase for GPU throughput;
     // decrease when training runs out of VRAM or learning becomes less stable.
     let mini_batch_size = 20_000;
@@ -157,7 +157,7 @@ pub fn default_config<B: AutodiffBackend>(
         checkpoints_limit: Some(10),
         ppo: PpoLearnerConfig {
             timesteps_per_iteration,
-            batch_size,
+            gpu_timestep_buffer_size,
             mini_batch_size,
             truncation_value_batch_size,
             epochs: 1,

@@ -22,16 +22,16 @@ pub struct PpoLearnerConfig {
     pub epochs: usize,
     /// Number of environment timesteps to collect before each training iteration.
     pub timesteps_per_iteration: usize,
-    /// Number of rollout samples transferred from CPU to GPU at once.
+    /// Number of rollout timesteps retained on the GPU at once during training.
     /// When this equals `timesteps_per_iteration`, the full rollout remains on the
     /// GPU and is reused across all epochs. This must divide `timesteps_per_iteration`.
-    pub batch_size: usize,
+    pub gpu_timestep_buffer_size: usize,
     /// Number of GPU-resident samples used per forward, backward, and optimizer step.
-    /// This must divide `batch_size`.
+    /// This must divide `gpu_timestep_buffer_size`.
     pub mini_batch_size: usize,
     /// Number of truncation next-state observations evaluated by the critic at once
-    /// when bootstrapping GAE. Set this to `batch_size` to use one contiguous
-    /// CPU-to-GPU upload whenever all truncation observations fit in one batch.
+    /// when bootstrapping GAE. Set this to `gpu_timestep_buffer_size` to use one
+    /// contiguous CPU-to-GPU upload whenever all truncation observations fit in one batch.
     pub truncation_value_batch_size: usize,
     /// Extend the last batch to use all remaining experience when it's less than
     /// 2x the batch size.
@@ -71,7 +71,7 @@ impl Default for PpoLearnerConfig {
             learning_rate: 3e-4,
             epochs: 4,
             timesteps_per_iteration: 60_000,
-            batch_size: 60_000,
+            gpu_timestep_buffer_size: 60_000,
             mini_batch_size: 20_000,
             truncation_value_batch_size: 20_000,
             overbatching: true,
@@ -88,14 +88,14 @@ impl PpoLearnerConfig {
     /// Initialize with the default AdamW optimizer.
     pub fn init<B: AutodiffBackend>(self, device: B::Device) -> Ppo<B> {
         assert_eq!(
-            self.timesteps_per_iteration % self.batch_size,
+            self.timesteps_per_iteration % self.gpu_timestep_buffer_size,
             0,
-            "Timesteps per iteration must be divisible by batch size"
+            "Timesteps per iteration must be divisible by GPU timestep buffer size"
         );
         assert_eq!(
-            self.batch_size % self.mini_batch_size,
+            self.gpu_timestep_buffer_size % self.mini_batch_size,
             0,
-            "Batch size must be divisible by mini batch size"
+            "GPU timestep buffer size must be divisible by mini batch size"
         );
 
         let clip_grad = self.clip_grad.clone();
@@ -118,14 +118,14 @@ impl PpoLearnerConfig {
         make_optim: impl Fn() -> O,
     ) -> Ppo<B, O> {
         assert_eq!(
-            self.timesteps_per_iteration % self.batch_size,
+            self.timesteps_per_iteration % self.gpu_timestep_buffer_size,
             0,
-            "Timesteps per iteration must be divisible by batch size"
+            "Timesteps per iteration must be divisible by GPU timestep buffer size"
         );
         assert_eq!(
-            self.batch_size % self.mini_batch_size,
+            self.gpu_timestep_buffer_size % self.mini_batch_size,
             0,
-            "Batch size must be divisible by mini batch size"
+            "GPU timestep buffer size must be divisible by mini batch size"
         );
 
         Ppo::new(self, device, make_optim)

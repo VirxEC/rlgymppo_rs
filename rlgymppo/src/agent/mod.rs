@@ -161,7 +161,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         // non-autodiff model clone so no gradient graph accumulates.
         let old_values = {
             let nodiff_net = net.valid();
-            let mb = self.config.batch_size;
+            let mb = self.config.gpu_timestep_buffer_size;
             let n = effective_batch_size;
             let mut values = Vec::with_capacity(n);
             for start in (0..n).step_by(mb) {
@@ -266,7 +266,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
         let mut metric_totals = MetricTotals::new(&self.device);
 
-        if self.config.batch_size == effective_batch_size {
+        if self.config.gpu_timestep_buffer_size == effective_batch_size {
             // Upload the complete rollout once, then train all mini-batches in each epoch.
             let batch = GpuBatch::from_memory_range(
                 memory,
@@ -288,8 +288,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 );
             }
         } else {
-            for batch_start in (0..effective_batch_size).step_by(self.config.batch_size) {
-                let batch_end = (batch_start + self.config.batch_size).min(effective_batch_size);
+            for batch_start in
+                (0..effective_batch_size).step_by(self.config.gpu_timestep_buffer_size)
+            {
+                let batch_end =
+                    (batch_start + self.config.gpu_timestep_buffer_size).min(effective_batch_size);
                 let batch_indices = &memory_indices[batch_start..batch_end];
                 let batch = GpuBatch::from_memory(
                     memory,

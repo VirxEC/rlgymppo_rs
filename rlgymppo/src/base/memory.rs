@@ -20,9 +20,9 @@ pub fn get_states_batch<B: Backend>(
     device: &B::Device,
 ) -> Tensor<B, 2> {
     let shape = [indices.len(), data[0].len()];
-    let mut states: Vec<f32> = Vec::with_capacity(shape[0] * shape[1]);
-    for &i in indices {
-        states.extend(&data[i]);
+    let mut states = vec![0.0; shape[0] * shape[1]];
+    for (row, &i) in states.chunks_exact_mut(shape[1]).zip(indices) {
+        row.copy_from_slice(&data[i]);
     }
 
     Tensor::from_data(TensorData::new(states, shape), device)
@@ -35,9 +35,9 @@ pub fn get_states_batch_range<B: Backend>(
     device: &B::Device,
 ) -> Tensor<B, 2> {
     let width = data[0].len();
-    let mut states: Vec<f32> = Vec::with_capacity((end - start) * width);
-    for i in start..end {
-        states.extend(&data[i]);
+    let mut states = vec![0.0; (end - start) * width];
+    for (row, i) in states.chunks_exact_mut(width).zip(start..end) {
+        row.copy_from_slice(&data[i]);
     }
     Tensor::from_data(TensorData::new(states, [end - start, width]), device)
 }
@@ -89,10 +89,10 @@ pub fn get_action_masks_batch<B: Backend>(
     device: &B::Device,
 ) -> Tensor<B, 2> {
     let shape = [indices.len(), data[0].len()];
-    let mut masks: Vec<f32> = Vec::with_capacity(shape[0] * shape[1]);
-    for &i in indices {
-        for &v in &data[i] {
-            masks.push(if v { 1.0 } else { 0.0 });
+    let mut masks = vec![0.0; shape[0] * shape[1]];
+    for (row, &i) in masks.chunks_exact_mut(shape[1]).zip(indices) {
+        for (mask, &valid) in row.iter_mut().zip(&data[i]) {
+            *mask = valid as u8 as f32;
         }
     }
 

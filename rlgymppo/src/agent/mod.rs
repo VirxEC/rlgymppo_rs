@@ -143,14 +143,14 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         // When overbatching, use ALL collected experience (the memory may have
         // slightly more entries than `timesteps_per_iteration` due to the ceil
         // division in thread_sim, or due to truncation next-states).
-        let effective_batch_size =
+        let rollout_size =
             if self.config.overbatching && memory.len() > self.config.timesteps_per_iteration {
                 memory.len()
             } else {
                 self.config.timesteps_per_iteration
             };
 
-        let memory_indices = (0..effective_batch_size).collect::<Vec<_>>();
+        let memory_indices = (0..rollout_size).collect::<Vec<_>>();
 
         // Snapshot parameters before training for update-magnitude computation.
         let actor_params_before = flatten_net(&net.actor);
@@ -161,7 +161,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let old_values = {
             let nodiff_net = net.valid();
             let mb = self.config.gpu_timestep_buffer_size;
-            let n = effective_batch_size;
+            let n = rollout_size;
             let mut values = Vec::with_capacity(n);
             for start in (0..n).step_by(mb) {
                 let end = (start + mb).min(n);
@@ -268,7 +268,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let mut batch_staging_time = Duration::ZERO;
         let mut batch_training_time = Duration::ZERO;
 
-        if effective_batch_size <= self.config.gpu_timestep_buffer_size {
+        if rollout_size <= self.config.gpu_timestep_buffer_size {
             // Keep the entire rollout on the GPU and only reorder it once per epoch.
             let staging_start = Instant::now();
             let rollout = GpuBatch::from_memory(
@@ -282,17 +282,13 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             let mut rollout_order = memory_indices;
             for _ in 0..self.config.epochs {
                 rollout_order.shuffle(rng);
-                let staging_start = Instant::now();
-                let shuffled_rollout = rollout.select(&rollout_order, &self.device);
-                batch_staging_time += staging_start.elapsed();
 
-                for batch_start in (0..effective_batch_size).step_by(self.config.batch_size) {
-                    let batch_end =
-                        (batch_start + self.config.batch_size).min(effective_batch_size);
+                for batch_indices in rollout_order.chunks(self.config.batch_size) {
                     let training_start = Instant::now();
-                    self.train_gpu_batch(
+                    self.train_gpu_batch_indices(
                         &mut net,
-                        &shuffled_rollout.slice(batch_start..batch_end),
+                        &rollout,
+                        batch_indices,
                         &mut metric_totals,
                     );
                     batch_training_time += training_start.elapsed();
@@ -304,7 +300,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 rollout_order.shuffle(rng);
 
                 for batch_indices in rollout_order.chunks(self.config.batch_size) {
-                    // Gather and upload each effective batch once, then reorder it on-device.
+                    // Upload the selected samples once, then gather only one mini-batch at a time.
                     let staging_start = Instant::now();
                     let batch = GpuBatch::from_memory(
                         memory,
@@ -313,13 +309,16 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                         &target_vals,
                         &self.device,
                     );
-                    let mut batch_order = (0..batch.len()).collect::<Vec<_>>();
-                    batch_order.shuffle(rng);
-                    let shuffled_batch = batch.select(&batch_order, &self.device);
                     batch_staging_time += staging_start.elapsed();
 
+                    let batch_order = (0..batch.len()).collect::<Vec<_>>();
                     let training_start = Instant::now();
-                    self.train_gpu_batch(&mut net, &shuffled_batch, &mut metric_totals);
+                    self.train_gpu_batch_indices(
+                        &mut net,
+                        &batch,
+                        &batch_order,
+                        &mut metric_totals,
+                    );
                     batch_training_time += training_start.elapsed();
                 }
             }
@@ -329,13 +328,12 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         metrics["PPO/batch staging time"] = batch_staging_time.as_secs_f64().into();
         metrics["PPO/batch training time"] = batch_training_time.as_secs_f64().into();
 
-        stats.cumulative_timesteps += effective_batch_size as u64;
+        stats.cumulative_timesteps += rollout_size as u64;
         stats.cumulative_epochs += self.config.epochs as u64;
         stats.cumulative_model_updates += 1;
 
-        let batch_iters = 1
-            .max(effective_batch_size.div_ceil(self.config.batch_size) * self.config.epochs)
-            as f32;
+        let batch_iters =
+            1.max(rollout_size.div_ceil(self.config.batch_size) * self.config.epochs) as f32;
 
         // Synchronize the accumulated scalar metrics only once after all epochs.
         let [entropy_data, kl_data, clip_data, policy_data, critic_data] = Transaction::default()
@@ -383,107 +381,136 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             metrics["Loss/value"] = mean_val_loss.into();
         }
 
-        (net, effective_batch_size)
+        (net, rollout_size)
     }
 
-    fn train_gpu_batch(
+    fn train_gpu_batch_indices(
         &mut self,
         net: &mut Actic<B>,
         batch: &GpuBatch<B>,
+        indices: &[usize],
         metric_totals: &mut MetricTotals<B>,
     ) {
         let mut actor_gradients = GradientsAccumulator::new();
         let mut critic_gradients = GradientsAccumulator::new();
         let mut shared_head_gradients = GradientsAccumulator::new();
 
-        for mini_batch_start in (0..batch.len()).step_by(self.config.mini_batch_size) {
-            let mini_batch_end = (mini_batch_start + self.config.mini_batch_size).min(batch.len());
+        for mini_batch_indices in indices.chunks(self.config.mini_batch_size) {
+            let mini_batch = batch.select(mini_batch_indices, &self.device);
+            let mini_batch_len = mini_batch.len();
 
-            let state_batch = batch
-                .states
-                .clone()
-                .slice_dim(0, mini_batch_start..mini_batch_end);
-            let action_batch = batch
-                .actions
-                .clone()
-                .slice_dim(0, mini_batch_start..mini_batch_end);
-            let old_log_probs_batch = batch
-                .old_log_probs
-                .clone()
-                .slice_dim(0, mini_batch_start..mini_batch_end);
-            let advantage_batch = batch
-                .advantages
-                .clone()
-                .slice_dim(0, mini_batch_start..mini_batch_end);
-            let target_vals_batch = batch
-                .target_vals
-                .clone()
-                .slice_dim(0, mini_batch_start..mini_batch_end);
-            let mask_batch = batch
-                .action_masks
-                .as_ref()
-                .map(|masks| masks.clone().slice_dim(0, mini_batch_start..mini_batch_end));
+            let state_batch = mini_batch.states;
+            let action_batch = mini_batch.actions;
+            let old_log_probs_batch = mini_batch.old_log_probs;
+            let advantage_batch = mini_batch.advantages;
+            let target_vals_batch = mini_batch.target_vals;
+            let mask_batch = mini_batch.action_masks;
 
-            let PPOOutput {
-                log_probs: log_prob,
-                values: value_batch,
-            } = net.forward(state_batch, mask_batch);
-
-            let num_actions = log_prob.shape().dims::<2>()[1];
-            let entropy_per_sample =
-                -(log_prob.clone() * log_prob.clone().exp()).sum_dim(1) / (num_actions as f32).ln();
-            let entropy = entropy_per_sample.mean();
-
-            let action_log_prob = log_prob.gather(1, action_batch.clone());
-            let log_prob_diff = action_log_prob - old_log_probs_batch;
-            let ratios = log_prob_diff.clone().exp();
-            let clipped_ratios = ratios
-                .clone()
-                .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
-            let kl_mean = ((ratios.clone() - 1.0) - log_prob_diff).mean();
-            let clip_fraction = (ratios.clone() - 1.0)
-                .abs()
-                .greater_elem(self.config.clip_range)
-                .float()
-                .mean();
-            let actor_loss = -(ratios * advantage_batch.clone())
-                .min_pair(clipped_ratios * advantage_batch)
-                .mean();
-
-            let mini_batch_weight = (mini_batch_end - mini_batch_start) as f32 / batch.len() as f32;
-            let ppo_loss = actor_loss.clone() - entropy.clone() * self.config.entropy_scale;
-            let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
-
-            let metric_entropy = entropy.detach();
-            let metric_kl = kl_mean.detach();
-            let metric_clip_fraction = clip_fraction.detach();
-            let metric_actor_loss = actor_loss.detach();
-            let metric_critic_loss = critic_loss.clone().detach();
-
-            let mut grads = ((ppo_loss + critic_loss) * mini_batch_weight).backward();
-            actor_gradients.accumulate(
-                &net.actor,
-                GradientsParams::from_module(&mut grads, &net.actor),
-            );
-            critic_gradients.accumulate(
-                &net.critic,
-                GradientsParams::from_module(&mut grads, &net.critic),
-            );
-            if let Some(head) = net.shared_head.as_ref() {
-                shared_head_gradients
-                    .accumulate(head, GradientsParams::from_module(&mut grads, head));
-            }
-
-            metric_totals.add_weighted(
-                metric_entropy,
-                metric_kl,
-                metric_clip_fraction,
-                metric_actor_loss,
-                metric_critic_loss,
-                mini_batch_weight,
+            self.train_mini_batch(
+                net,
+                state_batch,
+                action_batch,
+                old_log_probs_batch,
+                advantage_batch,
+                target_vals_batch,
+                mask_batch,
+                mini_batch_len as f32 / indices.len() as f32,
+                &mut actor_gradients,
+                &mut critic_gradients,
+                &mut shared_head_gradients,
+                metric_totals,
             );
         }
 
+        self.step_optimizers(
+            net,
+            actor_gradients,
+            critic_gradients,
+            shared_head_gradients,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn train_mini_batch(
+        &self,
+        net: &Actic<B>,
+        state_batch: Tensor<B, 2>,
+        action_batch: Tensor<B, 2, Int>,
+        old_log_probs_batch: Tensor<B, 2>,
+        advantage_batch: Tensor<B, 2>,
+        target_vals_batch: Tensor<B, 2>,
+        mask_batch: Option<Tensor<B, 2>>,
+        mini_batch_weight: f32,
+        actor_gradients: &mut GradientsAccumulator<Net<B>>,
+        critic_gradients: &mut GradientsAccumulator<Net<B>>,
+        shared_head_gradients: &mut GradientsAccumulator<Net<B>>,
+        metric_totals: &mut MetricTotals<B>,
+    ) {
+        let PPOOutput {
+            log_probs: log_prob,
+            values: value_batch,
+        } = net.forward(state_batch, mask_batch);
+
+        let num_actions = log_prob.shape().dims::<2>()[1];
+        let entropy_per_sample =
+            -(log_prob.clone() * log_prob.clone().exp()).sum_dim(1) / (num_actions as f32).ln();
+        let entropy = entropy_per_sample.mean();
+
+        let action_log_prob = log_prob.gather(1, action_batch.clone());
+        let log_prob_diff = action_log_prob - old_log_probs_batch;
+        let ratios = log_prob_diff.clone().exp();
+        let clipped_ratios = ratios
+            .clone()
+            .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
+        let kl_mean = ((ratios.clone() - 1.0) - log_prob_diff).mean();
+        let clip_fraction = (ratios.clone() - 1.0)
+            .abs()
+            .greater_elem(self.config.clip_range)
+            .float()
+            .mean();
+        let actor_loss = -(ratios * advantage_batch.clone())
+            .min_pair(clipped_ratios * advantage_batch)
+            .mean();
+
+        let ppo_loss = actor_loss.clone() - entropy.clone() * self.config.entropy_scale;
+        let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
+
+        let metric_entropy = entropy.detach();
+        let metric_kl = kl_mean.detach();
+        let metric_clip_fraction = clip_fraction.detach();
+        let metric_actor_loss = actor_loss.detach();
+        let metric_critic_loss = critic_loss.clone().detach();
+
+        let mut grads = ((ppo_loss + critic_loss) * mini_batch_weight).backward();
+        actor_gradients.accumulate(
+            &net.actor,
+            GradientsParams::from_module(&mut grads, &net.actor),
+        );
+        critic_gradients.accumulate(
+            &net.critic,
+            GradientsParams::from_module(&mut grads, &net.critic),
+        );
+        if let Some(head) = net.shared_head.as_ref() {
+            shared_head_gradients.accumulate(head, GradientsParams::from_module(&mut grads, head));
+        }
+
+        metric_totals.add_weighted(
+            metric_entropy,
+            metric_kl,
+            metric_clip_fraction,
+            metric_actor_loss,
+            metric_critic_loss,
+            mini_batch_weight,
+        );
+    }
+
+    fn step_optimizers(
+        &mut self,
+        net: &mut Actic<B>,
+        mut actor_gradients: GradientsAccumulator<Net<B>>,
+        mut critic_gradients: GradientsAccumulator<Net<B>>,
+        mut shared_head_gradients: GradientsAccumulator<Net<B>>,
+    ) {
         let lr = self.config.learning_rate.into();
         net.actor = self
             .policy_optimizer
@@ -551,20 +578,6 @@ impl<B: Backend> GpuBatch<B> {
                 .action_masks
                 .as_ref()
                 .map(|masks| masks.clone().select(0, indices)),
-        }
-    }
-
-    fn slice(&self, range: std::ops::Range<usize>) -> Self {
-        Self {
-            states: self.states.clone().slice_dim(0, range.clone()),
-            actions: self.actions.clone().slice_dim(0, range.clone()),
-            old_log_probs: self.old_log_probs.clone().slice_dim(0, range.clone()),
-            advantages: self.advantages.clone().slice_dim(0, range.clone()),
-            target_vals: self.target_vals.clone().slice_dim(0, range.clone()),
-            action_masks: self
-                .action_masks
-                .as_ref()
-                .map(|masks| masks.clone().slice_dim(0, range)),
         }
     }
 

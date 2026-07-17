@@ -562,7 +562,7 @@ fn should_track_metric_history(key: &str, fresh_rating: bool) -> bool {
     (fresh_rating && group == "Rating")
         || matches!(group, "Loss" | "GAE" | "Update")
         || matches!(key, "Collect/avg step reward" | "Collect/episode length")
-        || is_custom_sparkline_group(group)
+        || (group != "PPO" && is_custom_sparkline_group(group))
 }
 
 fn is_custom_sparkline_group(group: &str) -> bool {

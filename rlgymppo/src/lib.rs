@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use agent::Ppo;
 pub use agent::config::PpoLearnerConfig;
-pub use agent::model::{Actic, Net};
+pub use agent::model::{Actic, Net, linear_weight_param_ids};
 pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
 pub use agent::skill_tracker::SkillTrackerConfig;
@@ -27,7 +27,7 @@ use burn::module::{AutodiffModule, Module, Quantizer};
 use burn::nn::modules::norm::NormalizationConfig;
 use burn::nn::{LayerNormConfig, RmsNormConfig};
 use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{Adam, AdamConfig, AdamW, AdamWConfig, SimpleOptimizer};
+use burn::optim::{Adam, AdamConfig, AdamW, AdamWConfig, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
 use environment::render::{Renderer, RendererControls};
 use environment::sim::RewardSamplingConfig;
@@ -383,13 +383,46 @@ pub enum NormSelection {
     RmsNorm,
 }
 
+/// Optimizer adaptor used by the default AdamW configuration.
+pub type AdamWOptimizer<B> = OptimizerAdaptor<AdamW, Net<B>, B>;
+
+/// Optimizer adaptor used by the default Adam configuration.
+pub type AdamOptimizer<B> = OptimizerAdaptor<Adam, Net<B>, B>;
+
+/// Identifies the network being optimized by a model-aware optimizer factory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptimizerNetwork {
+    /// The policy/action network, including its output layer.
+    Policy,
+    /// The value network, including its output layer.
+    Value,
+    /// The optional shared feature-extractor network.
+    SharedHead,
+}
+
 /// A stored optimizer factory inside [`LearnerConfig`].
 ///
 /// The closure is called three times during `init()` (once per sub-network)
-/// and must return a freshly created [`OptimizerAdaptor`] each time.
-pub type MakeOptim<B, O> = Box<dyn Fn() -> OptimizerAdaptor<O, Net<B>, B>>;
+/// and must return a freshly created optimizer each time.
+pub type MakeOptim<O> = Box<dyn Fn() -> O>;
 
-pub struct LearnerConfig<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend> = AdamW> {
+/// A model-aware optimizer factory. The closure receives the network and its
+/// role, allowing parameter IDs to be grouped differently for output heads.
+pub type MakeOptimForNet<B, O> = Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O>;
+
+/// Returns a factory for the default Adam optimizer used by the previous
+/// `LearnerConfig::<B, AdamOptimizer<B>>::default()`.
+pub fn default_adam_optimizer<B: AutodiffBackend>() -> MakeOptim<AdamOptimizer<B>> {
+    Box::new(|| AdamConfig::new().with_epsilon(1e-8).init())
+}
+
+/// Returns a factory for the default AdamW optimizer used by the previous
+/// `LearnerConfig::<B, AdamWOptimizer<B>>::default()`.
+pub fn default_adamw_optimizer<B: AutodiffBackend>() -> MakeOptim<AdamWOptimizer<B>> {
+    Box::new(|| AdamWConfig::new().with_epsilon(1e-8).init())
+}
+
+pub struct LearnerConfig<B: AutodiffBackend> {
     /// Hyperparameters for the PPO learner.
     pub ppo: PpoLearnerConfig,
     /// Where to load/save checkpoints.
@@ -452,78 +485,95 @@ pub struct LearnerConfig<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>
     pub wandb_group_name: Option<String>,
     /// Run name for wandb (default: `"rlgymppo-run"`).
     pub wandb_run_name: Option<String>,
+}
 
-    /// Factory that creates the optimizer.
+impl<B: AutodiffBackend> Default for LearnerConfig<B> {
+    fn default() -> Self {
+        Self {
+            ppo: PpoLearnerConfig::default(),
+            checkpoints_folder: PathBuf::from("checkpoints"),
+            device: B::Device::default(),
+            quantizer: None,
+            render_device: B::Device::default(),
+            skill_tracker_device: None,
+            policy_layer_sizes: vec![256; 3],
+            critic_layer_sizes: vec![256; 3],
+            norm: NormSelection::RmsNorm,
+            shared_head_layer_sizes: vec![256],
+            checkpoints_limit: None,
+            timesteps_per_save: 1_000_000,
+            num_threads: 4,
+            num_games_per_thread: 64,
+            num_additional_iterations: None,
+            render: false,
+            self_play: SelfPlayConfig::default(),
+            skill_tracker: SkillTrackerConfig::default(),
+            wandb_project_name: None,
+            wandb_group_name: None,
+            wandb_run_name: None,
+        }
+    }
+}
+
+impl<B: AutodiffBackend> LearnerConfig<B> {
+    /// Initialize a [`Learner`] with a simple optimizer factory.
     ///
-    /// Called three times during `init()` (once per sub-network).
-    /// Set via [`LearnerConfig::with_optimizer`]; defaults to AdamW.
-    pub make_optim: MakeOptim<B, O>,
-}
-
-impl<B: AutodiffBackend> Default for LearnerConfig<B, Adam> {
-    fn default() -> Self {
-        Self {
-            ppo: PpoLearnerConfig::default(),
-            checkpoints_folder: PathBuf::from("checkpoints"),
-            device: B::Device::default(),
-            quantizer: None,
-            render_device: B::Device::default(),
-            skill_tracker_device: None,
-            policy_layer_sizes: vec![256; 3],
-            critic_layer_sizes: vec![256; 3],
-            norm: NormSelection::RmsNorm,
-            shared_head_layer_sizes: vec![256],
-            checkpoints_limit: None,
-            timesteps_per_save: 1_000_000,
-            num_threads: 4,
-            num_games_per_thread: 64,
-            num_additional_iterations: None,
-            render: false,
-            self_play: SelfPlayConfig::default(),
-            skill_tracker: SkillTrackerConfig::default(),
-            wandb_project_name: None,
-            wandb_group_name: None,
-            wandb_run_name: None,
-            make_optim: Box::new(|| AdamConfig::new().with_epsilon(1e-8).init()),
-        }
-    }
-}
-
-impl<B: AutodiffBackend> Default for LearnerConfig<B, AdamW> {
-    fn default() -> Self {
-        Self {
-            ppo: PpoLearnerConfig::default(),
-            checkpoints_folder: PathBuf::from("checkpoints"),
-            device: B::Device::default(),
-            quantizer: None,
-            render_device: B::Device::default(),
-            skill_tracker_device: None,
-            policy_layer_sizes: vec![256; 3],
-            critic_layer_sizes: vec![256; 3],
-            norm: NormSelection::RmsNorm,
-            shared_head_layer_sizes: vec![256],
-            checkpoints_limit: None,
-            timesteps_per_save: 1_000_000,
-            num_threads: 4,
-            num_games_per_thread: 64,
-            num_additional_iterations: None,
-            render: false,
-            self_play: SelfPlayConfig::default(),
-            skill_tracker: SkillTrackerConfig::default(),
-            wandb_project_name: None,
-            wandb_group_name: None,
-            wandb_run_name: None,
-            make_optim: Box::new(|| AdamWConfig::new().with_epsilon(1e-8).init()),
-        }
-    }
-}
-
-impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> LearnerConfig<B, O> {
-    pub fn init<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+    /// The `make_optim` closure is called three times (once per sub-network)
+    /// and must return a freshly created optimizer each time.
+    pub fn init<O, F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         self,
         create_env: F,
+        make_optim: MakeOptim<O>,
     ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
+        O: Optimizer<Net<B>, B>,
+        F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        SS: StateSetter<SI>,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+        OBS: Obs<SI>,
+        ACT: Action<SI, Input = usize>,
+        REW: Reward<SI>,
+        TERM: Terminal<SI>,
+        TRUNC: Truncate<SI>,
+    {
+        self.init_internal(create_env, |device, ppo, _model| {
+            ppo.init_with(device, make_optim)
+        })
+    }
+
+    /// Initialize a [`Learner`] with a model-aware optimizer factory.
+    ///
+    /// The factory receives each sub-network identifier and the corresponding
+    /// [`Net`], allowing parameter-group optimizers such as Muon/AdamW hybrids
+    /// to select parameters by ID.
+    pub fn init_with_model<O, F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+        self,
+        create_env: F,
+        make_optim: MakeOptimForNet<B, O>,
+    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+    where
+        O: Optimizer<Net<B>, B>,
+        F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        SS: StateSetter<SI>,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+        OBS: Obs<SI>,
+        ACT: Action<SI, Input = usize>,
+        REW: Reward<SI>,
+        TERM: Terminal<SI>,
+        TRUNC: Truncate<SI>,
+    {
+        self.init_internal(create_env, |device, ppo, model| {
+            ppo.init_with_model(device, model, make_optim)
+        })
+    }
+
+    fn init_internal<O, F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+        self,
+        create_env: F,
+        build_ppo: impl FnOnce(B::Device, PpoLearnerConfig, &Actic<B>) -> Ppo<B, O>,
+    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+    where
+        O: Optimizer<Net<B>, B>,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         SS: StateSetter<SI>,
         SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
@@ -638,8 +688,10 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> LearnerConfig<B, O
             self_play_config.clone(),
         );
 
+        let ppo = build_ppo(self.device.clone(), self.ppo, &model);
+
         Learner {
-            ppo: self.ppo.init_with(self.device.clone(), self.make_optim),
+            ppo,
             rng: SmallRng::from_rng(&mut rng()),
             stats: Stats::default(),
             device: self.device,
@@ -664,17 +716,8 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> LearnerConfig<B, O
     }
 }
 
-pub struct Learner<
-    B: AutodiffBackend,
-    O: SimpleOptimizer<B::InnerBackend>,
-    SS,
-    OBS,
-    ACT,
-    REW,
-    TERM,
-    TRUNC,
-    SI,
-> where
+pub struct Learner<B: AutodiffBackend, O: Optimizer<Net<B>, B>, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+where
     SS: StateSetter<SI>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
     OBS: Obs<SI>,
@@ -711,7 +754,7 @@ pub struct Learner<
     collector: ThreadSim<B::InnerBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
 }
 
-impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>, SS, OBS, ACT, REW, TERM, TRUNC, SI>
     Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,

@@ -15,7 +15,7 @@ use rlgymppo::utils::terminal::{
 use rlgymppo::utils::{AvgTracker, Report, rewards};
 use rlgymppo::{
     LearnerConfig, PpoLearnerConfig, SelfPlayConfig, SkillTrackerConfig, any_terminal,
-    combined_rewards, weighted_state,
+    combined_rewards, default_adamw_optimizer, weighted_state,
 };
 
 pub struct SharedInfo {
@@ -207,7 +207,7 @@ pub fn run<B: AutodiffBackend>(
         skill_tracker_device,
         async_skill_tracker,
     )
-    .init(create_env);
+    .init(create_env, default_adamw_optimizer::<B>());
     learner.load();
     learner.learn();
 }

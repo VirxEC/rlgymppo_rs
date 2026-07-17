@@ -10,7 +10,7 @@ use burn::module::AutodiffModule;
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::nn::modules::norm::Normalization;
 use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{AdamW, GradientsParams, Optimizer, SimpleOptimizer};
+use burn::optim::{AdamW, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError};
 use burn::tensor::Transaction;
@@ -19,6 +19,7 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 use ringbuffer::RingBuffer;
 
+use crate::OptimizerNetwork;
 use crate::agent::config::PpoLearnerConfig;
 use crate::agent::model::{Actic, Net, PPOOutput};
 use crate::base::{
@@ -29,24 +30,36 @@ use crate::base::{
 use crate::utils::Report;
 use crate::utils::running_stat::Stats;
 
-pub struct Ppo<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend> = AdamW> {
+pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<AdamW, Net<B>, B>> {
     config: PpoLearnerConfig,
-    policy_optimizer: OptimizerAdaptor<O, Net<B>, B>,
-    value_optimizer: OptimizerAdaptor<O, Net<B>, B>,
-    shared_head_optimizer: OptimizerAdaptor<O, Net<B>, B>,
+    policy_optimizer: O,
+    value_optimizer: O,
+    shared_head_optimizer: O,
     device: B::Device,
 }
 
-impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
-    pub fn new(
-        config: PpoLearnerConfig,
-        device: B::Device,
-        make_optim: impl Fn() -> OptimizerAdaptor<O, Net<B>, B>,
-    ) -> Self {
+impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
+    pub fn new(config: PpoLearnerConfig, device: B::Device, make_optim: impl Fn() -> O) -> Self {
         Self {
             policy_optimizer: make_optim(),
             value_optimizer: make_optim(),
             shared_head_optimizer: make_optim(),
+            config,
+            device,
+        }
+    }
+
+    pub fn new_with_model(
+        config: PpoLearnerConfig,
+        device: B::Device,
+        model: &Actic<B>,
+        make_optim: impl Fn(OptimizerNetwork, &Net<B>) -> O,
+    ) -> Self {
+        let shared_head = model.shared_head.as_ref().unwrap_or(&model.actor);
+        Self {
+            policy_optimizer: make_optim(OptimizerNetwork::Policy, &model.actor),
+            value_optimizer: make_optim(OptimizerNetwork::Value, &model.critic),
+            shared_head_optimizer: make_optim(OptimizerNetwork::SharedHead, shared_head),
             config,
             device,
         }
@@ -89,9 +102,7 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
         #[cfg(not(feature = "tui"))]
         println!("Loading optimizer states...");
 
-        let try_load_optim = |name: &str,
-                              target: &mut OptimizerAdaptor<O, Net<B>, B>|
-         -> Result<(), RecorderError> {
+        let try_load_optim = |name: &str, target: &mut O| -> Result<(), RecorderError> {
             let record = recorder.load(folder.join(name), &self.device)?;
             *target = target.clone().load_record(record);
             Ok(())
@@ -120,7 +131,7 @@ impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
     }
 }
 
-impl<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>> Ppo<B, O> {
+impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     pub fn learn<R: Rng>(
         &mut self,
         mut net: Actic<B>,

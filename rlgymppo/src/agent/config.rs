@@ -1,10 +1,10 @@
 use burn::grad_clipping::GradientClippingConfig;
-use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{AdamWConfig, SimpleOptimizer};
+use burn::optim::{AdamWConfig, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
 
 use super::Ppo;
-use super::model::Net;
+use super::model::{Actic, Net};
+use crate::OptimizerNetwork;
 
 pub struct PpoLearnerConfig {
     pub gamma: f32,
@@ -111,11 +111,11 @@ impl PpoLearnerConfig {
     /// Initialize with a custom optimizer.
     ///
     /// The `make_optim` closure is called three times (once per sub-network)
-    /// and must return a freshly created [`OptimizerAdaptor`] each time.
-    pub fn init_with<B: AutodiffBackend, O: SimpleOptimizer<B::InnerBackend>>(
+    /// and must return a freshly created optimizer each time.
+    pub fn init_with<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
         self,
         device: B::Device,
-        make_optim: impl Fn() -> OptimizerAdaptor<O, Net<B>, B>,
+        make_optim: impl Fn() -> O,
     ) -> Ppo<B, O> {
         assert_eq!(
             self.timesteps_per_iteration % self.batch_size,
@@ -129,5 +129,29 @@ impl PpoLearnerConfig {
         );
 
         Ppo::new(self, device, make_optim)
+    }
+
+    /// Initialize with a custom optimizer factory that can inspect each network.
+    ///
+    /// The factory is called once for the actor, critic, and shared head. This
+    /// allows optimizers such as Muon/AdamW hybrids to select parameters by ID.
+    pub fn init_with_model<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
+        self,
+        device: B::Device,
+        model: &Actic<B>,
+        make_optim: impl Fn(OptimizerNetwork, &Net<B>) -> O,
+    ) -> Ppo<B, O> {
+        assert_eq!(
+            self.timesteps_per_iteration % self.batch_size,
+            0,
+            "Timesteps per iteration must be divisible by batch size"
+        );
+        assert_eq!(
+            self.batch_size % self.mini_batch_size,
+            0,
+            "Batch size must be divisible by mini batch size"
+        );
+
+        Ppo::new_with_model(self, device, model, make_optim)
     }
 }

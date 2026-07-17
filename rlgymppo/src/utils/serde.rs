@@ -2,14 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use burn::optim::SimpleOptimizer;
+use burn::optim::Optimizer;
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use burn::tensor::backend::AutodiffBackend;
 
 use super::running_stat::Stats;
 use crate::agent::Ppo;
-use crate::agent::model::Actic;
+use crate::agent::model::{Actic, Net};
 
 /// Save a model checkpoint (model weights + training stats).
 pub fn save_model<B: Backend, P: AsRef<Path>>(
@@ -86,7 +86,7 @@ pub fn save_model<B: Backend, P: AsRef<Path>>(
 /// uses the autodiff backend.
 pub fn save_checkpoint<
     BAutodiff: AutodiffBackend,
-    O: SimpleOptimizer<BAutodiff::InnerBackend>,
+    O: Optimizer<Net<BAutodiff>, BAutodiff>,
     P: AsRef<Path>,
 >(
     model: Actic<BAutodiff::InnerBackend>,

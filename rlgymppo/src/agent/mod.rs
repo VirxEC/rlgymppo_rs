@@ -223,7 +223,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let GAEOutput {
             returns,
             target_vals,
-            advantages,
+            mut advantages,
             rew_clip_portion,
         } = get_gae(
             old_values,
@@ -262,6 +262,18 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         }
 
         metrics["GAE/returns STD"] = (stats.return_stat.get_std() as f64).into();
+
+        // Optionally standardize advantages to zero mean and unit variance.
+        if self.config.standardize_advantages {
+            let mean = advantages.iter().sum::<f32>() / advantages.len() as f32;
+            let var = advantages.iter().map(|a| (a - mean).powi(2)).sum::<f32>()
+                / advantages.len() as f32;
+            let std = var.sqrt().max(f32::EPSILON);
+
+            for a in &mut advantages {
+                *a = (*a - mean) / std;
+            }
+        }
 
         let mut metric_totals = MetricTotals::new(&self.device);
         let training_start = Instant::now();
@@ -452,8 +464,12 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         } = net.forward(state_batch, mask_batch);
 
         let num_actions = log_prob.shape().dims::<2>()[1];
-        let entropy_per_sample =
-            -(log_prob.clone() * log_prob.clone().exp()).sum_dim(1) / (num_actions as f32).ln();
+        let entropy_sum = -(log_prob.clone() * log_prob.clone().exp()).sum_dim(1);
+        let entropy_per_sample = if self.config.normalize_entropy {
+            entropy_sum / (num_actions as f32).ln()
+        } else {
+            entropy_sum
+        };
         let entropy = entropy_per_sample.mean();
 
         let action_log_prob = log_prob.gather(1, action_batch.clone());

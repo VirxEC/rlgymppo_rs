@@ -11,9 +11,16 @@ pub struct PpoLearnerConfig {
     pub lambda: f32,
     pub clip_range: f32,
     pub reward_clip_range: f32,
-    /// Entropy scale (applied after dividing by ln(n_actions)).
+    /// Entropy scale (applied after dividing by ln(n_actions) when
+    /// `normalize_entropy` is true).
     pub entropy_scale: f32,
+    /// Divide entropy by ln(n_actions) so it lies in [0, 1].
+    /// When false, the raw entropy value is used.
+    pub normalize_entropy: bool,
     pub standardize_returns: bool,
+    /// Standardize advantages to zero mean and unit variance before each
+    /// training batch.
+    pub standardize_advantages: bool,
     pub max_returns_per_stats_increment: usize,
     pub clip_grad: Option<GradientClippingConfig>,
     /// Learning rate for the optimizer.
@@ -69,7 +76,9 @@ impl Default for PpoLearnerConfig {
             clip_range: 0.2,
             reward_clip_range: 10.,
             entropy_scale: 0.018,
+            normalize_entropy: true,
             standardize_returns: true,
+            standardize_advantages: false,
             max_returns_per_stats_increment: 150,
             learning_rate: 3e-4,
             epochs: 4,

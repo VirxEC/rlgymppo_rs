@@ -1,8 +1,13 @@
 //! Sends metrics to Weights & Biases via an embedded Python interpreter.
 //!
 //! Mirrors the C++ `MetricSender` which uses pybind11 to call into Python's
-//! `wandb` library.  This crate wraps `wandb.init()` and `wandb.log()` through
+//! `wandb` library. This crate wraps `wandb.init()` and `wandb.log()` through
 //! pyo3 so users don't need a separate Python script.
+//!
+//! W&B history steps are append-only. `Cumulative/steps` is consequently
+//! configured as a chart axis rather than passed as W&B's internal log step,
+//! allowing a restored checkpoint to report lower cumulative values in the
+//! same run.
 
 use std::collections::HashMap;
 
@@ -25,7 +30,8 @@ impl MetricSender {
     /// `project_name`, `group_name`, `run_name` map directly to `wandb.init()`.
     /// If `run_id` is non-empty the run is **resumed** (wandb `id=` +
     /// `resume="allow"`), which lets you continue a crashed / interrupted
-    /// training run.
+    /// training run. Use [`Self::new_run`] when restoring a checkpoint whose
+    /// cumulative step may be behind the prior run history.
     ///
     /// Returns an error if the Python `wandb` module cannot be imported or
     /// `wandb.init()` fails.
@@ -49,6 +55,7 @@ impl MetricSender {
             }
 
             let run = wandb.call_method("init", (), Some(&kwargs))?;
+            run.call_method1("define_metric", ("*", "Cumulative/steps"))?;
             let rid: String = run.getattr("id")?.extract()?;
 
             Ok(MetricSender {
@@ -65,24 +72,17 @@ impl MetricSender {
 
     /// Send a flat dictionary of scalar metrics to wandb.
     ///
-    /// Metrics are logged against the report's cumulative environment steps,
-    /// rather than W&B's implicit per-log-call iteration counter.
+    /// W&B assigns its own monotonically increasing history step to each call.
+    /// Charts use `Cumulative/steps` as their x-axis, which means checkpoint
+    /// rollbacks can log lower cumulative values without losing later metrics.
     pub fn send(&self, metrics: &HashMap<String, f64>) -> PyResult<()> {
-        let step = metrics.get("Cumulative/steps").copied().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>("missing Cumulative/steps metric")
-        })?;
-
         Python::attach(|py| {
             let dict = PyDict::new(py);
             for (key, val) in metrics {
                 dict.set_item(key.as_str(), *val)?;
             }
 
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("step", step as u64)?;
-            self.py_run
-                .as_ref()
-                .call_method(py, "log", (dict,), Some(&kwargs))?;
+            self.py_run.as_ref().call_method1(py, "log", (dict,))?;
             Ok(())
         })
     }

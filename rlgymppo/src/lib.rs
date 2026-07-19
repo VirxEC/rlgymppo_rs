@@ -878,7 +878,6 @@ where
 
             match rlgymppo_wandb::MetricSender::new(project_name, group, name, run_id) {
                 Ok(sender) => {
-                    // Persist the run ID for resume on restart.
                     let id = sender.run_id().to_owned();
                     self.stats.wandb_run =
                         Some(crate::utils::running_stat::WandbRun { run_id: id.clone() });

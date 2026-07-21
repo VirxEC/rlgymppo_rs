@@ -676,6 +676,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             self.device.clone(),
             reward_sampling,
             self.ppo.max_episode_length,
+            self.ppo.retain_overflow_episodes,
         );
 
         let mut self_play_config = self.self_play;

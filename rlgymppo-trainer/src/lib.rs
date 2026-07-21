@@ -92,7 +92,7 @@ pub fn create_env(
 ) -> Env<
     WeightedState<SharedInfo>,
     DefaultObs<3>,
-    DefaultAction<6, 8>,
+    DefaultAction<6, 8, 1>,
     rewards::CombinedRewards<SharedInfo>,
     AnyTerminal<SharedInfo>,
     NoTouchCondition<MAX_NO_TOUCH_DURATION>,
@@ -143,10 +143,10 @@ pub fn default_config<B: AutodiffBackend>(
     // Samples per forward/backward pass. Decrease when training runs out of VRAM.
     let mini_batch_size = 20_000;
     // CPU-to-GPU staging capacity. It must be at least `batch_size`.
-    let gpu_timestep_buffer_size = timesteps_per_iteration;
+    let gpu_timestep_buffer_size = batch_size;
     // Inference-only batch for critic bootstrapping at truncated trajectories.
     // It can usually be larger than `mini_batch_size` because it holds no gradients.
-    let truncation_value_batch_size = timesteps_per_iteration;
+    let truncation_value_batch_size = batch_size;
     let lr = 2e-4;
 
     LearnerConfig {
@@ -154,22 +154,26 @@ pub fn default_config<B: AutodiffBackend>(
         num_threads: 4,
         num_games_per_thread: 64,
         timesteps_per_save: 10_000_000,
-        checkpoints_limit: Some(10),
+        checkpoints_limit: None,
         ppo: PpoLearnerConfig {
             timesteps_per_iteration,
             batch_size,
             mini_batch_size,
             gpu_timestep_buffer_size,
             truncation_value_batch_size,
-            epochs: 1,
+            epochs: 2,
             learning_rate: lr,
-            entropy_scale: 0.036,
+            entropy_scale: 0.024,
+            max_episode_length: None,
+            overbatching: false,
+            retain_overflow_episodes: false,
             ..Default::default()
         },
         self_play: SelfPlayConfig {
             save_policy_versions: true,
-            ts_per_version: 100_000_000,
+            ts_per_version: 500_000_000,
             max_old_versions: 10,
+            max_saved_versions: None,
             train_against_old_versions: false,
             train_against_old_chance: 0.15,
         },

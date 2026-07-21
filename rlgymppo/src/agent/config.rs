@@ -66,6 +66,12 @@ pub struct PpoLearnerConfig {
     /// bootstrap.  Defaults to 1800 (120 seconds at 15 steps/second,
     /// matching the GGL default).
     pub max_episode_length: Option<usize>,
+    /// Retain completed episodes that exceed an iteration's collection budget
+    /// and return them before collecting new experience next iteration.
+    ///
+    /// Disabled by default to preserve the historical behavior of discarding
+    /// overflow episodes.
+    pub retain_overflow_episodes: bool,
 }
 
 impl Default for PpoLearnerConfig {
@@ -93,6 +99,7 @@ impl Default for PpoLearnerConfig {
             reward_sample_interval: 8,
             max_reward_samples: 50,
             max_episode_length: Some(1800),
+            retain_overflow_episodes: false,
         }
     }
 }

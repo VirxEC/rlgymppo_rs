@@ -48,7 +48,7 @@ impl PpoBotConfig for ExampleConfig {
 }
 
 // Configure the shared info, observation builder, discrete action parser, and policy architecture.
-type Bot = ConfigurablePpoBot<DefaultObs<3>, DefaultAction<6, 8>, SharedInfo, ExampleConfig>;
+type Bot = ConfigurablePpoBot<DefaultObs<3>, DefaultAction<6, 8, 1>, SharedInfo, ExampleConfig>;
 
 const SOCCAR_COLLISION_MESHES: [&[u8]; 16] = [
     include_bytes!("../../../collision_meshes/soccar/mesh_0.cmf"),

@@ -73,6 +73,7 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<F>(
         create_env_fn: F,
         batch_size: usize,
@@ -81,6 +82,7 @@ where
         device: B::Device,
         reward_sampling: RewardSamplingConfig,
         max_episode_length: Option<usize>,
+        retain_overflow_episodes: bool,
     ) -> Self
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
@@ -110,6 +112,7 @@ where
                     device,
                     reward_sampling,
                     max_episode_length,
+                    retain_overflow_episodes,
                 );
 
                 loop {

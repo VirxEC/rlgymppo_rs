@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "=0.21.0", default-features = false, features = ["std"] }
-thiserror = "2.0.18"
+burn = { workspace = true, default-features = false, features = ["std"] }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 burn = {
-  version = "=0.21.0",
+  workspace = true,
   default-features = false,
   features = ["flex", "std"]
 }

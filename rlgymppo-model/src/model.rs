@@ -4,8 +4,9 @@ use burn::prelude::*;
 use burn::tensor::activation::{log_softmax, relu, softmax};
 
 use crate::tensor::{
-    argmax_actions, sample_actions_from_logits, to_mask_tensor_2d, to_mask_tensor_2d_indexed,
-    to_state_tensor_2d, to_state_tensor_2d_indexed,
+    SampledActions, argmax_actions, sample_actions_from_logits, sample_actions_from_logits_tensor,
+    sampled_actions_to_vec, to_mask_tensor_2d, to_mask_tensor_2d_indexed, to_state_tensor_2d,
+    to_state_tensor_2d_indexed,
 };
 
 pub struct PPOOutput<B: Backend> {
@@ -204,6 +205,18 @@ impl<B: Backend> Net<B> {
     }
 }
 
+/// Device-resident actor output. Calling [`Self::wait`] is the first point at
+/// which sampled actions and log probabilities are transferred back to the CPU.
+pub struct PendingActions<B: Backend> {
+    sampled: SampledActions<B>,
+}
+
+impl<B: Backend> PendingActions<B> {
+    pub fn wait(self) -> (Vec<usize>, Vec<f32>) {
+        sampled_actions_to_vec(self.sampled)
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct Actic<B: Backend> {
     /// Optional feature extractor shared between the actor and critic.
@@ -271,16 +284,53 @@ impl<B: Backend> Actic<B> {
         PPOOutput::<B>::new(log_probs, values)
     }
 
+    /// Dispatch stochastic action inference and retain the sampled output on
+    /// the backend device until [`PendingActions::wait`] is called.
+    pub fn submit_react(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        device: &B::Device,
+    ) -> PendingActions<B> {
+        let input = to_state_tensor_2d(state, device);
+        let features = self.apply_shared_head(input);
+        let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
+        PendingActions {
+            sampled: sample_actions_from_logits_tensor(
+                self.actor.masked_logits(features, mask_tensor),
+                device,
+            ),
+        }
+    }
+
     pub fn react(
         &self,
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
         device: &B::Device,
     ) -> (Vec<usize>, Vec<f32>) {
-        let input = to_state_tensor_2d(state, device);
+        self.submit_react(state, masks, device).wait()
+    }
+
+    /// Dispatch stochastic inference for selected rows and retain the sampled
+    /// output on the backend device until [`PendingActions::wait`] is called.
+    pub fn submit_react_indexed(
+        &self,
+        state: &[Vec<f32>],
+        masks: &[Vec<bool>],
+        indices: &[usize],
+        device: &B::Device,
+    ) -> PendingActions<B> {
+        let input = to_state_tensor_2d_indexed(state, indices, device);
         let features = self.apply_shared_head(input);
-        let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
-        sample_actions_from_logits(self.actor.masked_logits(features, mask_tensor), device)
+        let mask_tensor =
+            (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
+        PendingActions {
+            sampled: sample_actions_from_logits_tensor(
+                self.actor.masked_logits(features, mask_tensor),
+                device,
+            ),
+        }
     }
 
     pub fn react_indexed(
@@ -290,11 +340,8 @@ impl<B: Backend> Actic<B> {
         indices: &[usize],
         device: &B::Device,
     ) -> (Vec<usize>, Vec<f32>) {
-        let input = to_state_tensor_2d_indexed(state, indices, device);
-        let features = self.apply_shared_head(input);
-        let mask_tensor =
-            (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
-        sample_actions_from_logits(self.actor.masked_logits(features, mask_tensor), device)
+        self.submit_react_indexed(state, masks, indices, device)
+            .wait()
     }
 
     pub fn react_deterministic(

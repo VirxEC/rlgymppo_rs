@@ -125,7 +125,52 @@ where
     }
 
     pub fn step(&mut self, actions: &[ACT::Input]) -> StepResult {
-        let result = self.env.step(&self.last_state, actions);
+        self.env.pre_step(&self.last_state, actions);
+        self.env.step_physics(ACT::get_tick_skip());
+        self.finish_step()
+    }
+
+    /// Advance the delayed portion of a policy decision interval using the
+    /// previously selected action. Call [`Self::finish_delayed_step`] with the
+    /// new action to complete the interval.
+    pub fn begin_delayed_step(&mut self, previous_actions: &[ACT::Input]) {
+        let delay = ACT::get_action_delay();
+        let tick_skip = ACT::get_tick_skip();
+        assert!(
+            delay < tick_skip,
+            "action_delay ({delay}) must be less than tick_skip ({tick_skip})"
+        );
+
+        self.env.pre_step(&self.last_state, previous_actions);
+        self.env.step_physics(delay);
+    }
+
+    /// Advance the delayed portion of a policy decision interval with neutral
+    /// controls. This is used before the first action after a reset is available.
+    pub fn begin_neutral_delayed_step(&mut self) {
+        let delay = ACT::get_action_delay();
+        let tick_skip = ACT::get_tick_skip();
+        assert!(
+            delay < tick_skip,
+            "action_delay ({delay}) must be less than tick_skip ({tick_skip})"
+        );
+
+        self.env.pre_step_neutral(&self.last_state);
+        self.env.step_physics(delay);
+    }
+
+    /// Apply the newly selected action, simulate the remainder of a delayed
+    /// decision interval, and evaluate the resulting environment step.
+    pub fn finish_delayed_step(&mut self, actions: &[ACT::Input]) -> StepResult {
+        let delayed_state = self.env.current_state();
+        self.env.apply_actions(&delayed_state, actions);
+        self.env
+            .step_physics(ACT::get_tick_skip() - ACT::get_action_delay());
+        self.finish_step()
+    }
+
+    fn finish_step(&mut self) -> StepResult {
+        let result = self.env.post_step();
         self.last_state = result.state;
 
         let shared_info = self.env.get_mut_shared_info();

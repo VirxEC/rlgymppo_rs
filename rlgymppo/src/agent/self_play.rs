@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -26,6 +25,11 @@ pub struct SelfPlayConfig {
     pub ts_per_version: u64,
     /// Maximum number of old versions to keep in memory.
     pub max_old_versions: usize,
+    /// Maximum number of policy versions retained on disk.
+    ///
+    /// `None` preserves every saved version. `Some(n)` retains the newest
+    /// `n` version directories independently of `max_old_versions`.
+    pub max_saved_versions: Option<usize>,
     /// Whether to occasionally train against old versions (self-play).
     pub train_against_old_versions: bool,
     /// Probability (0.0 – 1.0) that a given training iteration will
@@ -39,6 +43,7 @@ impl Default for SelfPlayConfig {
             save_policy_versions: false,
             ts_per_version: 25_000_000,
             max_old_versions: 32,
+            max_saved_versions: Some(32),
             train_against_old_versions: false,
             train_against_old_chance: 0.15,
         }
@@ -120,15 +125,18 @@ impl<B: Backend> VersionManager<B> {
             #[cfg(not(feature = "tui"))]
             println!(" > Saving policy version at {cur_timesteps} ts ...");
 
-            self.versions.push(PolicyVersion::from_model(
+            let version = PolicyVersion::from_model(
                 model,
                 cur_timesteps,
                 cur_ratings.cloned().unwrap_or_default(),
-            ));
+            );
+            self.persist_version(&version);
+            self.versions.push(version);
 
             while self.versions.len() > self.config.max_old_versions {
                 self.versions.remove(0);
             }
+            self.prune_saved_versions();
 
             #[cfg(not(feature = "tui"))]
             println!(
@@ -140,68 +148,75 @@ impl<B: Backend> VersionManager<B> {
 
     // ── Disk persistence ─────────────────────────────────────────
 
-    /// Persist all in-memory versions to disk inside
-    /// `save_folder/<timestep>/`.  Uses Burn's native recorder
-    /// (`.mpk.gz`), identical to how checkpoints are saved.
-    ///
-    /// Orphaned directories on disk (those whose timestep is no
-    /// longer in the in-memory window) are removed.
+    /// Persist in-memory versions and enforce the independent disk-retention
+    /// policy. New versions are also persisted immediately by `on_iteration`.
     pub fn save_versions(&self) {
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+        for version in &self.versions {
+            self.persist_version(version);
+        }
+        self.prune_saved_versions();
+    }
 
-        fs::create_dir_all(&self.save_folder).ok();
-
-        let in_memory: HashSet<u64> = self.versions.iter().map(|v| v.timesteps).collect();
-
-        // Remove saved directories for versions that were pruned.
-        if let Ok(entries) = fs::read_dir(&self.save_folder) {
-            for entry in entries.flatten() {
-                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-                    continue;
-                }
-                if let Some(name) = entry.file_name().to_str()
-                    && let Ok(ts) = name.parse::<u64>()
-                    && !in_memory.contains(&ts)
-                {
-                    let _ = fs::remove_dir_all(entry.path());
-                    #[cfg(not(feature = "tui"))]
-                    println!(" > Removed orphaned policy version {ts}");
-                }
-            }
+    fn persist_version(&self, version: &PolicyVersion<B>) {
+        let path = self.save_folder.join(version.timesteps.to_string());
+        if path.exists() {
+            return;
         }
 
-        // Save each version.
-        for version in &self.versions {
-            let path = self.save_folder.join(version.timesteps.to_string());
-            if path.exists() {
-                continue; // already on disk
-            }
-            fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
-            version
-                .model
-                .actor
-                .clone()
-                .save_file(path.join("actor"), &recorder)
+        version
+            .model
+            .actor
+            .clone()
+            .save_file(path.join("actor"), &recorder)
+            .unwrap();
+        version
+            .model
+            .critic
+            .clone()
+            .save_file(path.join("critic"), &recorder)
+            .unwrap();
+        if let Some(ref head) = version.model.shared_head {
+            head.clone()
+                .save_file(path.join("shared_head"), &recorder)
                 .unwrap();
-            version
-                .model
-                .critic
-                .clone()
-                .save_file(path.join("critic"), &recorder)
-                .unwrap();
-            if let Some(ref head) = version.model.shared_head {
-                head.clone()
-                    .save_file(path.join("shared_head"), &recorder)
-                    .unwrap();
-            }
+        }
 
-            // Persist the frozen skill ratings as TOML.
-            let stats_toml = toml::to_string_pretty(&version.ratings).unwrap();
-            fs::write(path.join("stats.toml"), stats_toml).unwrap();
+        let stats_toml = toml::to_string_pretty(&version.ratings).unwrap();
+        fs::write(path.join("stats.toml"), stats_toml).unwrap();
 
+        #[cfg(not(feature = "tui"))]
+        println!(" > Persisted policy version {} to disk", version.timesteps);
+    }
+
+    fn prune_saved_versions(&self) {
+        let Some(max_saved_versions) = self.config.max_saved_versions else {
+            return;
+        };
+
+        let Ok(entries) = fs::read_dir(&self.save_folder) else {
+            return;
+        };
+        let mut versions: Vec<(u64, PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|file_type| file_type.is_dir())?;
+                let timestep = entry.file_name().to_str()?.parse::<u64>().ok()?;
+                Some((timestep, entry.path()))
+            })
+            .collect();
+        versions.sort_unstable_by_key(|(timestep, _)| *timestep);
+
+        let remove_count = versions.len().saturating_sub(max_saved_versions);
+        for (_, path) in versions.into_iter().take(remove_count) {
+            let _ = fs::remove_dir_all(&path);
             #[cfg(not(feature = "tui"))]
-            println!(" > Persisted policy version {} to disk", version.timesteps);
+            println!(" > Removed old policy version {}", path.display());
         }
     }
 

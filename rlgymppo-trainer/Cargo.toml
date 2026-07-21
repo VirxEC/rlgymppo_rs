@@ -8,8 +8,8 @@ name = "run"
 required-features = ["backend"]
 
 [dependencies]
-burn = { version = "0.21.0", features = ["autodiff"] }
-rand = "0.10.1"
+burn = { workspace = true, features = ["autodiff"] }
+rand = { workspace = true }
 rlgymppo = { path = "../rlgymppo", default-features = false }
 
 [features]

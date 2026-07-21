@@ -56,18 +56,31 @@ pub(crate) fn to_state_tensor_2d_indexed<B: Backend>(
     Tensor::from_data(TensorData::new(data, [indices.len(), columns]), device)
 }
 
-pub(crate) fn sample_actions_from_logits<B: Backend>(
+pub(crate) struct SampledActions<B: Backend> {
+    pub actions: Tensor<B, 2, Int>,
+    pub log_probs: Tensor<B, 2>,
+}
+
+pub(crate) fn sample_actions_from_logits_tensor<B: Backend>(
     logits: Tensor<B, 2>,
     device: &B::Device,
-) -> (Vec<usize>, Vec<f32>) {
+) -> SampledActions<B> {
     let shape = logits.shape();
     let log_probs = log_softmax(logits.clone(), 1);
     let uniform = Tensor::<B, 2>::random(shape, Distribution::Default, device);
     let gumbel = uniform.log().neg().log().neg();
-    let indices = (logits + gumbel).argmax(1);
+    let actions = (logits + gumbel).argmax(1);
+    let log_probs = log_probs.gather(1, actions.clone());
+
+    SampledActions { actions, log_probs }
+}
+
+pub(crate) fn sampled_actions_to_vec<B: Backend>(
+    sampled: SampledActions<B>,
+) -> (Vec<usize>, Vec<f32>) {
     let transaction = Transaction::default()
-        .register(log_probs.gather(1, indices.clone()))
-        .register(indices)
+        .register(sampled.log_probs)
+        .register(sampled.actions)
         .execute();
 
     (
@@ -77,6 +90,13 @@ pub(crate) fn sample_actions_from_logits<B: Backend>(
             .collect(),
         transaction[0].to_vec().unwrap(),
     )
+}
+
+pub(crate) fn sample_actions_from_logits<B: Backend>(
+    logits: Tensor<B, 2>,
+    device: &B::Device,
+) -> (Vec<usize>, Vec<f32>) {
+    sampled_actions_to_vec(sample_actions_from_logits_tensor(logits, device))
 }
 
 pub(crate) fn argmax_actions<B: Backend>(output: Tensor<B, 2>) -> Vec<usize> {

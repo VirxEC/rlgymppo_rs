@@ -13,7 +13,6 @@ use rlbot_rocketsim::{GameStateEnricher, MatchContext};
 use rlgymppo_model::{NormSelection, Policy, PolicyConfig};
 use rlgymppo_utils::actions::DefaultAction;
 use rlgymppo_utils::rlgym::{Action, Obs};
-use rlgymppo_utils::rocketsim::CarControls as RlgymCarControls;
 
 use crate::controls::to_rlbot_controls;
 use crate::state::to_rlgym_game_state;
@@ -44,13 +43,13 @@ impl PpoBotConfig for DefaultConfig {
 
 /// Converts a discrete policy action into RocketSim controls for RLBot.
 pub trait RlbotAction {
-    fn get_action(&self, action_index: usize) -> RlgymCarControls;
+    fn get_action(&self, action_index: usize) -> CarControls;
 }
 
-impl<const MAX_PLAYERS: usize, const TICK_SKIP: u8> RlbotAction
-    for DefaultAction<MAX_PLAYERS, TICK_SKIP>
+impl<const MAX_PLAYERS: usize, const TICK_SKIP: u8, const ACTION_DELAY: u8> RlbotAction
+    for DefaultAction<MAX_PLAYERS, TICK_SKIP, ACTION_DELAY>
 {
-    fn get_action(&self, action_index: usize) -> RlgymCarControls {
+    fn get_action(&self, action_index: usize) -> CarControls {
         self.get_action(action_index)
     }
 }

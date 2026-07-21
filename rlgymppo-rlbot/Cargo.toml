@@ -9,7 +9,7 @@ path = "examples/rlbot/main.rs"
 
 [dependencies]
 burn = {
-  workspace = true,
+  version = "0.21.0",
   default-features = false,
   features = ["flex", "std"]
 }

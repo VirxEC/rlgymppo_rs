@@ -677,6 +677,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             reward_sampling,
             self.ppo.max_episode_length,
             self.ppo.retain_overflow_episodes,
+            self.ppo.overbatching,
         );
 
         let mut self_play_config = self.self_play;

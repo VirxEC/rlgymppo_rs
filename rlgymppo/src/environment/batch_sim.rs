@@ -134,6 +134,7 @@ where
         remaining_steps: &AtomicUsize,
         memory_capacity_hint: usize,
         self_play: Option<(&Actic<B>, usize)>,
+        overbatching: bool,
     ) -> (Memory, Report) {
         let (old_model, old_team) = self_play.unzip();
 
@@ -154,12 +155,23 @@ where
             let Some((traj, trunc_next_state)) = self.overflow_trajs.pop_front() else {
                 break;
             };
-            let traj_len = traj.states.len();
-            if Self::claim_steps(remaining_steps, traj_len) {
+            if overbatching {
+                Self::claim_steps(remaining_steps, traj.states.len());
                 Self::push_traj(&mut memory, traj, trunc_next_state);
             } else {
-                self.overflow_trajs.push_front((traj, trunc_next_state));
-                break;
+                let claimed = Self::claim_available_steps(remaining_steps, traj.states.len());
+                if claimed == 0 {
+                    self.overflow_trajs.push_front((traj, trunc_next_state));
+                    break;
+                }
+                let truncated = claimed < traj.states.len();
+                let boundary_next_state = truncated.then(|| traj.states[claimed].clone());
+                Self::push_traj_prefix(
+                    &mut memory,
+                    traj,
+                    claimed,
+                    boundary_next_state.or(trunc_next_state),
+                );
             }
         }
 
@@ -325,16 +337,26 @@ where
                             let traj_len = self.player_trajs[ti].states.len();
                             let trunc_next = (terminal_type == TerminalState::Truncated)
                                 .then(|| result.obs[p].clone());
-                            if Self::claim_steps(remaining_steps, traj_len) {
-                                Self::push_traj(
-                                    &mut memory,
-                                    mem::take(&mut self.player_trajs[ti]),
-                                    trunc_next,
-                                );
-                            } else {
-                                let traj = mem::take(&mut self.player_trajs[ti]);
-                                if self.retain_overflow_episodes {
+                            let traj = mem::take(&mut self.player_trajs[ti]);
+                            if overbatching {
+                                if Self::claim_steps(remaining_steps, traj_len) {
+                                    Self::push_traj(&mut memory, traj, trunc_next);
+                                } else if self.retain_overflow_episodes {
                                     self.overflow_trajs.push_back((traj, trunc_next));
+                                }
+                            } else {
+                                let claimed =
+                                    Self::claim_available_steps(remaining_steps, traj_len);
+                                if claimed > 0 {
+                                    let truncated = claimed < traj_len;
+                                    let boundary_next_state =
+                                        truncated.then(|| traj.states[claimed].clone());
+                                    Self::push_traj_prefix(
+                                        &mut memory,
+                                        traj,
+                                        claimed,
+                                        boundary_next_state.or(trunc_next),
+                                    );
                                 }
                             }
                         } else {
@@ -386,7 +408,38 @@ where
             .is_ok()
     }
 
+    fn claim_available_steps(remaining_steps: &AtomicUsize, steps: usize) -> usize {
+        remaining_steps
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(steps))
+            })
+            .map(|remaining| remaining.min(steps))
+            .unwrap_or(0)
+    }
+
     fn push_traj(memory: &mut Memory, traj: PlayerTraj, trunc_next_state: Option<Vec<f32>>) {
+        Self::push_traj_prefix(memory, traj, usize::MAX, trunc_next_state);
+    }
+
+    fn push_traj_prefix(
+        memory: &mut Memory,
+        mut traj: PlayerTraj,
+        len: usize,
+        trunc_next_state: Option<Vec<f32>>,
+    ) {
+        let len = len.min(traj.states.len());
+        traj.states.truncate(len);
+        traj.actions.truncate(len);
+        traj.log_probs.truncate(len);
+        traj.rewards.truncate(len);
+        traj.terminals.truncate(len);
+        traj.action_masks.truncate(len);
+        if trunc_next_state.is_some()
+            && let Some(terminal) = traj.terminals.last_mut()
+        {
+            *terminal = TerminalState::Truncated;
+        }
+
         memory.push_player(
             traj.states,
             traj.actions,

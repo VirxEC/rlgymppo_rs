@@ -83,12 +83,18 @@ where
         reward_sampling: RewardSamplingConfig,
         max_episode_length: Option<usize>,
         retain_overflow_episodes: bool,
+        overbatching: bool,
     ) -> Self
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         B::Device: Send,
     {
         let (sender, recv) = channel();
+        let memory_capacity = if overbatching {
+            batch_size * 2
+        } else {
+            batch_size
+        };
         let control = Arc::new(ThreadControl {
             command: RwLock::new(ThreadCommand::Shutdown),
             remaining_steps: AtomicUsize::new(0),
@@ -127,8 +133,9 @@ where
                             let (memory, metrics) = batch_sim.run_with_budget(
                                 model.as_ref(),
                                 &control.remaining_steps,
-                                batch_size * 2,
+                                memory_capacity,
                                 self_play.as_ref().map(|(m, t)| (m.as_ref(), *t)),
+                                overbatching,
                             );
 
                             sender.send(DataResponse { memory, metrics }).unwrap();
@@ -144,7 +151,7 @@ where
             recv,
             control,
             threads,
-            memory: Memory::with_capacity(batch_size * 2),
+            memory: Memory::with_capacity(memory_capacity),
             metrics: Report::default(),
             batch_size,
             pending_responses: 0,

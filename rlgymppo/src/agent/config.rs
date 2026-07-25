@@ -43,8 +43,8 @@ pub struct PpoLearnerConfig {
     /// when bootstrapping GAE. Set this to `gpu_timestep_buffer_size` to use one
     /// contiguous CPU-to-GPU upload whenever all truncation observations fit in one batch.
     pub truncation_value_batch_size: usize,
-    /// Extend the last batch to use all remaining experience when it's less than
-    /// 2x the batch size.
+    /// Allow the final completed trajectory to extend the rollout while keeping
+    /// the collected size strictly below 2x `timesteps_per_iteration`.
     pub overbatching: bool,
 
     // ── Reward metrics sampling ─────────────────────────────────────
@@ -133,7 +133,11 @@ impl PpoLearnerConfig {
         Ppo::new(self, device, make_optim)
     }
 
-    fn validate_batching(&self) {
+    pub(crate) fn validate_batching(&self) {
+        assert!(
+            self.timesteps_per_iteration > 0,
+            "Timesteps per iteration must be greater than zero"
+        );
         assert!(self.batch_size > 0, "Batch size must be greater than zero");
         assert!(
             self.mini_batch_size > 0,
@@ -174,16 +178,7 @@ impl PpoLearnerConfig {
         model: &Actic<B>,
         make_optim: impl Fn(OptimizerNetwork, &Net<B>) -> O,
     ) -> Ppo<B, O> {
-        assert_eq!(
-            self.timesteps_per_iteration % self.batch_size,
-            0,
-            "Timesteps per iteration must be divisible by batch size"
-        );
-        assert_eq!(
-            self.batch_size % self.mini_batch_size,
-            0,
-            "Batch size must be divisible by mini batch size"
-        );
+        self.validate_batching();
 
         Ppo::new_with_model(self, device, model, make_optim)
     }

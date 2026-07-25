@@ -17,7 +17,6 @@ use burn::tensor::Transaction;
 use burn::tensor::backend::AutodiffBackend;
 use rand::Rng;
 use rand::seq::SliceRandom;
-use ringbuffer::RingBuffer;
 
 use crate::OptimizerNetwork;
 use crate::agent::config::PpoLearnerConfig;
@@ -140,9 +139,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         stats: &mut Stats,
         is_first_iteration: bool,
     ) -> (Actic<B>, usize) {
-        // When overbatching, use ALL collected experience (the memory may have
-        // slightly more entries than `timesteps_per_iteration` due to the ceil
-        // division in thread_sim, or due to truncation next-states).
+        // Overbatching uses the complete bounded rollout, including the final
+        // trajectory prefix that extends beyond `timesteps_per_iteration`.
         let rollout_size =
             if self.config.overbatching && memory.len() > self.config.timesteps_per_iteration {
                 memory.len()

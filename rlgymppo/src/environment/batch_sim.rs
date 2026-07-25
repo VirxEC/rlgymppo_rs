@@ -24,6 +24,147 @@ struct PlayerTraj {
     action_masks: Vec<Vec<bool>>,
 }
 
+impl PlayerTraj {
+    fn split_off(&mut self, at: usize) -> Self {
+        Self {
+            states: self.states.split_off(at),
+            actions: self.actions.split_off(at),
+            log_probs: self.log_probs.split_off(at),
+            rewards: self.rewards.split_off(at),
+            terminals: self.terminals.split_off(at),
+            action_masks: self.action_masks.split_off(at),
+        }
+    }
+}
+
+type OverflowTraj = (PlayerTraj, Option<Vec<f32>>);
+
+struct ClaimedTrajectory {
+    trajectory: PlayerTraj,
+    len: usize,
+    next_state: Option<Vec<f32>>,
+}
+
+struct TrajectoryPartition {
+    claimed: Option<ClaimedTrajectory>,
+    overflow: Option<OverflowTraj>,
+}
+
+fn partition_claimed_trajectory(
+    mut traj: PlayerTraj,
+    trunc_next_state: Option<Vec<f32>>,
+    claimed: usize,
+    retain_overflow: bool,
+) -> TrajectoryPartition {
+    debug_assert!(claimed <= traj.states.len());
+
+    if claimed == traj.states.len() {
+        return TrajectoryPartition {
+            claimed: Some(ClaimedTrajectory {
+                len: traj.states.len(),
+                trajectory: traj,
+                next_state: trunc_next_state,
+            }),
+            overflow: None,
+        };
+    }
+    if claimed == 0 {
+        return TrajectoryPartition {
+            claimed: None,
+            overflow: retain_overflow.then_some((traj, trunc_next_state)),
+        };
+    }
+
+    let boundary_next_state = Some(traj.states[claimed].clone());
+    let overflow = retain_overflow.then(|| (traj.split_off(claimed), trunc_next_state));
+    TrajectoryPartition {
+        claimed: Some(ClaimedTrajectory {
+            trajectory: traj,
+            len: claimed,
+            next_state: boundary_next_state,
+        }),
+        overflow,
+    }
+}
+
+fn claim_overbatch_steps(
+    remaining_steps: &AtomicUsize,
+    steps: usize,
+    rollout_budget: usize,
+) -> usize {
+    // Once this claim exceeds `remaining`, the rollout is over budget. Limit
+    // that excess to `rollout_budget - 1`, keeping the total strictly below 2x.
+    let claim = |remaining: usize| {
+        let max_claim = remaining.saturating_add(rollout_budget.saturating_sub(1));
+        steps.min(max_claim)
+    };
+
+    remaining_steps
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            (remaining > 0).then(|| remaining.saturating_sub(claim(remaining)))
+        })
+        .map(claim)
+        .unwrap_or(0)
+}
+
+fn claim_available_steps(remaining_steps: &AtomicUsize, steps: usize) -> usize {
+    remaining_steps
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            Some(remaining.saturating_sub(steps))
+        })
+        .map(|remaining| remaining.min(steps))
+        .unwrap_or(0)
+}
+
+fn push_claimed_trajectory(memory: &mut Memory, claimed: Option<ClaimedTrajectory>) {
+    if let Some(claimed) = claimed {
+        push_traj_prefix(memory, claimed.trajectory, claimed.len, claimed.next_state);
+    }
+}
+
+fn push_traj_prefix(
+    memory: &mut Memory,
+    mut traj: PlayerTraj,
+    len: usize,
+    trunc_next_state: Option<Vec<f32>>,
+) {
+    let len = len.min(traj.states.len());
+    traj.states.truncate(len);
+    traj.actions.truncate(len);
+    traj.log_probs.truncate(len);
+    traj.rewards.truncate(len);
+    traj.terminals.truncate(len);
+    traj.action_masks.truncate(len);
+    if trunc_next_state.is_some()
+        && let Some(terminal) = traj.terminals.last_mut()
+    {
+        *terminal = TerminalState::Truncated;
+    }
+
+    memory.push_player(
+        traj.states,
+        traj.actions,
+        traj.log_probs,
+        traj.rewards,
+        traj.terminals,
+        traj.action_masks,
+        trunc_next_state,
+    );
+}
+
+fn reached_max_episode_length(
+    player_trajs: &[PlayerTraj],
+    player_is_tracked: &[bool],
+    player_start: usize,
+    player_count: usize,
+    max_episode_length: Option<usize>,
+) -> bool {
+    max_episode_length.is_some_and(|max_len| {
+        (player_start..player_start + player_count)
+            .any(|ti| player_is_tracked[ti] && player_trajs[ti].states.len() >= max_len)
+    })
+}
+
 pub struct BatchSim<B: Backend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
@@ -52,6 +193,10 @@ where
     /// Per-player team index (0 = Blue, 1 = Orange), cached at
     /// construction / game reset.
     player_teams: Vec<usize>,
+    self_play_current_indices: Vec<usize>,
+    self_play_old_indices: Vec<usize>,
+    self_play_actions: Vec<usize>,
+    self_play_log_probs: Vec<f32>,
 }
 
 impl<B, SS, OBS, ACT, REW, TERM, TRUNC, SI> BatchSim<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
@@ -118,6 +263,10 @@ where
             retain_overflow_episodes,
             device,
             player_teams,
+            self_play_current_indices: Vec::new(),
+            self_play_old_indices: Vec::new(),
+            self_play_actions: Vec::new(),
+            self_play_log_probs: Vec::new(),
             max_episode_length,
         }
     }
@@ -133,6 +282,7 @@ where
         model: &Actic<B>,
         remaining_steps: &AtomicUsize,
         memory_capacity_hint: usize,
+        rollout_budget: usize,
         self_play: Option<(&Actic<B>, usize)>,
         overbatching: bool,
     ) -> (Memory, Report) {
@@ -156,22 +306,26 @@ where
                 break;
             };
             if overbatching {
-                Self::claim_steps(remaining_steps, traj.states.len());
-                Self::push_traj(&mut memory, traj, trunc_next_state);
-            } else {
-                let claimed = Self::claim_available_steps(remaining_steps, traj.states.len());
+                let claimed =
+                    claim_overbatch_steps(remaining_steps, traj.states.len(), rollout_budget);
+                let partition = partition_claimed_trajectory(traj, trunc_next_state, claimed, true);
+                push_claimed_trajectory(&mut memory, partition.claimed);
+                if let Some(overflow) = partition.overflow {
+                    self.overflow_trajs.push_front(overflow);
+                }
                 if claimed == 0 {
-                    self.overflow_trajs.push_front((traj, trunc_next_state));
                     break;
                 }
-                let truncated = claimed < traj.states.len();
-                let boundary_next_state = truncated.then(|| traj.states[claimed].clone());
-                Self::push_traj_prefix(
-                    &mut memory,
-                    traj,
-                    claimed,
-                    boundary_next_state.or(trunc_next_state),
-                );
+            } else {
+                let claimed = claim_available_steps(remaining_steps, traj.states.len());
+                let partition = partition_claimed_trajectory(traj, trunc_next_state, claimed, true);
+                push_claimed_trajectory(&mut memory, partition.claimed);
+                if let Some(overflow) = partition.overflow {
+                    self.overflow_trajs.push_front(overflow);
+                }
+                if claimed == 0 {
+                    break;
+                }
             }
         }
 
@@ -184,29 +338,29 @@ where
 
             let (actions, log_probs) = if let (Some(old_model), Some(_ot)) = (old_model, old_team) {
                 // ── Self-play: submit each policy's indexed batch ─────────
-                let mut current_indices = Vec::new();
-                let mut old_indices = Vec::new();
+                self.self_play_current_indices.clear();
+                self.self_play_old_indices.clear();
                 for (index, &tracked) in player_is_tracked.iter().enumerate() {
                     if tracked {
-                        current_indices.push(index);
+                        self.self_play_current_indices.push(index);
                     } else {
-                        old_indices.push(index);
+                        self.self_play_old_indices.push(index);
                     }
                 }
 
-                let current_pending = (!current_indices.is_empty()).then(|| {
+                let current_pending = (!self.self_play_current_indices.is_empty()).then(|| {
                     model.submit_react_indexed(
                         &self.next_obs,
                         &self.next_masks,
-                        &current_indices,
+                        &self.self_play_current_indices,
                         &self.device,
                     )
                 });
-                let old_pending = (!old_indices.is_empty()).then(|| {
+                let old_pending = (!self.self_play_old_indices.is_empty()).then(|| {
                     old_model.submit_react_indexed(
                         &self.next_obs,
                         &self.next_masks,
-                        &old_indices,
+                        &self.self_play_old_indices,
                         &self.device,
                     )
                 });
@@ -230,18 +384,25 @@ where
                     .map(|pending| pending.wait())
                     .unwrap_or_default();
 
-                // Interleave results back into the original player order.
-                let mut actions = vec![0usize; self.next_obs.len()];
-                let mut log_probs = vec![0.0f32; self.next_obs.len()];
-                for (offset, &index) in current_indices.iter().enumerate() {
-                    actions[index] = current_actions[offset];
-                    log_probs[index] = current_log_probs[offset];
+                // Interleave results back into reusable buffers in the original
+                // player order.
+                let player_count = self.next_obs.len();
+                self.self_play_actions.clear();
+                self.self_play_actions.resize(player_count, 0);
+                self.self_play_log_probs.clear();
+                self.self_play_log_probs.resize(player_count, 0.0);
+                for (offset, &index) in self.self_play_current_indices.iter().enumerate() {
+                    self.self_play_actions[index] = current_actions[offset];
+                    self.self_play_log_probs[index] = current_log_probs[offset];
                 }
-                for (offset, &index) in old_indices.iter().enumerate() {
-                    actions[index] = old_actions[offset];
+                for (offset, &index) in self.self_play_old_indices.iter().enumerate() {
+                    self.self_play_actions[index] = old_actions[offset];
                 }
 
-                (actions, log_probs)
+                (
+                    mem::take(&mut self.self_play_actions),
+                    mem::take(&mut self.self_play_log_probs),
+                )
             } else if action_delay == 0 {
                 model.react(&self.next_obs, &self.next_masks, &self.device)
             } else {
@@ -306,10 +467,13 @@ where
                 // Force-truncate if any tracked player in this game exceeds
                 // the maximum episode length (matches GGL behaviour).
                 if terminal_type == TerminalState::None
-                    && let Some(max_len) = self.max_episode_length
-                    && (player_start..player_start + n).any(|ti| {
-                        player_is_tracked[ti] && self.player_trajs[ti].states.len() >= max_len
-                    })
+                    && reached_max_episode_length(
+                        &self.player_trajs,
+                        &player_is_tracked,
+                        player_start,
+                        n,
+                        self.max_episode_length,
+                    )
                 {
                     terminal_type = TerminalState::Truncated;
                 }
@@ -339,24 +503,32 @@ where
                                 .then(|| result.obs[p].clone());
                             let traj = mem::take(&mut self.player_trajs[ti]);
                             if overbatching {
-                                if Self::claim_steps(remaining_steps, traj_len) {
-                                    Self::push_traj(&mut memory, traj, trunc_next);
-                                } else if self.retain_overflow_episodes {
-                                    self.overflow_trajs.push_back((traj, trunc_next));
+                                let claimed = claim_overbatch_steps(
+                                    remaining_steps,
+                                    traj_len,
+                                    rollout_budget,
+                                );
+                                let partition = partition_claimed_trajectory(
+                                    traj,
+                                    trunc_next,
+                                    claimed,
+                                    self.retain_overflow_episodes,
+                                );
+                                push_claimed_trajectory(&mut memory, partition.claimed);
+                                if let Some(overflow) = partition.overflow {
+                                    self.overflow_trajs.push_back(overflow);
                                 }
                             } else {
-                                let claimed =
-                                    Self::claim_available_steps(remaining_steps, traj_len);
-                                if claimed > 0 {
-                                    let truncated = claimed < traj_len;
-                                    let boundary_next_state =
-                                        truncated.then(|| traj.states[claimed].clone());
-                                    Self::push_traj_prefix(
-                                        &mut memory,
-                                        traj,
-                                        claimed,
-                                        boundary_next_state.or(trunc_next),
-                                    );
+                                let claimed = claim_available_steps(remaining_steps, traj_len);
+                                let partition = partition_claimed_trajectory(
+                                    traj,
+                                    trunc_next,
+                                    claimed,
+                                    self.retain_overflow_episodes,
+                                );
+                                push_claimed_trajectory(&mut memory, partition.claimed);
+                                if let Some(overflow) = partition.overflow {
+                                    self.overflow_trajs.push_back(overflow);
                                 }
                             }
                         } else {
@@ -390,6 +562,11 @@ where
                 action_offset += n;
             }
 
+            if self_play.is_some() {
+                self.self_play_actions = actions;
+                self.self_play_log_probs = log_probs;
+            }
+
             total_env_step_time += env_start.elapsed().as_secs_f64();
         }
 
@@ -398,57 +575,6 @@ where
         report["Collect/env step time"] = total_env_step_time.into();
 
         (memory, report)
-    }
-
-    fn claim_steps(remaining_steps: &AtomicUsize, steps: usize) -> bool {
-        remaining_steps
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                (remaining > 0).then_some(remaining.saturating_sub(steps))
-            })
-            .is_ok()
-    }
-
-    fn claim_available_steps(remaining_steps: &AtomicUsize, steps: usize) -> usize {
-        remaining_steps
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                Some(remaining.saturating_sub(steps))
-            })
-            .map(|remaining| remaining.min(steps))
-            .unwrap_or(0)
-    }
-
-    fn push_traj(memory: &mut Memory, traj: PlayerTraj, trunc_next_state: Option<Vec<f32>>) {
-        Self::push_traj_prefix(memory, traj, usize::MAX, trunc_next_state);
-    }
-
-    fn push_traj_prefix(
-        memory: &mut Memory,
-        mut traj: PlayerTraj,
-        len: usize,
-        trunc_next_state: Option<Vec<f32>>,
-    ) {
-        let len = len.min(traj.states.len());
-        traj.states.truncate(len);
-        traj.actions.truncate(len);
-        traj.log_probs.truncate(len);
-        traj.rewards.truncate(len);
-        traj.terminals.truncate(len);
-        traj.action_masks.truncate(len);
-        if trunc_next_state.is_some()
-            && let Some(terminal) = traj.terminals.last_mut()
-        {
-            *terminal = TerminalState::Truncated;
-        }
-
-        memory.push_player(
-            traj.states,
-            traj.actions,
-            traj.log_probs,
-            traj.rewards,
-            traj.terminals,
-            traj.action_masks,
-            trunc_next_state,
-        );
     }
 
     fn get_metrics(&mut self) -> Report {
@@ -461,5 +587,111 @@ where
         self.metrics.clear();
 
         metrics
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn trajectory(len: usize) -> PlayerTraj {
+        let mut terminals = vec![TerminalState::None; len];
+        *terminals.last_mut().unwrap() = TerminalState::Normal;
+        PlayerTraj {
+            states: (0..len).map(|i| vec![i as f32]).collect(),
+            actions: (0..len).collect(),
+            log_probs: vec![0.0; len],
+            rewards: vec![1.0; len],
+            terminals,
+            action_masks: vec![vec![true]; len],
+        }
+    }
+
+    #[test]
+    fn regression_retention_controls_unclaimed_trajectory_suffix() {
+        let partition = partition_claimed_trajectory(trajectory(5), Some(vec![5.0]), 2, true);
+        let claimed = partition.claimed.unwrap();
+        let (suffix, final_next_state) = partition.overflow.unwrap();
+
+        assert_eq!(claimed.len, 2);
+        assert_eq!(claimed.trajectory.actions, &[0, 1]);
+        assert_eq!(claimed.next_state, Some(vec![2.0]));
+        assert_eq!(suffix.actions, &[2, 3, 4]);
+        assert_eq!(suffix.terminals.last(), Some(&TerminalState::Normal));
+        assert_eq!(final_next_state, Some(vec![5.0]));
+
+        let partition = partition_claimed_trajectory(trajectory(5), Some(vec![5.0]), 2, false);
+        let claimed = partition.claimed.unwrap();
+        assert_eq!(claimed.len, 2);
+        assert_eq!(claimed.trajectory.states.len(), 5);
+        assert_eq!(claimed.next_state, Some(vec![2.0]));
+        assert!(partition.overflow.is_none());
+    }
+
+    #[test]
+    fn regression_overbatch_claim_is_strictly_below_twice_the_budget() {
+        let remaining = AtomicUsize::new(100);
+        assert_eq!(claim_overbatch_steps(&remaining, 90, 100), 90);
+        assert_eq!(remaining.load(Ordering::Relaxed), 10);
+        assert_eq!(claim_overbatch_steps(&remaining, 500, 100), 109);
+        assert_eq!(remaining.load(Ordering::Relaxed), 0);
+        assert_eq!(claim_overbatch_steps(&remaining, 1, 100), 0);
+    }
+
+    #[test]
+    fn regression_partial_claim_flushes_a_truncated_bootstrap_boundary() {
+        let partition = partition_claimed_trajectory(trajectory(5), Some(vec![5.0]), 2, false);
+        let mut memory = Memory::with_capacity(2);
+        push_claimed_trajectory(&mut memory, partition.claimed);
+
+        assert!(partition.overflow.is_none());
+        assert_eq!(memory.len(), 2);
+        assert_eq!(memory.terminals().last(), Some(&TerminalState::Truncated));
+        assert_eq!(memory.trunc_next_states(), &[vec![2.0]]);
+    }
+
+    #[test]
+    fn regression_zero_claim_is_retained_only_when_enabled() {
+        let partition = partition_claimed_trajectory(trajectory(3), None, 0, false);
+        assert!(partition.claimed.is_none());
+        assert!(partition.overflow.is_none());
+
+        let partition = partition_claimed_trajectory(trajectory(3), None, 0, true);
+        assert!(partition.claimed.is_none());
+        assert_eq!(partition.overflow.unwrap().0.states.len(), 3);
+    }
+
+    #[test]
+    fn regression_max_episode_length_only_counts_tracked_players() {
+        let player_trajs = vec![trajectory(2), trajectory(4)];
+
+        assert!(!reached_max_episode_length(
+            &player_trajs,
+            &[true, false],
+            0,
+            2,
+            Some(3),
+        ));
+        assert!(reached_max_episode_length(
+            &player_trajs,
+            &[true, true],
+            0,
+            2,
+            Some(3),
+        ));
+        assert!(!reached_max_episode_length(
+            &player_trajs,
+            &[true, true],
+            0,
+            2,
+            Some(5),
+        ));
+        assert!(!reached_max_episode_length(
+            &player_trajs,
+            &[true, true],
+            0,
+            2,
+            None,
+        ));
     }
 }

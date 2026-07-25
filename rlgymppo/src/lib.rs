@@ -583,6 +583,15 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         TERM: Terminal<SI>,
         TRUNC: Truncate<SI>,
     {
+        self.ppo.validate_batching();
+        assert!(
+            self.num_threads > 0,
+            "Number of collector threads must be greater than zero"
+        );
+        assert!(
+            self.num_games_per_thread > 0,
+            "Number of games per collector thread must be greater than zero"
+        );
         assert_ne!(
             self.policy_layer_sizes.len(),
             0,

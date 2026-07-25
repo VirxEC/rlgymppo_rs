@@ -11,7 +11,6 @@ hashbrown = "0.16.1"
 itertools = "0.15.0"
 parking_lot = "0.12.4"
 rand = { workspace = true }
-ringbuffer = "0.16.0"
 rlgym = { workspace = true }
 rlgymppo-model = { path = "../rlgymppo-model" }
 rlgymppo-tui = { path = "../rlgymppo-tui", optional = true }

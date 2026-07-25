@@ -1,11 +1,12 @@
+use std::any::Any;
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Barrier};
 use std::thread;
 
 use burn::prelude::Backend;
-use parking_lot::RwLock;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 
 use super::batch_sim::BatchSim;
@@ -20,6 +21,53 @@ pub struct DataResponse {
     pub metrics: Report,
 }
 
+fn merge_worker_memory(
+    target: &mut Memory,
+    incoming: Memory,
+    rollout_budget: usize,
+    overbatching: bool,
+) {
+    if overbatching {
+        target.merge(incoming);
+        return;
+    }
+
+    let remaining = rollout_budget.saturating_sub(target.len());
+    if incoming.len() <= remaining {
+        target.merge(incoming);
+    } else if remaining > 0 {
+        target.merge_prefix(incoming, remaining);
+    }
+}
+
+type WorkerResponse = Result<DataResponse, String>;
+
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_owned())
+}
+
+fn collect_worker_responses(
+    recv: &Receiver<WorkerResponse>,
+    response_count: usize,
+    target: &mut Memory,
+    metrics: &mut Report,
+    rollout_budget: usize,
+    overbatching: bool,
+) -> Result<(), String> {
+    for _ in 0..response_count {
+        let response = recv
+            .recv()
+            .map_err(|_| "collector worker disconnected without a response".to_owned())??;
+        merge_worker_memory(target, response.memory, rollout_budget, overbatching);
+        *metrics += response.metrics;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 enum ThreadCommand<B: Backend> {
     Run {
@@ -29,11 +77,8 @@ enum ThreadCommand<B: Backend> {
     Shutdown,
 }
 
-/// Shared rollout state passed to collector threads via the barrier.
-struct ThreadControl<B: Backend> {
-    command: RwLock<ThreadCommand<B>>,
+struct ThreadControl {
     remaining_steps: AtomicUsize,
-    barrier: Barrier,
 }
 
 /// Multi‑threaded collector.  Each thread owns an independent pool of
@@ -52,13 +97,14 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    recv: Receiver<DataResponse>,
-    control: Arc<ThreadControl<B>>,
+    recv: Receiver<WorkerResponse>,
+    command_senders: Vec<Sender<ThreadCommand<B>>>,
+    control: Arc<ThreadControl>,
     threads: Vec<thread::JoinHandle<()>>,
     metrics: Report,
     memory: Memory,
-    batch_size: usize,
-    pending_responses: usize,
+    rollout_budget: usize,
+    overbatching: bool,
     _marker: PhantomData<fn(SS, OBS, ACT, REW, TERM, TRUNC, SI)>,
 }
 
@@ -76,7 +122,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new<F>(
         create_env_fn: F,
-        batch_size: usize,
+        rollout_budget: usize,
         num_threads: usize,
         num_games_per_thread: usize,
         device: B::Device,
@@ -89,56 +135,81 @@ where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         B::Device: Send,
     {
+        assert!(
+            num_threads > 0,
+            "Number of collector threads must be greater than zero"
+        );
+        assert!(
+            num_games_per_thread > 0,
+            "Number of games per collector thread must be greater than zero"
+        );
+
         let (sender, recv) = channel();
-        let memory_capacity = if overbatching {
-            batch_size * 2
-        } else {
-            batch_size
-        };
+        // These are initial capacities, not hard limits. Exact batching never
+        // exceeds one coordinator batch; overbatching grows only when needed.
+        let coordinator_memory_capacity = rollout_budget;
+        let worker_memory_capacity = rollout_budget.div_ceil(num_threads);
+
         let control = Arc::new(ThreadControl {
-            command: RwLock::new(ThreadCommand::Shutdown),
             remaining_steps: AtomicUsize::new(0),
-            barrier: Barrier::new(num_threads + 1),
         });
 
+        let (startup_sender, startup_recv) = channel();
+        let mut command_senders = Vec::with_capacity(num_threads);
         let mut threads = Vec::with_capacity(num_threads);
 
         for t in 0..num_threads {
-            let sender: Sender<DataResponse> = sender.clone();
+            let sender: Sender<WorkerResponse> = sender.clone();
+            let startup_sender = startup_sender.clone();
+            let (command_sender, command_recv) = channel();
+            command_senders.push(command_sender);
             let create_env_fn = create_env_fn.clone();
             let device = device.clone();
             let control = control.clone();
             let reward_sampling = reward_sampling.clone();
 
             let thread = thread::spawn(move || {
-                let mut batch_sim = BatchSim::new(
-                    create_env_fn,
-                    t + 1,
-                    num_games_per_thread,
-                    device,
-                    reward_sampling,
-                    max_episode_length,
-                    retain_overflow_episodes,
-                );
+                let batch_sim = catch_unwind(AssertUnwindSafe(|| {
+                    BatchSim::new(
+                        create_env_fn,
+                        t + 1,
+                        num_games_per_thread,
+                        device,
+                        reward_sampling,
+                        max_episode_length,
+                        retain_overflow_episodes,
+                    )
+                }));
+                let mut batch_sim = match batch_sim {
+                    Ok(batch_sim) => {
+                        let _ = startup_sender.send(Ok(()));
+                        batch_sim
+                    }
+                    Err(payload) => {
+                        let _ = startup_sender.send(Err(panic_message(payload)));
+                        return;
+                    }
+                };
 
-                loop {
-                    control.barrier.wait();
-                    let command = {
-                        let guard = control.command.read();
-                        guard.clone()
-                    };
-
+                while let Ok(command) = command_recv.recv() {
                     match command {
                         ThreadCommand::Run { model, self_play } => {
-                            let (memory, metrics) = batch_sim.run_with_budget(
-                                model.as_ref(),
-                                &control.remaining_steps,
-                                memory_capacity,
-                                self_play.as_ref().map(|(m, t)| (m.as_ref(), *t)),
-                                overbatching,
-                            );
-
-                            sender.send(DataResponse { memory, metrics }).unwrap();
+                            let response = catch_unwind(AssertUnwindSafe(|| {
+                                let (memory, metrics) = batch_sim.run_with_budget(
+                                    model.as_ref(),
+                                    &control.remaining_steps,
+                                    worker_memory_capacity,
+                                    rollout_budget,
+                                    self_play.as_ref().map(|(m, t)| (m.as_ref(), *t)),
+                                    overbatching,
+                                );
+                                DataResponse { memory, metrics }
+                            }))
+                            .map_err(panic_message);
+                            let failed = response.is_err();
+                            if sender.send(response).is_err() || failed {
+                                break;
+                            }
                         }
                         ThreadCommand::Shutdown => break,
                     }
@@ -146,15 +217,37 @@ where
             });
             threads.push(thread);
         }
+        drop(startup_sender);
+
+        for _ in 0..num_threads {
+            match startup_recv.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => {
+                    drop(command_senders);
+                    for thread in threads {
+                        let _ = thread.join();
+                    }
+                    panic!("collector worker failed to initialize: {message}");
+                }
+                Err(_) => {
+                    drop(command_senders);
+                    for thread in threads {
+                        let _ = thread.join();
+                    }
+                    panic!("collector worker disconnected during initialization");
+                }
+            }
+        }
 
         Self {
             recv,
+            command_senders,
             control,
             threads,
-            memory: Memory::with_capacity(memory_capacity),
+            memory: Memory::with_capacity(coordinator_memory_capacity),
             metrics: Report::default(),
-            batch_size,
-            pending_responses: 0,
+            rollout_budget,
+            overbatching,
             _marker: PhantomData,
         }
     }
@@ -170,51 +263,120 @@ where
         model: Actic<B>,
         self_play: Option<(Actic<B>, usize)>,
     ) -> (&Memory, Report) {
-        self.discard_pending_responses();
         self.metrics.clear();
         self.memory.clear();
 
         self.control
             .remaining_steps
-            .store(self.batch_size, Ordering::Release);
-        *self.control.command.write() = ThreadCommand::Run {
+            .store(self.rollout_budget, Ordering::Release);
+        let command = ThreadCommand::Run {
             model: Arc::new(model),
             self_play: self_play.map(|(model, team)| (Arc::new(model), team)),
         };
-        self.control.barrier.wait();
-
-        let mut received = 0;
-        while received < self.threads.len() {
-            let response = self.recv.recv().unwrap();
-            received += 1;
-            self.memory.merge(response.memory);
-            self.metrics += response.metrics;
-
-            if self.memory.len() >= self.batch_size {
-                break;
-            }
+        for sender in &self.command_senders {
+            sender
+                .send(command.clone())
+                .expect("collector worker disconnected before rollout");
         }
-        self.pending_responses = self.threads.len() - received;
+
+        collect_worker_responses(
+            &self.recv,
+            self.threads.len(),
+            &mut self.memory,
+            &mut self.metrics,
+            self.rollout_budget,
+            self.overbatching,
+        )
+        .unwrap_or_else(|message| panic!("collector rollout failed: {message}"));
 
         (&self.memory, self.metrics.clone())
     }
 
-    fn discard_pending_responses(&mut self) {
-        for _ in 0..self.pending_responses {
-            let _ = self.recv.recv().unwrap();
+    pub fn join(self) {
+        for sender in self.command_senders {
+            let _ = sender.send(ThreadCommand::Shutdown);
         }
-        self.pending_responses = 0;
+        for thread in self.threads {
+            thread.join().expect("collector worker panicked");
+        }
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use crate::base::TerminalState;
+
+    fn memory(start: usize, count: usize) -> Memory {
+        let mut memory = Memory::with_capacity(count);
+        memory.push_player(
+            (start..start + count).map(|i| vec![i as f32]).collect(),
+            (start..start + count).collect(),
+            vec![0.0; count],
+            vec![1.0; count],
+            vec![TerminalState::None; count],
+            vec![vec![true]; count],
+            None,
+        );
+        memory
     }
 
-    pub fn join(mut self) {
-        self.discard_pending_responses();
-
-        // Signal shutdown.
-        *self.control.command.write() = ThreadCommand::Shutdown;
-        self.control.barrier.wait();
-
-        for thread in self.threads {
-            thread.join().unwrap();
+    #[test]
+    fn regression_overbatching_receives_and_merges_every_worker_response() {
+        let (sender, receiver) = channel();
+        for (start, count) in [(0, 60), (60, 60), (120, 30)] {
+            sender
+                .send(Ok(DataResponse {
+                    memory: memory(start, count),
+                    metrics: Report::default(),
+                }))
+                .unwrap();
         }
+
+        let mut target = Memory::with_capacity(100);
+        let mut metrics = Report::default();
+        collect_worker_responses(&receiver, 3, &mut target, &mut metrics, 100, true).unwrap();
+
+        assert_eq!(target.len(), 150);
+        assert_eq!(target.actions().first(), Some(&0));
+        assert_eq!(target.actions().last(), Some(&149));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn regression_worker_failure_returns_without_waiting_for_other_responses() {
+        let (sender, receiver) = channel();
+        sender
+            .send(Err("simulated worker panic".to_owned()))
+            .unwrap();
+        sender
+            .send(Ok(DataResponse {
+                memory: memory(0, 10),
+                metrics: Report::default(),
+            }))
+            .unwrap();
+
+        let mut target = Memory::with_capacity(10);
+        let mut metrics = Report::default();
+        let error = collect_worker_responses(&receiver, 2, &mut target, &mut metrics, 10, false)
+            .unwrap_err();
+
+        assert_eq!(error, "simulated worker panic");
+        assert!(target.is_empty());
+    }
+
+    #[test]
+    fn regression_exact_batching_discards_worker_overflow() {
+        let mut target = Memory::with_capacity(100);
+        merge_worker_memory(&mut target, memory(0, 60), 100, false);
+        merge_worker_memory(&mut target, memory(60, 60), 100, false);
+        merge_worker_memory(&mut target, memory(120, 30), 100, false);
+
+        assert_eq!(target.len(), 100);
+        assert_eq!(target.actions().first(), Some(&0));
+        assert_eq!(target.actions().last(), Some(&99));
     }
 }

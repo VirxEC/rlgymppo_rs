@@ -1,5 +1,4 @@
 use burn::prelude::*;
-use ringbuffer::{AllocRingBuffer, RingBuffer};
 
 /// Terminal-state encoding.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -10,12 +9,12 @@ pub enum TerminalState {
     Truncated,
 }
 
-pub fn get_batch_1d<T: Copy>(data: &AllocRingBuffer<T>, indices: &[usize]) -> Vec<T> {
+pub fn get_batch_1d<T: Copy>(data: &[T], indices: &[usize]) -> Vec<T> {
     indices.iter().map(|i| data[*i]).collect::<Vec<_>>()
 }
 
 pub fn get_states_batch<B: Backend>(
-    data: &AllocRingBuffer<Vec<f32>>,
+    data: &[Vec<f32>],
     indices: &[usize],
     device: &B::Device,
 ) -> Tensor<B, 2> {
@@ -29,7 +28,7 @@ pub fn get_states_batch<B: Backend>(
 }
 
 pub fn get_states_batch_range<B: Backend>(
-    data: &AllocRingBuffer<Vec<f32>>,
+    data: &[Vec<f32>],
     start: usize,
     end: usize,
     device: &B::Device,
@@ -43,7 +42,7 @@ pub fn get_states_batch_range<B: Backend>(
 }
 
 pub fn get_log_probs_batch<B: Backend>(
-    data: &AllocRingBuffer<f32>,
+    data: &[f32],
     indices: &[usize],
     device: &B::Device,
 ) -> Tensor<B, 2> {
@@ -56,7 +55,7 @@ pub fn get_log_probs_batch<B: Backend>(
 }
 
 pub fn get_action_batch<B: Backend>(
-    data: &AllocRingBuffer<usize>,
+    data: &[usize],
     indices: &[usize],
     device: &B::Device,
 ) -> Tensor<B, 2, Int> {
@@ -84,7 +83,7 @@ pub fn get_generic_batch<B: Backend>(
 
 /// Flatten per-player action masks into a [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
 pub fn get_action_masks_batch<B: Backend>(
-    data: &AllocRingBuffer<Vec<bool>>,
+    data: &[Vec<bool>],
     indices: &[usize],
     device: &B::Device,
 ) -> Tensor<B, 2> {
@@ -101,17 +100,17 @@ pub fn get_action_masks_batch<B: Backend>(
 
 #[derive(Clone)]
 pub struct Memory {
-    states: AllocRingBuffer<Vec<f32>>,
-    actions: AllocRingBuffer<usize>,
-    log_probs: AllocRingBuffer<f32>,
-    rewards: AllocRingBuffer<f32>,
+    states: Vec<Vec<f32>>,
+    actions: Vec<usize>,
+    log_probs: Vec<f32>,
+    rewards: Vec<f32>,
     /// Unified terminal encoding per step: TERMINAL_NONE / NORMAL / TRUNCATED.
-    terminals: AllocRingBuffer<TerminalState>,
+    terminals: Vec<TerminalState>,
     /// Observations immediately after a truncated step, used for critic bootstrapping.
     /// Stored in the same order as TERMINAL_TRUNCATED entries appear in `terminals`.
-    trunc_next_states: AllocRingBuffer<Vec<f32>>,
+    trunc_next_states: Vec<Vec<f32>>,
     /// Action-validity mask per player-step, stored in the same order as `states`.
-    action_masks: AllocRingBuffer<Vec<bool>>,
+    action_masks: Vec<Vec<bool>>,
 }
 
 impl Default for Memory {
@@ -123,13 +122,15 @@ impl Default for Memory {
 impl Memory {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            states: AllocRingBuffer::new(capacity),
-            actions: AllocRingBuffer::new(capacity),
-            log_probs: AllocRingBuffer::new(capacity),
-            rewards: AllocRingBuffer::new(capacity),
-            terminals: AllocRingBuffer::new(capacity),
-            trunc_next_states: AllocRingBuffer::new(capacity),
-            action_masks: AllocRingBuffer::new(capacity),
+            states: Vec::with_capacity(capacity),
+            actions: Vec::with_capacity(capacity),
+            log_probs: Vec::with_capacity(capacity),
+            rewards: Vec::with_capacity(capacity),
+            terminals: Vec::with_capacity(capacity),
+            // Truncations are sparse relative to rollout steps, so reserving one
+            // slot per step wastes substantial CPU memory.
+            trunc_next_states: Vec::new(),
+            action_masks: Vec::with_capacity(capacity),
         }
     }
 
@@ -161,7 +162,7 @@ impl Memory {
         self.terminals.extend(terminals);
         self.action_masks.extend(action_masks);
         if let Some(ns) = trunc_next_state {
-            self.trunc_next_states.enqueue(ns);
+            self.trunc_next_states.push(ns);
         }
     }
 
@@ -175,31 +176,69 @@ impl Memory {
         self.action_masks.extend(other.action_masks);
     }
 
-    pub fn states(&self) -> &AllocRingBuffer<Vec<f32>> {
+    /// Move at most `max_steps` samples from `other` into this memory.
+    ///
+    /// Truncation next states are stored independently, in terminal order, so
+    /// only the entries associated with truncated steps in the moved prefix are
+    /// retained. The unclaimed suffix is dropped with `other`.
+    pub fn merge_prefix(&mut self, other: Memory, max_steps: usize) {
+        let steps = max_steps.min(other.len());
+        if steps == 0 {
+            return;
+        }
+
+        let truncations = other
+            .terminals
+            .iter()
+            .take(steps)
+            .filter(|&&terminal| terminal == TerminalState::Truncated)
+            .count();
+        let Memory {
+            states,
+            actions,
+            log_probs,
+            rewards,
+            terminals,
+            trunc_next_states,
+            action_masks,
+        } = other;
+
+        self.states.extend(states.into_iter().take(steps));
+        self.actions.extend(actions.into_iter().take(steps));
+        self.log_probs.extend(log_probs.into_iter().take(steps));
+        self.rewards.extend(rewards.into_iter().take(steps));
+        self.terminals.extend(terminals.into_iter().take(steps));
+        self.action_masks
+            .extend(action_masks.into_iter().take(steps));
+        self.trunc_next_states
+            .extend(trunc_next_states.into_iter().take(truncations));
+    }
+
+    pub fn states(&self) -> &[Vec<f32>] {
         &self.states
     }
 
-    pub fn actions(&self) -> &AllocRingBuffer<usize> {
+    pub fn actions(&self) -> &[usize] {
         &self.actions
     }
 
-    pub fn log_probs(&self) -> &AllocRingBuffer<f32> {
+    pub fn log_probs(&self) -> &[f32] {
         &self.log_probs
     }
 
-    pub fn rewards(&self) -> &AllocRingBuffer<f32> {
+    pub fn rewards(&self) -> &[f32] {
         &self.rewards
     }
 
-    pub fn terminals(&self) -> &AllocRingBuffer<TerminalState> {
+    pub fn terminals(&self) -> &[TerminalState] {
         &self.terminals
     }
 
-    pub fn trunc_next_states(&self) -> &AllocRingBuffer<Vec<f32>> {
+    pub fn trunc_next_states(&self) -> &[Vec<f32>] {
         &self.trunc_next_states
     }
 
-    pub fn action_masks(&self) -> &AllocRingBuffer<Vec<bool>> {
+    pub fn action_masks(&self) -> &[Vec<bool>] {
         &self.action_masks
     }
 
@@ -219,5 +258,65 @@ impl Memory {
         self.terminals.clear();
         self.trunc_next_states.clear();
         self.action_masks.clear();
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn push_steps(memory: &mut Memory, start: usize, count: usize, terminal: TerminalState) {
+        let mut terminals = vec![TerminalState::None; count];
+        if let Some(last) = terminals.last_mut() {
+            *last = terminal;
+        }
+        memory.push_player(
+            (start..start + count).map(|i| vec![i as f32]).collect(),
+            (start..start + count).collect(),
+            vec![0.0; count],
+            vec![1.0; count],
+            terminals,
+            vec![vec![true]; count],
+            (terminal == TerminalState::Truncated).then(|| vec![(start + count) as f32]),
+        );
+    }
+
+    #[test]
+    fn regression_capacity_hint_does_not_drop_rollout_samples() {
+        let mut memory = Memory::with_capacity(2);
+        push_steps(&mut memory, 0, 5, TerminalState::None);
+
+        assert_eq!(memory.len(), 5);
+        assert_eq!(memory.actions(), &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn regression_prefix_merge_keeps_matching_truncation_states() {
+        let mut source = Memory::with_capacity(1);
+        push_steps(&mut source, 0, 1, TerminalState::Truncated);
+        push_steps(&mut source, 1, 1, TerminalState::Truncated);
+        push_steps(&mut source, 2, 2, TerminalState::Truncated);
+
+        let mut destination = Memory::with_capacity(3);
+        destination.merge_prefix(source, 3);
+
+        assert_eq!(destination.actions(), &[0, 1, 2]);
+        assert_eq!(
+            destination.terminals(),
+            &[
+                TerminalState::Truncated,
+                TerminalState::Truncated,
+                TerminalState::None,
+            ]
+        );
+        assert_eq!(destination.trunc_next_states(), &[vec![1.0], vec![2.0]]);
+    }
+
+    #[test]
+    fn regression_truncation_storage_is_not_preallocated_per_step() {
+        let memory = Memory::with_capacity(10_000);
+
+        assert_eq!(memory.trunc_next_states.capacity(), 0);
+        assert!(memory.states.capacity() >= 10_000);
     }
 }

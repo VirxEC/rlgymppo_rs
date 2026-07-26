@@ -17,27 +17,32 @@ use crate::utils::Report;
 use crate::utils::shared_info::SharedInfoReport;
 
 pub struct DataResponse {
+    pub worker_index: usize,
     pub memory: Memory,
     pub metrics: Report,
 }
 
 fn merge_worker_memory(
     target: &mut Memory,
-    incoming: Memory,
+    mut incoming: Memory,
     rollout_budget: usize,
     overbatching: bool,
-) {
+) -> Memory {
     if overbatching {
-        target.merge(incoming);
-        return;
+        target.merge_retain_capacity(&mut incoming);
+    } else {
+        let remaining = rollout_budget.saturating_sub(target.len());
+        if incoming.len() <= remaining {
+            target.merge_retain_capacity(&mut incoming);
+        } else if remaining > 0 {
+            target.merge_prefix_retain_capacity(&mut incoming, remaining);
+        }
     }
 
-    let remaining = rollout_budget.saturating_sub(target.len());
-    if incoming.len() <= remaining {
-        target.merge(incoming);
-    } else if remaining > 0 {
-        target.merge_prefix(incoming, remaining);
-    }
+    // Drop any unclaimed suffix values while retaining this worker's baseline
+    // allocations for the next collection call.
+    incoming.clear();
+    incoming
 }
 
 type WorkerResponse = Result<DataResponse, String>;
@@ -57,12 +62,15 @@ fn collect_worker_responses(
     metrics: &mut Report,
     rollout_budget: usize,
     overbatching: bool,
+    mut recycle_memory: impl FnMut(usize, Memory),
 ) -> Result<(), String> {
     for _ in 0..response_count {
         let response = recv
             .recv()
             .map_err(|_| "collector worker disconnected without a response".to_owned())??;
-        merge_worker_memory(target, response.memory, rollout_budget, overbatching);
+        let worker_index = response.worker_index;
+        let memory = merge_worker_memory(target, response.memory, rollout_budget, overbatching);
+        recycle_memory(worker_index, memory);
         *metrics += response.metrics;
     }
     Ok(())
@@ -74,6 +82,7 @@ enum ThreadCommand<B: Backend> {
         model: Arc<Actic<B>>,
         self_play: Option<(Arc<Actic<B>>, usize)>,
     },
+    Recycle(Memory),
     Shutdown,
 }
 
@@ -190,20 +199,26 @@ where
                         return;
                     }
                 };
+                let mut worker_memory = Memory::with_capacity(worker_memory_capacity);
 
                 while let Ok(command) = command_recv.recv() {
                     match command {
                         ThreadCommand::Run { model, self_play } => {
+                            let memory = std::mem::take(&mut worker_memory);
                             let response = catch_unwind(AssertUnwindSafe(|| {
                                 let (memory, metrics) = batch_sim.run_with_budget(
                                     model.as_ref(),
                                     &control.remaining_steps,
-                                    worker_memory_capacity,
+                                    memory,
                                     rollout_budget,
                                     self_play.as_ref().map(|(m, t)| (m.as_ref(), *t)),
                                     overbatching,
                                 );
-                                DataResponse { memory, metrics }
+                                DataResponse {
+                                    worker_index: t,
+                                    memory,
+                                    metrics,
+                                }
                             }))
                             .map_err(panic_message);
                             let failed = response.is_err();
@@ -211,6 +226,7 @@ where
                                 break;
                             }
                         }
+                        ThreadCommand::Recycle(memory) => worker_memory = memory,
                         ThreadCommand::Shutdown => break,
                     }
                 }
@@ -279,6 +295,7 @@ where
                 .expect("collector worker disconnected before rollout");
         }
 
+        let command_senders = &self.command_senders;
         collect_worker_responses(
             &self.recv,
             self.threads.len(),
@@ -286,6 +303,11 @@ where
             &mut self.metrics,
             self.rollout_budget,
             self.overbatching,
+            |worker_index, memory| {
+                command_senders[worker_index]
+                    .send(ThreadCommand::Recycle(memory))
+                    .expect("collector worker disconnected before memory recycle");
+            },
         )
         .unwrap_or_else(|message| panic!("collector rollout failed: {message}"));
 
@@ -329,6 +351,7 @@ mod regression_tests {
         for (start, count) in [(0, 60), (60, 60), (120, 30)] {
             sender
                 .send(Ok(DataResponse {
+                    worker_index: start / 60,
                     memory: memory(start, count),
                     metrics: Report::default(),
                 }))
@@ -337,7 +360,16 @@ mod regression_tests {
 
         let mut target = Memory::with_capacity(100);
         let mut metrics = Report::default();
-        collect_worker_responses(&receiver, 3, &mut target, &mut metrics, 100, true).unwrap();
+        collect_worker_responses(
+            &receiver,
+            3,
+            &mut target,
+            &mut metrics,
+            100,
+            true,
+            |_, _| {},
+        )
+        .unwrap();
 
         assert_eq!(target.len(), 150);
         assert_eq!(target.actions().first(), Some(&0));
@@ -356,6 +388,7 @@ mod regression_tests {
             .unwrap();
         sender
             .send(Ok(DataResponse {
+                worker_index: 0,
                 memory: memory(0, 10),
                 metrics: Report::default(),
             }))
@@ -363,8 +396,16 @@ mod regression_tests {
 
         let mut target = Memory::with_capacity(10);
         let mut metrics = Report::default();
-        let error = collect_worker_responses(&receiver, 2, &mut target, &mut metrics, 10, false)
-            .unwrap_err();
+        let error = collect_worker_responses(
+            &receiver,
+            2,
+            &mut target,
+            &mut metrics,
+            10,
+            false,
+            |_, _| {},
+        )
+        .unwrap_err();
 
         assert_eq!(error, "simulated worker panic");
         assert!(target.is_empty());
@@ -373,9 +414,9 @@ mod regression_tests {
     #[test]
     fn regression_exact_batching_discards_worker_overflow() {
         let mut target = Memory::with_capacity(100);
-        merge_worker_memory(&mut target, memory(0, 60), 100, false);
-        merge_worker_memory(&mut target, memory(60, 60), 100, false);
-        merge_worker_memory(&mut target, memory(120, 30), 100, false);
+        let _ = merge_worker_memory(&mut target, memory(0, 60), 100, false);
+        let _ = merge_worker_memory(&mut target, memory(60, 60), 100, false);
+        let _ = merge_worker_memory(&mut target, memory(120, 30), 100, false);
 
         assert_eq!(target.len(), 100);
         assert_eq!(target.actions().first(), Some(&0));

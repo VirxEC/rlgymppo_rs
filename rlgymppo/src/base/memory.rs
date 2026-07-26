@@ -234,6 +234,51 @@ impl Memory {
         self.action_masks.extend(action_masks);
     }
 
+    /// Merge all samples from `other` while leaving its allocations available
+    /// for reuse by the caller.
+    pub fn merge_retain_capacity(&mut self, other: &mut Memory) {
+        if !other.actions.is_empty() {
+            self.set_widths(other.state_width, other.action_mask_width);
+        }
+        self.states.append(&mut other.states);
+        self.actions.append(&mut other.actions);
+        self.log_probs.append(&mut other.log_probs);
+        self.rewards.append(&mut other.rewards);
+        self.terminals.append(&mut other.terminals);
+        self.trunc_next_states.append(&mut other.trunc_next_states);
+        self.action_masks.append(&mut other.action_masks);
+    }
+
+    /// Merge at most `max_steps` samples from `other` while leaving its
+    /// allocations available for reuse by the caller.
+    pub fn merge_prefix_retain_capacity(&mut self, other: &mut Memory, max_steps: usize) {
+        let steps = max_steps.min(other.len());
+        if steps == 0 {
+            return;
+        }
+
+        let truncations = other
+            .terminals
+            .iter()
+            .take(steps)
+            .filter(|&&terminal| terminal == TerminalState::Truncated)
+            .count();
+        self.set_widths(other.state_width, other.action_mask_width);
+        self.states
+            .extend(other.states.drain(..steps * other.state_width));
+        self.actions.extend(other.actions.drain(..steps));
+        self.log_probs.extend(other.log_probs.drain(..steps));
+        self.rewards.extend(other.rewards.drain(..steps));
+        self.terminals.extend(other.terminals.drain(..steps));
+        self.action_masks
+            .extend(other.action_masks.drain(..steps * other.action_mask_width));
+        self.trunc_next_states.extend(
+            other
+                .trunc_next_states
+                .drain(..truncations * other.state_width),
+        );
+    }
+
     /// Move at most `max_steps` samples from `other` into this memory.
     ///
     /// Truncation next states are stored independently, in terminal order, so
@@ -382,6 +427,45 @@ mod regression_tests {
 
         assert_eq!(memory.len(), 5);
         assert_eq!(memory.actions(), &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn regression_retain_capacity_merge_keeps_worker_allocations_reusable() {
+        let mut source = Memory::with_capacity(2);
+        push_steps(&mut source, 0, 5, TerminalState::None);
+        let mut destination = Memory::with_capacity(5);
+        destination.merge_retain_capacity(&mut source);
+        source.clear();
+
+        assert!(source.states.capacity() >= source.baseline_steps * source.state_width);
+        assert!(source.actions.capacity() >= source.baseline_steps);
+        assert!(source.is_empty());
+        assert_eq!(destination.len(), 5);
+    }
+
+    #[test]
+    fn regression_prefix_retain_capacity_keeps_matching_truncation_states() {
+        let mut source = Memory::with_capacity(1);
+        push_steps(&mut source, 0, 1, TerminalState::Truncated);
+        push_steps(&mut source, 1, 1, TerminalState::Truncated);
+        push_steps(&mut source, 2, 2, TerminalState::Truncated);
+
+        let mut destination = Memory::with_capacity(3);
+        destination.merge_prefix_retain_capacity(&mut source, 3);
+        source.clear();
+
+        assert_eq!(destination.actions(), &[0, 1, 2]);
+        assert_eq!(
+            destination.terminals(),
+            &[
+                TerminalState::Truncated,
+                TerminalState::Truncated,
+                TerminalState::None,
+            ]
+        );
+        assert_eq!(destination.trunc_next_states(), &[1.0, 2.0]);
+        assert!(source.is_empty());
+        assert!(source.states.capacity() >= source.baseline_steps * source.state_width);
     }
 
     #[test]

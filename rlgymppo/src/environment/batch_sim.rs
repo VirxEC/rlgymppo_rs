@@ -16,24 +16,64 @@ use crate::utils::shared_info::SharedInfoReport;
 /// so incomplete episodes carry over to the next iteration.
 #[derive(Default)]
 struct PlayerTraj {
-    states: Vec<Vec<f32>>,
+    /// Per-step observations stored row-major as `[step * state_width..]`.
+    states: Vec<f32>,
+    state_width: usize,
     actions: Vec<usize>,
     log_probs: Vec<f32>,
     rewards: Vec<f32>,
     terminals: Vec<TerminalState>,
-    action_masks: Vec<Vec<bool>>,
+    /// Per-step action masks stored row-major.
+    action_masks: Vec<bool>,
+    action_mask_width: usize,
 }
 
 impl PlayerTraj {
+    fn with_width(state_width: usize, action_mask_width: usize) -> Self {
+        Self {
+            state_width,
+            action_mask_width,
+            ..Self::default()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.actions.len()
+    }
+
+    /// Move the accumulated samples out while keeping this slot ready for the
+    /// next episode with the same row widths.
+    fn take(&mut self) -> Self {
+        let state_width = self.state_width;
+        let action_mask_width = self.action_mask_width;
+        mem::replace(self, Self::with_width(state_width, action_mask_width))
+    }
+
     fn split_off(&mut self, at: usize) -> Self {
         Self {
-            states: self.states.split_off(at),
+            states: self.states.split_off(at * self.state_width),
+            state_width: self.state_width,
             actions: self.actions.split_off(at),
             log_probs: self.log_probs.split_off(at),
             rewards: self.rewards.split_off(at),
             terminals: self.terminals.split_off(at),
-            action_masks: self.action_masks.split_off(at),
+            action_masks: self.action_masks.split_off(at * self.action_mask_width),
+            action_mask_width: self.action_mask_width,
         }
+    }
+
+    fn state_at(&self, index: usize) -> Vec<f32> {
+        let start = index * self.state_width;
+        self.states[start..start + self.state_width].to_vec()
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.states.truncate(len * self.state_width);
+        self.actions.truncate(len);
+        self.log_probs.truncate(len);
+        self.rewards.truncate(len);
+        self.terminals.truncate(len);
+        self.action_masks.truncate(len * self.action_mask_width);
     }
 }
 
@@ -56,12 +96,12 @@ fn partition_claimed_trajectory(
     claimed: usize,
     retain_overflow: bool,
 ) -> TrajectoryPartition {
-    debug_assert!(claimed <= traj.states.len());
+    debug_assert!(claimed <= traj.len());
 
-    if claimed == traj.states.len() {
+    if claimed == traj.len() {
         return TrajectoryPartition {
             claimed: Some(ClaimedTrajectory {
-                len: traj.states.len(),
+                len: traj.len(),
                 trajectory: traj,
                 next_state: trunc_next_state,
             }),
@@ -75,7 +115,7 @@ fn partition_claimed_trajectory(
         };
     }
 
-    let boundary_next_state = Some(traj.states[claimed].clone());
+    let boundary_next_state = Some(traj.state_at(claimed));
     let overflow = retain_overflow.then(|| (traj.split_off(claimed), trunc_next_state));
     TrajectoryPartition {
         claimed: Some(ClaimedTrajectory {
@@ -128,13 +168,8 @@ fn push_traj_prefix(
     len: usize,
     trunc_next_state: Option<Vec<f32>>,
 ) {
-    let len = len.min(traj.states.len());
-    traj.states.truncate(len);
-    traj.actions.truncate(len);
-    traj.log_probs.truncate(len);
-    traj.rewards.truncate(len);
-    traj.terminals.truncate(len);
-    traj.action_masks.truncate(len);
+    let len = len.min(traj.len());
+    traj.truncate(len);
     if trunc_next_state.is_some()
         && let Some(terminal) = traj.terminals.last_mut()
     {
@@ -143,11 +178,13 @@ fn push_traj_prefix(
 
     memory.push_player(
         traj.states,
+        traj.state_width,
         traj.actions,
         traj.log_probs,
         traj.rewards,
         traj.terminals,
         traj.action_masks,
+        traj.action_mask_width,
         trunc_next_state,
     );
 }
@@ -161,7 +198,7 @@ fn reached_max_episode_length(
 ) -> bool {
     max_episode_length.is_some_and(|max_len| {
         (player_start..player_start + player_count)
-            .any(|ti| player_is_tracked[ti] && player_trajs[ti].states.len() >= max_len)
+            .any(|ti| player_is_tracked[ti] && player_trajs[ti].len() >= max_len)
     })
 }
 
@@ -247,7 +284,12 @@ where
         }
 
         let total_players: usize = np.iter().sum();
-        let player_trajs = (0..total_players).map(|_| PlayerTraj::default()).collect();
+        let state_width = next_obs.first().map_or(0, Vec::len);
+        let action_mask_width = next_masks.first().map_or(0, Vec::len);
+        debug_assert!(state_width > 0);
+        let player_trajs = (0..total_players)
+            .map(|_| PlayerTraj::with_width(state_width, action_mask_width))
+            .collect();
 
         Self {
             metrics: Report::default(),
@@ -306,8 +348,7 @@ where
                 break;
             };
             if overbatching {
-                let claimed =
-                    claim_overbatch_steps(remaining_steps, traj.states.len(), rollout_budget);
+                let claimed = claim_overbatch_steps(remaining_steps, traj.len(), rollout_budget);
                 let partition = partition_claimed_trajectory(traj, trunc_next_state, claimed, true);
                 push_claimed_trajectory(&mut memory, partition.claimed);
                 if let Some(overflow) = partition.overflow {
@@ -317,7 +358,7 @@ where
                     break;
                 }
             } else {
-                let claimed = claim_available_steps(remaining_steps, traj.states.len());
+                let claimed = claim_available_steps(remaining_steps, traj.len());
                 let partition = partition_claimed_trajectory(traj, trunc_next_state, claimed, true);
                 push_claimed_trajectory(&mut memory, partition.claimed);
                 if let Some(overflow) = partition.overflow {
@@ -430,8 +471,8 @@ where
             // Record pre‑step observations (current-policy only).
             for (i, (obs, mask)) in self.next_obs.iter().zip(self.next_masks.iter()).enumerate() {
                 if player_is_tracked[i] {
-                    self.player_trajs[i].states.push(obs.clone());
-                    self.player_trajs[i].action_masks.push(mask.clone());
+                    self.player_trajs[i].states.extend_from_slice(obs);
+                    self.player_trajs[i].action_masks.extend_from_slice(mask);
                 }
             }
 
@@ -498,10 +539,10 @@ where
                     for p in 0..n {
                         let ti = player_start + p;
                         if player_is_tracked[ti] {
-                            let traj_len = self.player_trajs[ti].states.len();
+                            let traj_len = self.player_trajs[ti].len();
                             let trunc_next = (terminal_type == TerminalState::Truncated)
                                 .then(|| result.obs[p].clone());
-                            let traj = mem::take(&mut self.player_trajs[ti]);
+                            let traj = self.player_trajs[ti].take();
                             if overbatching {
                                 let claimed = claim_overbatch_steps(
                                     remaining_steps,
@@ -533,7 +574,7 @@ where
                             }
                         } else {
                             // Discard untracked player's buffers.
-                            let _ = mem::take(&mut self.player_trajs[ti]);
+                            let _ = self.player_trajs[ti].take();
                         }
                     }
 
@@ -598,13 +639,39 @@ mod regression_tests {
         let mut terminals = vec![TerminalState::None; len];
         *terminals.last_mut().unwrap() = TerminalState::Normal;
         PlayerTraj {
-            states: (0..len).map(|i| vec![i as f32]).collect(),
+            states: (0..len).map(|i| i as f32).collect(),
+            state_width: 1,
             actions: (0..len).collect(),
             log_probs: vec![0.0; len],
             rewards: vec![1.0; len],
             terminals,
-            action_masks: vec![vec![true]; len],
+            action_masks: vec![true; len],
+            action_mask_width: 1,
         }
+    }
+
+    #[test]
+    fn regression_episode_reuse_preserves_flat_row_widths() {
+        let mut trajectory = PlayerTraj::with_width(2, 1);
+        trajectory.states.extend_from_slice(&[1.0, 2.0]);
+        trajectory.actions.push(0);
+        trajectory.log_probs.push(0.0);
+        trajectory.rewards.push(1.0);
+        trajectory.terminals.push(TerminalState::Normal);
+        trajectory.action_masks.push(true);
+
+        let _completed = trajectory.take();
+        trajectory.states.extend_from_slice(&[3.0, 4.0]);
+        trajectory.actions.push(1);
+        trajectory.log_probs.push(0.0);
+        trajectory.rewards.push(1.0);
+        trajectory.terminals.push(TerminalState::Normal);
+        trajectory.action_masks.push(false);
+        trajectory.truncate(1);
+
+        assert_eq!(trajectory.states, &[3.0, 4.0]);
+        assert_eq!(trajectory.actions, &[1]);
+        assert_eq!(trajectory.action_masks, &[false]);
     }
 
     #[test]
@@ -647,7 +714,7 @@ mod regression_tests {
         assert!(partition.overflow.is_none());
         assert_eq!(memory.len(), 2);
         assert_eq!(memory.terminals().last(), Some(&TerminalState::Truncated));
-        assert_eq!(memory.trunc_next_states(), &[vec![2.0]]);
+        assert_eq!(memory.trunc_next_states(), &[2.0]);
     }
 
     #[test]
@@ -658,7 +725,7 @@ mod regression_tests {
 
         let partition = partition_claimed_trajectory(trajectory(3), None, 0, true);
         assert!(partition.claimed.is_none());
-        assert_eq!(partition.overflow.unwrap().0.states.len(), 3);
+        assert_eq!(partition.overflow.unwrap().0.len(), 3);
     }
 
     #[test]

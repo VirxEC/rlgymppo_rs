@@ -147,6 +147,10 @@ impl PpoLearnerConfig {
             self.gpu_timestep_buffer_size > 0,
             "GPU timestep buffer size must be greater than zero"
         );
+        assert!(
+            self.truncation_value_batch_size > 0,
+            "Truncation value batch size must be greater than zero"
+        );
         assert_eq!(
             self.timesteps_per_iteration % self.batch_size,
             0,
@@ -181,5 +185,20 @@ impl PpoLearnerConfig {
         self.validate_batching();
 
         Ppo::new_with_model(self, device, model, make_optim)
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "Truncation value batch size must be greater than zero")]
+    fn regression_zero_truncation_value_batch_size_is_rejected() {
+        let config = PpoLearnerConfig {
+            truncation_value_batch_size: 0,
+            ..PpoLearnerConfig::default()
+        };
+        config.validate_batching();
     }
 }

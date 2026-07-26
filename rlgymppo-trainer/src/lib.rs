@@ -165,8 +165,6 @@ pub fn default_config<B: AutodiffBackend>(
             learning_rate: lr,
             entropy_scale: 0.024,
             max_episode_length: None,
-            overbatching: false,
-            retain_overflow_episodes: false,
             ..Default::default()
         },
         self_play: SelfPlayConfig {

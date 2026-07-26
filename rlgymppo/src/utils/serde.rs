@@ -107,9 +107,17 @@ pub fn latest_checkpoint_folder(base_folder: &Path) -> Option<PathBuf> {
     };
 
     folders
-        .filter_map(|entry| entry.ok())
-        .max_by_key(|entry| entry.file_name().to_str().unwrap().parse::<u64>().ok())
-        .map(|entry| entry.path())
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let timestep = entry.file_name().to_str()?.parse::<u64>().ok()?;
+            Some((timestep, path))
+        })
+        .max_by_key(|(timestep, _)| *timestep)
+        .map(|(_, path)| path)
 }
 
 pub fn load_latest_model<B: Backend, P: AsRef<Path>>(
@@ -167,4 +175,29 @@ pub fn load_model<B: Backend, P: AsRef<Path>>(
         },
         stats,
     )
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn regression_checkpoint_discovery_ignores_policy_version_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "rlgymppo-serde-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("policy_versions")).unwrap();
+        fs::create_dir_all(root.join("20")).unwrap();
+        fs::create_dir_all(root.join("100")).unwrap();
+        fs::write(root.join("not-a-checkpoint"), []).unwrap();
+
+        assert_eq!(latest_checkpoint_folder(&root), Some(root.join("100")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

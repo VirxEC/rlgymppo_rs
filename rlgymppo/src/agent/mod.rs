@@ -165,6 +165,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 let end = (start + mb).min(n);
                 let states = get_states_batch_range::<B::InnerBackend>(
                     memory.states(),
+                    memory.state_width(),
                     start,
                     end,
                     &self.device,
@@ -192,13 +193,14 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             } else {
                 let nodiff_net = net.valid();
                 let mb = self.config.truncation_value_batch_size;
-                let n = memory.trunc_next_states().len();
+                let n = memory.truncation_len();
 
                 let mut values = Vec::with_capacity(n);
                 for start in (0..n).step_by(mb) {
                     let end = (start + mb).min(n);
                     let batch = get_states_batch_range::<B::InnerBackend>(
                         memory.trunc_next_states(),
+                        memory.state_width(),
                         start,
                         end,
                         &self.device,
@@ -560,13 +562,19 @@ impl<B: Backend> GpuBatch<B> {
         device: &B::Device,
     ) -> Self {
         Self {
-            states: get_states_batch(memory.states(), indices, device),
+            states: get_states_batch(memory.states(), memory.state_width(), indices, device),
             actions: get_action_batch(memory.actions(), indices, device),
             old_log_probs: get_log_probs_batch(memory.log_probs(), indices, device),
             advantages: get_generic_batch(advantages, indices, device),
             target_vals: get_generic_batch(target_vals, indices, device),
-            action_masks: (!memory.action_masks().is_empty())
-                .then(|| get_action_masks_batch(memory.action_masks(), indices, device)),
+            action_masks: (!memory.action_masks().is_empty()).then(|| {
+                get_action_masks_batch(
+                    memory.action_masks(),
+                    memory.action_mask_width(),
+                    indices,
+                    device,
+                )
+            }),
         }
     }
 

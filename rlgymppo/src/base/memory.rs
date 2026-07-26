@@ -14,31 +14,36 @@ pub fn get_batch_1d<T: Copy>(data: &[T], indices: &[usize]) -> Vec<T> {
 }
 
 pub fn get_states_batch<B: Backend>(
-    data: &[Vec<f32>],
+    data: &[f32],
+    width: usize,
     indices: &[usize],
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let shape = [indices.len(), data[0].len()];
-    let mut states = vec![0.0; shape[0] * shape[1]];
-    for (row, &i) in states.chunks_exact_mut(shape[1]).zip(indices) {
-        row.copy_from_slice(&data[i]);
+    let mut states = Vec::with_capacity(indices.len() * width);
+    for &index in indices {
+        let start = index * width;
+        states.extend_from_slice(&data[start..start + width]);
     }
 
-    Tensor::from_data(TensorData::new(states, shape), device)
+    Tensor::from_data(TensorData::new(states, [indices.len(), width]), device)
 }
 
 pub fn get_states_batch_range<B: Backend>(
-    data: &[Vec<f32>],
+    data: &[f32],
+    width: usize,
     start: usize,
     end: usize,
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let width = data[0].len();
-    let mut states = vec![0.0; (end - start) * width];
-    for (row, i) in states.chunks_exact_mut(width).zip(start..end) {
-        row.copy_from_slice(&data[i]);
-    }
-    Tensor::from_data(TensorData::new(states, [end - start, width]), device)
+    let start_offset = start * width;
+    let end_offset = end * width;
+    Tensor::from_data(
+        TensorData::new(
+            data[start_offset..end_offset].to_vec(),
+            [end - start, width],
+        ),
+        device,
+    )
 }
 
 pub fn get_log_probs_batch<B: Backend>(
@@ -83,34 +88,46 @@ pub fn get_generic_batch<B: Backend>(
 
 /// Flatten per-player action masks into a [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
 pub fn get_action_masks_batch<B: Backend>(
-    data: &[Vec<bool>],
+    data: &[bool],
+    width: usize,
     indices: &[usize],
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let shape = [indices.len(), data[0].len()];
-    let mut masks = vec![0.0; shape[0] * shape[1]];
-    for (row, &i) in masks.chunks_exact_mut(shape[1]).zip(indices) {
-        for (mask, &valid) in row.iter_mut().zip(&data[i]) {
-            *mask = valid as u8 as f32;
-        }
+    let mut masks = Vec::with_capacity(indices.len() * width);
+    for &index in indices {
+        let start = index * width;
+        masks.extend(
+            data[start..start + width]
+                .iter()
+                .map(|&valid| valid as u8 as f32),
+        );
     }
 
-    Tensor::from_data(TensorData::new(masks, shape), device)
+    Tensor::from_data(TensorData::new(masks, [indices.len(), width]), device)
 }
 
 #[derive(Clone)]
 pub struct Memory {
-    states: Vec<Vec<f32>>,
+    /// Per-step observations stored row-major as `[step * state_width..]`.
+    states: Vec<f32>,
+    state_width: usize,
     actions: Vec<usize>,
     log_probs: Vec<f32>,
     rewards: Vec<f32>,
     /// Unified terminal encoding per step: TERMINAL_NONE / NORMAL / TRUNCATED.
     terminals: Vec<TerminalState>,
-    /// Observations immediately after a truncated step, used for critic bootstrapping.
-    /// Stored in the same order as TERMINAL_TRUNCATED entries appear in `terminals`.
-    trunc_next_states: Vec<Vec<f32>>,
-    /// Action-validity mask per player-step, stored in the same order as `states`.
-    action_masks: Vec<Vec<bool>>,
+    /// Observations immediately after truncated steps, stored row-major.
+    /// Entries are ordered the same way as TERMINAL_TRUNCATED entries appear in
+    /// `terminals`.
+    trunc_next_states: Vec<f32>,
+    /// Action-validity masks stored row-major as `[step * action_mask_width..]`.
+    action_masks: Vec<bool>,
+    action_mask_width: usize,
+    /// Retained until the first trajectory is pushed, when the observation
+    /// widths become known. It is used as a small scalar-element seed rather
+    /// than multiplied by the observation width, avoiding a full wide-rollout
+    /// allocation in every worker.
+    capacity_hint: usize,
 }
 
 impl Default for Memory {
@@ -122,7 +139,8 @@ impl Default for Memory {
 impl Memory {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            states: Vec::with_capacity(capacity),
+            states: Vec::new(),
+            state_width: 0,
             actions: Vec::with_capacity(capacity),
             log_probs: Vec::with_capacity(capacity),
             rewards: Vec::with_capacity(capacity),
@@ -130,30 +148,56 @@ impl Memory {
             // Truncations are sparse relative to rollout steps, so reserving one
             // slot per step wastes substantial CPU memory.
             trunc_next_states: Vec::new(),
-            action_masks: Vec::with_capacity(capacity),
+            action_masks: Vec::new(),
+            action_mask_width: 0,
+            capacity_hint: capacity,
+        }
+    }
+
+    fn set_widths(&mut self, state_width: usize, action_mask_width: usize) {
+        debug_assert!(state_width > 0);
+        if self.state_width == 0 {
+            self.state_width = state_width;
+            self.action_mask_width = action_mask_width;
+            self.states.reserve(self.capacity_hint);
+            self.action_masks.reserve(self.capacity_hint);
+            self.capacity_hint = 0;
+        } else {
+            debug_assert_eq!(self.state_width, state_width);
+            debug_assert_eq!(self.action_mask_width, action_mask_width);
         }
     }
 
     /// Push a complete per-player trajectory.
     /// All vectors must have the same length.
-    /// `trunc_next_state` is `Some` only when the last terminal is `TERMINAL_TRUNCATED`.
+    /// `trunc_next_state` is `Some` only when the last terminal is `Truncated`.
     #[allow(clippy::too_many_arguments)]
     pub fn push_player(
         &mut self,
-        states: Vec<Vec<f32>>,
+        states: Vec<f32>,
+        state_width: usize,
         actions: Vec<usize>,
         log_probs: Vec<f32>,
         rewards: Vec<f32>,
         terminals: Vec<TerminalState>,
-        action_masks: Vec<Vec<bool>>,
+        action_masks: Vec<bool>,
+        action_mask_width: usize,
         trunc_next_state: Option<Vec<f32>>,
     ) {
-        let n = states.len();
-        debug_assert_eq!(n, actions.len());
+        let n = actions.len();
+        debug_assert_eq!(states.len(), n * state_width);
         debug_assert_eq!(n, log_probs.len());
         debug_assert_eq!(n, rewards.len());
         debug_assert_eq!(n, terminals.len());
-        debug_assert_eq!(n, action_masks.len());
+        debug_assert_eq!(action_masks.len(), n * action_mask_width);
+        if n == 0 {
+            return;
+        }
+
+        self.set_widths(state_width, action_mask_width);
+        if let Some(ref ns) = trunc_next_state {
+            debug_assert_eq!(ns.len(), state_width);
+        }
 
         self.states.extend(states);
         self.actions.extend(actions);
@@ -162,18 +206,34 @@ impl Memory {
         self.terminals.extend(terminals);
         self.action_masks.extend(action_masks);
         if let Some(ns) = trunc_next_state {
-            self.trunc_next_states.push(ns);
+            self.trunc_next_states.extend(ns);
         }
     }
 
     pub fn merge(&mut self, other: Memory) {
-        self.states.extend(other.states);
-        self.actions.extend(other.actions);
-        self.log_probs.extend(other.log_probs);
-        self.rewards.extend(other.rewards);
-        self.terminals.extend(other.terminals);
-        self.trunc_next_states.extend(other.trunc_next_states);
-        self.action_masks.extend(other.action_masks);
+        let Memory {
+            states,
+            state_width,
+            actions,
+            log_probs,
+            rewards,
+            terminals,
+            trunc_next_states,
+            action_masks,
+            action_mask_width,
+            ..
+        } = other;
+
+        if !actions.is_empty() {
+            self.set_widths(state_width, action_mask_width);
+        }
+        self.states.extend(states);
+        self.actions.extend(actions);
+        self.log_probs.extend(log_probs);
+        self.rewards.extend(rewards);
+        self.terminals.extend(terminals);
+        self.trunc_next_states.extend(trunc_next_states);
+        self.action_masks.extend(action_masks);
     }
 
     /// Move at most `max_steps` samples from `other` into this memory.
@@ -195,27 +255,39 @@ impl Memory {
             .count();
         let Memory {
             states,
+            state_width,
             actions,
             log_probs,
             rewards,
             terminals,
             trunc_next_states,
             action_masks,
+            action_mask_width,
+            ..
         } = other;
 
-        self.states.extend(states.into_iter().take(steps));
+        self.set_widths(state_width, action_mask_width);
+        self.states
+            .extend(states.into_iter().take(steps * state_width));
         self.actions.extend(actions.into_iter().take(steps));
         self.log_probs.extend(log_probs.into_iter().take(steps));
         self.rewards.extend(rewards.into_iter().take(steps));
         self.terminals.extend(terminals.into_iter().take(steps));
         self.action_masks
-            .extend(action_masks.into_iter().take(steps));
-        self.trunc_next_states
-            .extend(trunc_next_states.into_iter().take(truncations));
+            .extend(action_masks.into_iter().take(steps * action_mask_width));
+        self.trunc_next_states.extend(
+            trunc_next_states
+                .into_iter()
+                .take(truncations * state_width),
+        );
     }
 
-    pub fn states(&self) -> &[Vec<f32>] {
+    pub fn states(&self) -> &[f32] {
         &self.states
+    }
+
+    pub fn state_width(&self) -> usize {
+        self.state_width
     }
 
     pub fn actions(&self) -> &[usize] {
@@ -234,23 +306,37 @@ impl Memory {
         &self.terminals
     }
 
-    pub fn trunc_next_states(&self) -> &[Vec<f32>] {
+    pub fn trunc_next_states(&self) -> &[f32] {
         &self.trunc_next_states
     }
 
-    pub fn action_masks(&self) -> &[Vec<bool>] {
+    pub fn truncation_len(&self) -> usize {
+        self.trunc_next_states
+            .len()
+            .checked_div(self.state_width)
+            .unwrap_or(0)
+    }
+
+    pub fn action_masks(&self) -> &[bool] {
         &self.action_masks
     }
 
+    pub fn action_mask_width(&self) -> usize {
+        self.action_mask_width
+    }
+
     pub fn len(&self) -> usize {
-        self.states.len()
+        self.actions.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.states.is_empty()
+        self.actions.is_empty()
     }
 
     pub fn clear(&mut self) {
+        // The flat buffers intentionally retain their capacity. Unlike the
+        // former Vec<Vec<_>> representation, clearing does not drop one heap
+        // allocation per observation, so subsequent rollouts reuse storage.
         self.states.clear();
         self.actions.clear();
         self.log_probs.clear();
@@ -271,12 +357,14 @@ mod regression_tests {
             *last = terminal;
         }
         memory.push_player(
-            (start..start + count).map(|i| vec![i as f32]).collect(),
+            (start..start + count).map(|i| i as f32).collect::<Vec<_>>(),
+            1,
             (start..start + count).collect(),
             vec![0.0; count],
             vec![1.0; count],
             terminals,
-            vec![vec![true]; count],
+            vec![true; count],
+            1,
             (terminal == TerminalState::Truncated).then(|| vec![(start + count) as f32]),
         );
     }
@@ -309,14 +397,41 @@ mod regression_tests {
                 TerminalState::None,
             ]
         );
-        assert_eq!(destination.trunc_next_states(), &[vec![1.0], vec![2.0]]);
+        assert_eq!(destination.trunc_next_states(), &[1.0, 2.0]);
     }
 
     #[test]
-    fn regression_truncation_storage_is_not_preallocated_per_step() {
-        let memory = Memory::with_capacity(10_000);
+    fn regression_flat_storage_preserves_observation_rows() {
+        let mut memory = Memory::with_capacity(2);
+        memory.push_player(
+            vec![1.0, 2.0, 3.0, 4.0],
+            2,
+            vec![0, 1],
+            vec![0.0, 0.0],
+            vec![1.0, 1.0],
+            vec![TerminalState::None, TerminalState::Normal],
+            vec![true, false, false, true],
+            2,
+            None,
+        );
 
-        assert_eq!(memory.trunc_next_states.capacity(), 0);
-        assert!(memory.states.capacity() >= 10_000);
+        assert_eq!(memory.states(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(memory.state_width(), 2);
+        assert_eq!(memory.action_masks(), &[true, false, false, true]);
+        assert_eq!(memory.action_mask_width(), 2);
+    }
+
+    #[test]
+    fn regression_flat_rollout_storage_reuses_capacity_after_clear() {
+        let mut memory = Memory::with_capacity(10_000);
+        push_steps(&mut memory, 0, 10_000, TerminalState::None);
+        let state_capacity = memory.states.capacity();
+        let mask_capacity = memory.action_masks.capacity();
+
+        memory.clear();
+        push_steps(&mut memory, 0, 10_000, TerminalState::None);
+
+        assert_eq!(memory.states.capacity(), state_capacity);
+        assert_eq!(memory.action_masks.capacity(), mask_capacity);
     }
 }

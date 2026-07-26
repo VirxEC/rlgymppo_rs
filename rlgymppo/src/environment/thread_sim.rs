@@ -310,12 +310,14 @@ mod regression_tests {
     fn memory(start: usize, count: usize) -> Memory {
         let mut memory = Memory::with_capacity(count);
         memory.push_player(
-            (start..start + count).map(|i| vec![i as f32]).collect(),
+            (start..start + count).map(|i| i as f32).collect::<Vec<_>>(),
+            1,
             (start..start + count).collect(),
             vec![0.0; count],
             vec![1.0; count],
             vec![TerminalState::None; count],
-            vec![vec![true]; count],
+            vec![true; count],
+            1,
             None,
         );
         memory

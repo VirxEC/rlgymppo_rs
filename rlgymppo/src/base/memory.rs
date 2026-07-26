@@ -123,11 +123,9 @@ pub struct Memory {
     /// Action-validity masks stored row-major as `[step * action_mask_width..]`.
     action_masks: Vec<bool>,
     action_mask_width: usize,
-    /// Retained until the first trajectory is pushed, when the observation
-    /// widths become known. It is used as a small scalar-element seed rather
-    /// than multiplied by the observation width, avoiding a full wide-rollout
-    /// allocation in every worker.
-    capacity_hint: usize,
+    /// Baseline capacity in rollout rows. Flat buffers convert this to scalar
+    /// capacity using their stable row width.
+    baseline_steps: usize,
 }
 
 impl Default for Memory {
@@ -150,7 +148,7 @@ impl Memory {
             trunc_next_states: Vec::new(),
             action_masks: Vec::new(),
             action_mask_width: 0,
-            capacity_hint: capacity,
+            baseline_steps: capacity,
         }
     }
 
@@ -159,9 +157,9 @@ impl Memory {
         if self.state_width == 0 {
             self.state_width = state_width;
             self.action_mask_width = action_mask_width;
-            self.states.reserve(self.capacity_hint);
-            self.action_masks.reserve(self.capacity_hint);
-            self.capacity_hint = 0;
+            self.states.reserve(self.baseline_steps * state_width);
+            self.action_masks
+                .reserve(self.baseline_steps * action_mask_width);
         } else {
             debug_assert_eq!(self.state_width, state_width);
             debug_assert_eq!(self.action_mask_width, action_mask_width);
@@ -334,16 +332,24 @@ impl Memory {
     }
 
     pub fn clear(&mut self) {
-        // The flat buffers intentionally retain their capacity. Unlike the
-        // former Vec<Vec<_>> representation, clearing does not drop one heap
-        // allocation per observation, so subsequent rollouts reuse storage.
+        // Keep a small baseline for the next collection, but discard any
+        // high-water growth from an unusually large rollout or episode.
         self.states.clear();
+        self.states
+            .shrink_to(self.baseline_steps * self.state_width);
         self.actions.clear();
+        self.actions.shrink_to(self.baseline_steps);
         self.log_probs.clear();
+        self.log_probs.shrink_to(self.baseline_steps);
         self.rewards.clear();
+        self.rewards.shrink_to(self.baseline_steps);
         self.terminals.clear();
+        self.terminals.shrink_to(self.baseline_steps);
         self.trunc_next_states.clear();
+        self.trunc_next_states.shrink_to(0);
         self.action_masks.clear();
+        self.action_masks
+            .shrink_to(self.baseline_steps * self.action_mask_width);
     }
 }
 
@@ -417,21 +423,28 @@ mod regression_tests {
 
         assert_eq!(memory.states(), &[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(memory.state_width(), 2);
+        assert!(memory.states.capacity() >= 2 * memory.state_width());
         assert_eq!(memory.action_masks(), &[true, false, false, true]);
         assert_eq!(memory.action_mask_width(), 2);
+        assert!(memory.action_masks.capacity() >= 2 * memory.action_mask_width());
     }
 
     #[test]
-    fn regression_flat_rollout_storage_reuses_capacity_after_clear() {
-        let mut memory = Memory::with_capacity(10_000);
+    fn regression_clear_shrinks_growth_to_baseline() {
+        let baseline = 8;
+        let mut memory = Memory::with_capacity(baseline);
         push_steps(&mut memory, 0, 10_000, TerminalState::None);
-        let state_capacity = memory.states.capacity();
-        let mask_capacity = memory.action_masks.capacity();
+        let grown_state_capacity = memory.states.capacity();
+        let grown_mask_capacity = memory.action_masks.capacity();
 
         memory.clear();
-        push_steps(&mut memory, 0, 10_000, TerminalState::None);
 
-        assert_eq!(memory.states.capacity(), state_capacity);
-        assert_eq!(memory.action_masks.capacity(), mask_capacity);
+        assert!(memory.states.capacity() >= baseline);
+        assert!(memory.states.capacity() < grown_state_capacity);
+        assert!(memory.action_masks.capacity() >= baseline);
+        assert!(memory.action_masks.capacity() < grown_mask_capacity);
+        assert_eq!(memory.state_width(), 1);
+        assert_eq!(memory.action_mask_width(), 1);
+        assert_eq!(memory.actions.capacity(), baseline);
     }
 }

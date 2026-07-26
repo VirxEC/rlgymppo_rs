@@ -33,6 +33,9 @@ pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<Ad
     policy_optimizer: O,
     value_optimizer: O,
     shared_head_optimizer: O,
+    /// The model-aware factory is retained so optimizers can be rebuilt after
+    /// loading a checkpoint with freshly-created model parameters.
+    make_optim: Option<Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O>>,
     device: B::Device,
 }
 
@@ -42,6 +45,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             policy_optimizer: make_optim(),
             value_optimizer: make_optim(),
             shared_head_optimizer: make_optim(),
+            make_optim: None,
             config,
             device,
         }
@@ -51,16 +55,30 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         config: PpoLearnerConfig,
         device: B::Device,
         model: &Actic<B>,
-        make_optim: impl Fn(OptimizerNetwork, &Net<B>) -> O,
+        make_optim: impl Fn(OptimizerNetwork, &Net<B>) -> O + 'static,
     ) -> Self {
+        let make_optim: Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O> = Box::new(make_optim);
         let shared_head = model.shared_head.as_ref().unwrap_or(&model.actor);
         Self {
             policy_optimizer: make_optim(OptimizerNetwork::Policy, &model.actor),
             value_optimizer: make_optim(OptimizerNetwork::Value, &model.critic),
             shared_head_optimizer: make_optim(OptimizerNetwork::SharedHead, shared_head),
+            make_optim: Some(make_optim),
             config,
             device,
         }
+    }
+
+    /// Recreate model-aware optimizers for a newly-loaded model.
+    pub fn reinit_optimizers(&mut self, model: &Actic<B>) {
+        let Some(make_optim) = self.make_optim.as_ref() else {
+            return;
+        };
+
+        let shared_head = model.shared_head.as_ref().unwrap_or(&model.actor);
+        self.policy_optimizer = make_optim(OptimizerNetwork::Policy, &model.actor);
+        self.value_optimizer = make_optim(OptimizerNetwork::Value, &model.critic);
+        self.shared_head_optimizer = make_optim(OptimizerNetwork::SharedHead, shared_head);
     }
 
     /// Save the optimizer states (momentum/velocity buffers) to a checkpoint folder.

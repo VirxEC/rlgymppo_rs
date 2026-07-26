@@ -563,7 +563,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         make_optim: MakeOptimForNet<B, O>,
     ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
-        O: Optimizer<Net<B>, B>,
+        O: Optimizer<Net<B>, B> + 'static,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         SS: StateSetter<SI>,
         SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
@@ -797,6 +797,8 @@ where
 
         // Align save timer so we don't immediately re-save the loaded checkpoint.
         self.last_save_timestep = self.stats.cumulative_timesteps;
+
+        self.ppo.reinit_optimizers(&self.model);
 
         if let Some(latest_folder) = latest_checkpoint_folder(&self.checkpoints_folder) {
             self.ppo.load_optimizers(&latest_folder);

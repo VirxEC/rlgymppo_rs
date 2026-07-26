@@ -180,7 +180,7 @@ impl PpoLearnerConfig {
         self,
         device: B::Device,
         model: &Actic<B>,
-        make_optim: impl Fn(OptimizerNetwork, &Net<B>) -> O,
+        make_optim: impl Fn(OptimizerNetwork, &Net<B>) -> O + 'static,
     ) -> Ppo<B, O> {
         self.validate_batching();
 

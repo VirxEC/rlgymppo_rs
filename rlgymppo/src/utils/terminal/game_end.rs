@@ -1,5 +1,5 @@
 use rand::RngExt;
-use rlgym::rocketsim::ArenaEvent;
+use rlgym::rocketsim::{ArenaEvent, Vec3A};
 use rlgym::{GameState, Terminal};
 
 use crate::utils::shared_info::SharedInfoRng;
@@ -30,9 +30,13 @@ impl<const MIN_DURATION: u64, const MAX_DURATION: u64, SI: SharedInfoRng> Termin
             return false;
         }
 
+        if state.ball.vel == Vec3A::ZERO && state.ball.ang_vel == Vec3A::ZERO {
+            return true;
+        }
+
         state.events.iter().any(|event| {
             if let ArenaEvent::BallHitWorld(info) = event {
-                info.contact_point.z < 1.0
+                info.contact_normal.z > 0.9
             } else {
                 false
             }
@@ -61,10 +65,14 @@ impl<const DURATION: u64, SI> Terminal<SI> for GameEndedCondition<DURATION> {
             return false;
         }
 
+        if state.ball.vel == Vec3A::ZERO && state.ball.ang_vel == Vec3A::ZERO {
+            return true;
+        }
+
         // wait until the ball hits the floor
         state.events.iter().any(|event| {
             if let ArenaEvent::BallHitWorld(info) = event {
-                info.contact_point.z < 5.0
+                info.contact_normal.z > 0.9
             } else {
                 false
             }

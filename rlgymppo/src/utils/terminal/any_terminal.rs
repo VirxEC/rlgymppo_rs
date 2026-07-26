@@ -5,7 +5,16 @@ use rlgym::{GameState, Terminal};
 /// # Example
 ///
 /// ```
-/// let terminal = any_terminal![
+/// # use rlgymppo::any_terminal;
+/// # use rlgymppo::utils::shared_info::SharedInfoReport;
+/// # use rlgymppo::utils::terminal::{AnyTerminal, GameEndedCondition, OnGoalCondition};
+/// # use rlgymppo::utils::Report;
+/// # #[derive(Default)]
+/// # struct MySharedInfo { report: Report }
+/// # impl SharedInfoReport for MySharedInfo {
+/// #     fn report(&mut self) -> &mut Report { &mut self.report }
+/// # }
+/// let terminal: AnyTerminal<MySharedInfo> = any_terminal![
 ///     OnGoalCondition,
 ///     GameEndedCondition<600>,
 /// ];

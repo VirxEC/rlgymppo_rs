@@ -20,17 +20,35 @@ macro_rules! combined_rewards {
 ///
 /// Simple default-constructible rewards use their path directly:
 /// ```
-/// let reward_fn = combined_rewards![
-///     "reward1", MyUnitReward => 1.0;
-///     "reward2", MyUnitReward2 => 0.5;
+/// # use rlgymppo::combined_rewards;
+/// # use rlgymppo::utils::rewards::{CombinedRewards, GoalReward, VelocityToBallReward};
+/// # use rlgymppo::utils::shared_info::SharedInfoReport;
+/// # use rlgymppo::utils::Report;
+/// # #[derive(Default)]
+/// # struct MySharedInfo { report: Report }
+/// # impl SharedInfoReport for MySharedInfo {
+/// #     fn report(&mut self) -> &mut Report { &mut self.report }
+/// # }
+/// let reward_fn: CombinedRewards<MySharedInfo> = combined_rewards![
+///     "goal", GoalReward::default() => 1.0;
+///     "velocity", VelocityToBallReward::default() => 0.5;
 /// ];
 /// ```
 ///
 /// Parameterized or wrapped rewards use their constructor:
 /// ```
-/// let reward_fn = combined_rewards![
-///     "reward1", ZeroSumReward::new(ChildReward, 0.3, 1.0) => 1.0;
-///     "reward2", SomeReward::new(0.5) => 0.5;
+/// # use rlgymppo::combined_rewards;
+/// # use rlgymppo::utils::rewards::{CombinedRewards, GoalReward, VelocityToBallReward};
+/// # use rlgymppo::utils::shared_info::SharedInfoReport;
+/// # use rlgymppo::utils::Report;
+/// # #[derive(Default)]
+/// # struct MySharedInfo { report: Report }
+/// # impl SharedInfoReport for MySharedInfo {
+/// #     fn report(&mut self) -> &mut Report { &mut self.report }
+/// # }
+/// let reward_fn: CombinedRewards<MySharedInfo> = combined_rewards![
+///     "goal", GoalReward::new(0.3) => 1.0;
+///     "velocity", VelocityToBallReward::default() => 0.5;
 /// ];
 /// ```
 pub struct CombinedRewards<SI: SharedInfoReport> {

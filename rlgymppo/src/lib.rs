@@ -8,7 +8,7 @@ pub mod utils;
 use std::collections::{HashMap, VecDeque};
 #[cfg(not(feature = "tui"))]
 use std::io::{Read, stdin};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
@@ -39,7 +39,9 @@ pub use rlgym::{self, rocketsim};
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 use utils::Report;
 use utils::running_stat::Stats;
-use utils::serde::{latest_checkpoint_folder, load_latest_model, save_checkpoint};
+use utils::serde::{
+    latest_checkpoint_folder, load_latest_model, save_checkpoint as save_checkpoint_files,
+};
 use utils::shared_info::{SharedInfoReport, SharedInfoRng};
 
 #[derive(Clone, Copy)]
@@ -410,6 +412,11 @@ pub type MakeOptim<O> = Box<dyn Fn() -> O>;
 /// role, allowing parameter IDs to be grouped differently for output heads.
 pub type MakeOptimForNet<B, O> = Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O>;
 
+/// Called after a checkpoint's model, statistics, and optimizer files have been saved.
+///
+/// The callback receives the path to the newly-created checkpoint folder.
+pub type CheckpointCallback = Box<dyn Fn(&Path)>;
+
 /// Returns a factory for the default Adam optimizer used by the previous
 /// `LearnerConfig::<B, AdamOptimizer<B>>::default()`.
 pub fn default_adam_optimizer<B: AutodiffBackend>() -> MakeOptim<AdamOptimizer<B>> {
@@ -454,6 +461,9 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub checkpoints_limit: Option<usize>,
     /// The number of timesteps to run before saving a checkpoint.
     pub timesteps_per_save: u64,
+    /// An optional callback invoked after each checkpoint is saved.
+    /// The callback receives the path to the newly-created checkpoint folder.
+    pub checkpoint_callback: Option<CheckpointCallback>,
     /// The number of threads to use for collecting data.
     pub num_threads: usize,
     /// The number of games to run per thread.
@@ -502,6 +512,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             shared_head_layer_sizes: vec![256],
             checkpoints_limit: None,
             timesteps_per_save: 1_000_000,
+            checkpoint_callback: None,
             num_threads: 4,
             num_games_per_thread: 64,
             num_additional_iterations: None,
@@ -714,6 +725,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             checkpoints_folder: self.checkpoints_folder,
             checkpoints_limit: self.checkpoints_limit,
             timesteps_per_save: self.timesteps_per_save,
+            checkpoint_callback: self.checkpoint_callback,
             last_save_timestep: 0,
             num_additional_iterations: self.num_additional_iterations,
             renderer_controls: renderer_controls.clone(),
@@ -751,6 +763,7 @@ where
     checkpoints_folder: PathBuf,
     checkpoints_limit: Option<usize>,
     timesteps_per_save: u64,
+    checkpoint_callback: Option<CheckpointCallback>,
     last_save_timestep: u64,
     num_additional_iterations: Option<u64>,
     renderer_controls: Arc<(Mutex<RendererControls<B::InnerBackend>>, Condvar)>,
@@ -814,6 +827,19 @@ where
         }
     }
 
+    fn save_checkpoint(&self) {
+        let folder = save_checkpoint_files(
+            self.model.valid(),
+            &self.ppo,
+            &self.stats,
+            &self.checkpoints_folder,
+            self.checkpoints_limit,
+        );
+        if let Some(callback) = &self.checkpoint_callback {
+            callback(&folder);
+        }
+    }
+
     fn handle_input(&mut self, input: HumanInput) -> bool {
         match input {
             HumanInput::Quit => {
@@ -824,13 +850,7 @@ where
                 if let Some(ref st) = self.skill_tracker {
                     self.stats.skill_ratings = Some(st.cur_ratings.data.clone());
                 }
-                save_checkpoint(
-                    self.model.valid(),
-                    &self.ppo,
-                    &self.stats,
-                    &self.checkpoints_folder,
-                    self.checkpoints_limit,
-                );
+                self.save_checkpoint();
                 self.version_mgr.save_versions();
             }
             HumanInput::RenderToggled | HumanInput::DeterministicToggled => {}
@@ -1111,13 +1131,7 @@ where
                     self.stats.skill_ratings = Some(st.cur_ratings.data.clone());
                 }
 
-                save_checkpoint(
-                    self.model.valid(),
-                    &self.ppo,
-                    &self.stats,
-                    &self.checkpoints_folder,
-                    self.checkpoints_limit,
-                );
+                self.save_checkpoint();
                 self.version_mgr.save_versions();
                 self.last_save_timestep = self.stats.cumulative_timesteps;
             }
@@ -1141,13 +1155,7 @@ where
             self.stats.skill_ratings = Some(ratings.data);
         }
 
-        save_checkpoint(
-            self.model.valid(),
-            &self.ppo,
-            &self.stats,
-            &self.checkpoints_folder,
-            self.checkpoints_limit,
-        );
+        self.save_checkpoint();
         self.version_mgr.save_versions();
 
         let _ = metric_tx.send(MetricEvent::Shutdown);
@@ -1202,13 +1210,7 @@ where
             start_renderer.notify_all();
         }
 
-        save_checkpoint(
-            self.model.valid(),
-            &self.ppo,
-            &self.stats,
-            &self.checkpoints_folder,
-            self.checkpoints_limit,
-        );
+        self.save_checkpoint();
         self.version_mgr.save_versions();
 
         println!("Waiting for threads to exit...");

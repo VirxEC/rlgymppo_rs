@@ -198,7 +198,7 @@ fn reached_max_episode_length(
 ) -> bool {
     max_episode_length.is_some_and(|max_len| {
         (player_start..player_start + player_count)
-            .any(|ti| player_is_tracked[ti] && player_trajs[ti].len() >= max_len)
+            .any(|ti| player_is_tracked[ti] && player_trajs[ti].len() + 1 >= max_len)
     })
 }
 
@@ -505,8 +505,9 @@ where
 
                 let player_start = self.player_offsets[game_idx];
 
-                // Force-truncate if any tracked player in this game exceeds
-                // the maximum episode length (matches GGL behaviour).
+                // Force-truncate if the current step would bring any tracked
+                // player's trajectory to the maximum episode length (matches
+                // GGL behaviour).
                 if terminal_type == TerminalState::None
                     && reached_max_episode_length(
                         &self.player_trajs,
@@ -737,21 +738,21 @@ mod regression_tests {
             &[true, false],
             0,
             2,
-            Some(3),
+            Some(5),
         ));
         assert!(reached_max_episode_length(
             &player_trajs,
             &[true, true],
             0,
             2,
-            Some(3),
+            Some(5),
         ));
         assert!(!reached_max_episode_length(
             &player_trajs,
             &[true, true],
             0,
             2,
-            Some(5),
+            Some(6),
         ));
         assert!(!reached_max_episode_length(
             &player_trajs,

@@ -103,6 +103,18 @@ where
         self.env.set_rlviser_enabled(enabled)
     }
 
+    pub fn handle_rlviser_messages(&mut self) -> std::io::Result<()> {
+        self.env.handle_rlviser_messages()
+    }
+
+    pub fn rlviser_paused(&self) -> bool {
+        self.env.rlviser_paused()
+    }
+
+    pub fn rlviser_speed(&self) -> f32 {
+        self.env.rlviser_speed()
+    }
+
     pub fn num_players(&self) -> usize {
         self.last_state.cars.len()
     }

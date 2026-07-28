@@ -104,6 +104,14 @@ where
         let mut next_time = Instant::now();
 
         loop {
+            if let Err(error) = self.game.handle_rlviser_messages() {
+                eprintln!("Error receiving messages from RLViser: {error}");
+                break;
+            }
+
+            let speed = self.game.rlviser_speed();
+            let paused = self.game.rlviser_paused();
+
             let (controller, start_var) = &*self.controller;
             let mut guard = controller.lock();
 
@@ -126,20 +134,35 @@ where
             let deterministic = guard.deterministic;
             drop(guard);
 
-            let actions = if deterministic {
-                model.react_deterministic(&self.last_obs, &[], &self.device)
+            let actions = (!paused).then(|| {
+                if deterministic {
+                    model.react_deterministic(&self.last_obs, &[], &self.device)
+                } else {
+                    model.react(&self.last_obs, &[], &self.device).0
+                }
+            });
+
+            // Keep the renderer in real time, adjusted by RLViser's speed.
+            let interval = if paused {
+                tick_rate
             } else {
-                model.react(&self.last_obs, &[], &self.device).0
+                Duration::from_secs_f64(
+                    tick_rate.as_secs_f64() / f64::from(speed.max(f32::EPSILON)),
+                )
             };
-
-            // ensure real-time rendering
-            // we get the action first to avoid stutters
-            let wait_time = next_time - Instant::now();
-            if !wait_time.is_zero() {
-                sleep(wait_time);
+            let now = Instant::now();
+            if next_time > now {
+                sleep(next_time - now);
+            } else {
+                // If inference or rendering takes too long, resync instead of
+                // permanently trying to catch up.
+                next_time = now;
             }
-            next_time += tick_rate;
+            next_time += interval;
 
+            let Some(actions) = actions else {
+                continue;
+            };
             let result = self.game.step(&actions);
 
             self.last_obs = if result.is_terminal || result.truncated {

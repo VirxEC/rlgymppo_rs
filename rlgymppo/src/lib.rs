@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent::Ppo;
-pub use agent::config::PpoLearnerConfig;
+pub use agent::config::{GaeEstimator, PpoLearnerConfig};
 pub use agent::model::{Actic, Net, linear_weight_param_ids};
 pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
@@ -698,6 +698,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             self.ppo.max_episode_length,
             self.ppo.retain_overflow_episodes,
             self.ppo.overbatching,
+            self.ppo.gae_estimator == GaeEstimator::TerminationTime,
         );
 
         let mut self_play_config = self.self_play;

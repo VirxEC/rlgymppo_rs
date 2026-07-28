@@ -1,4 +1,5 @@
 pub mod config;
+mod gae;
 pub mod model;
 pub mod self_play;
 pub mod skill_tracker;
@@ -20,10 +21,11 @@ use rand::seq::SliceRandom;
 
 use crate::OptimizerNetwork;
 use crate::agent::config::PpoLearnerConfig;
+use crate::agent::gae::{GAEOutput, get_gae};
 use crate::agent::model::{Actic, Net, PPOOutput};
 use crate::base::{
-    Memory, TerminalState, get_action_batch, get_action_masks_batch, get_batch_1d,
-    get_generic_batch, get_log_probs_batch, get_states_batch, get_states_batch_range,
+    Memory, get_action_batch, get_action_masks_batch, get_batch_1d, get_generic_batch,
+    get_log_probs_batch, get_states_batch, get_states_batch_range,
 };
 use crate::utils::Report;
 use crate::utils::running_stat::Stats;
@@ -159,12 +161,17 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     ) -> (Actic<B>, usize) {
         // Overbatching uses the complete bounded rollout, including the final
         // trajectory prefix that extends beyond `timesteps_per_iteration`.
-        let rollout_size =
-            if self.config.overbatching && memory.len() > self.config.timesteps_per_iteration {
-                memory.len()
-            } else {
-                self.config.timesteps_per_iteration
-            };
+        let rollout_size = if memory.len() > self.config.timesteps_per_iteration
+            && (self.config.overbatching
+                || self.config.gae_estimator == config::GaeEstimator::TerminationTime)
+        {
+            // Paper-faithful collection may overrun the nominal global budget
+            // to retain its final complete trajectory. Train on that complete
+            // trajectory instead of silently cutting it back to the budget.
+            memory.len()
+        } else {
+            self.config.timesteps_per_iteration
+        };
 
         let memory_indices = (0..rollout_size).collect::<Vec<_>>();
 
@@ -237,6 +244,10 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             }
         };
 
+        memory
+            .validate()
+            .unwrap_or_else(|error| panic!("Invalid learner memory: {error}"));
+
         let gae_start = Instant::now();
         let GAEOutput {
             returns,
@@ -252,6 +263,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             self.config.lambda,
             return_std,
             self.config.reward_clip_range,
+            self.config.gae_estimator,
         );
         metrics["GAE/time"] = gae_start.elapsed().as_secs_f64().into();
         metrics["GAE/reward clip portion"] = rew_clip_portion.into();
@@ -659,93 +671,6 @@ impl<B: Backend> MetricTotals<B> {
         self.clip_fraction = self.clip_fraction.clone() + clip_fraction * weight;
         self.policy_loss = self.policy_loss.clone() + policy_loss * weight;
         self.value_loss = self.value_loss.clone() + value_loss * weight;
-    }
-}
-
-struct GAEOutput {
-    returns: Vec<f32>,
-    target_vals: Vec<f32>,
-    advantages: Vec<f32>,
-    rew_clip_portion: f32,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn get_gae(
-    values: Vec<f32>,
-    rewards: Vec<f32>,
-    terminals: Vec<TerminalState>,
-    trunc_val_preds: &[f32],
-    gamma: f32,
-    lambda: f32,
-    return_std: f32,
-    clip_range: f32,
-) -> GAEOutput {
-    let n_returns = values.len();
-    let mut returns = vec![0.0; n_returns];
-    let mut target_vals = returns.clone();
-    let mut advantages = returns.clone();
-
-    let mut return_scale = 1.0 / return_std;
-    if return_scale.is_nan() || return_scale == 0.0 {
-        return_scale = 1.0;
-    }
-
-    let mut last_return = 0.0;
-    let mut running_advantage = 0.0;
-    let mut trunc_count = 0_usize;
-
-    let mut total_reward = 0.0_f32;
-    let mut total_clipped_reward = 0.0_f32;
-
-    for i in (0..n_returns).rev() {
-        let term = terminals[i];
-        let is_done = term == TerminalState::Normal;
-        let is_trunc = term == TerminalState::Truncated;
-
-        let not_done = f32::from(!is_done);
-        let not_trunc = f32::from(!is_trunc);
-
-        // Normalize reward.
-        let mut norm_reward = rewards[i] * return_scale;
-        total_reward += norm_reward.abs();
-
-        if clip_range > 0.0 {
-            norm_reward = norm_reward.clamp(-clip_range, clip_range);
-        }
-        total_clipped_reward += norm_reward.abs();
-
-        // Determine next-value prediction:
-        //   - TRUNCATED  → pull from `trunc_val_preds`
-        //   - NOT_TERMINAL → pull from `values[i + 1]`
-        //   - NORMAL / end-of-buffer → 0.0 (the `(1-done)` multiplier zeros it anyway)
-        let next_val = if is_trunc {
-            let v = trunc_val_preds[trunc_count];
-            trunc_count += 1;
-            v
-        } else if !is_done && i + 1 < n_returns {
-            values[i + 1]
-        } else {
-            0.0
-        };
-
-        let pred_ret = norm_reward + gamma * next_val * not_done;
-        let delta = pred_ret - values[i];
-
-        last_return = rewards[i] + last_return * gamma * not_done * not_trunc;
-        returns[i] = last_return;
-
-        running_advantage = delta + gamma * lambda * not_done * not_trunc * running_advantage;
-        advantages[i] = running_advantage;
-
-        target_vals[i] = values[i] + running_advantage;
-    }
-
-    let rew_clip_portion = (total_reward - total_clipped_reward) / total_reward.max(f32::EPSILON);
-    GAEOutput {
-        returns,
-        target_vals,
-        advantages,
-        rew_clip_portion,
     }
 }
 

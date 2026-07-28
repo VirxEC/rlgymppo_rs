@@ -6,9 +6,21 @@ use super::Ppo;
 use super::model::{Actic, Net};
 use crate::OptimizerNetwork;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GaeEstimator {
+    /// Ordinary GAE truncated at explicit rollout boundaries.
+    #[default]
+    Truncated,
+    /// Paper finite-time GAE over complete trajectories through their actual
+    /// environment or configured maximum-length termination.
+    TerminationTime,
+}
+
 pub struct PpoLearnerConfig {
     pub gamma: f32,
     pub lambda: f32,
+    /// Advantage estimator used for each learner update.
+    pub gae_estimator: GaeEstimator,
     pub clip_range: f32,
     pub reward_clip_range: f32,
     /// Entropy scale (applied after dividing by ln(n_actions) when
@@ -79,6 +91,7 @@ impl Default for PpoLearnerConfig {
         Self {
             gamma: 0.99,
             lambda: 0.95,
+            gae_estimator: GaeEstimator::default(),
             clip_range: 0.2,
             reward_clip_range: 10.,
             entropy_scale: 0.018,
@@ -134,6 +147,17 @@ impl PpoLearnerConfig {
     }
 
     pub(crate) fn validate_batching(&self) {
+        if self.gae_estimator == GaeEstimator::TerminationTime {
+            assert!(
+                self.lambda > 0.0 && self.lambda < 1.0,
+                "Termination-time GAE requires lambda in the open interval (0, 1)"
+            );
+            assert!(
+                self.max_episode_length.is_some_and(|length| length > 0),
+                "Termination-time GAE requires a finite, positive max_episode_length"
+            );
+        }
+
         assert!(
             self.timesteps_per_iteration > 0,
             "Timesteps per iteration must be greater than zero"
@@ -191,6 +215,35 @@ impl PpoLearnerConfig {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn regression_default_uses_truncated_gae() {
+        let config = PpoLearnerConfig::default();
+        assert_eq!(config.gae_estimator, GaeEstimator::Truncated);
+        config.validate_batching();
+    }
+
+    #[test]
+    #[should_panic(expected = "finite, positive max_episode_length")]
+    fn regression_termination_time_requires_a_finite_horizon() {
+        let config = PpoLearnerConfig {
+            gae_estimator: GaeEstimator::TerminationTime,
+            max_episode_length: None,
+            ..PpoLearnerConfig::default()
+        };
+        config.validate_batching();
+    }
+
+    #[test]
+    #[should_panic(expected = "lambda in the open interval")]
+    fn regression_termination_time_rejects_lambda_endpoints() {
+        let config = PpoLearnerConfig {
+            gae_estimator: GaeEstimator::TerminationTime,
+            lambda: 1.0,
+            ..PpoLearnerConfig::default()
+        };
+        config.validate_batching();
+    }
 
     #[test]
     #[should_panic(expected = "Truncation value batch size must be greater than zero")]

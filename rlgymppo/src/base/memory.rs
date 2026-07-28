@@ -238,19 +238,15 @@ impl Memory {
     ///
     /// Truncation next states are stored independently, in terminal order, so
     /// only the entries associated with truncated steps in the moved prefix are
-    /// retained. The unclaimed suffix is dropped with `other`.
+    /// retained. If the prefix cuts a non-terminal trajectory, the retained
+    /// final row is repaired with the incoming observation as its bootstrap
+    /// state. The unclaimed suffix is dropped with `other`.
     pub fn merge_prefix(&mut self, other: Memory, max_steps: usize) {
         let steps = max_steps.min(other.len());
         if steps == 0 {
             return;
         }
 
-        let truncations = other
-            .terminals
-            .iter()
-            .take(steps)
-            .filter(|&&terminal| terminal == TerminalState::Truncated)
-            .count();
         let Memory {
             states,
             state_width,
@@ -263,10 +259,22 @@ impl Memory {
             action_mask_width,
             ..
         } = other;
+        let mut terminals = terminals;
+        let truncations = terminals
+            .iter()
+            .take(steps)
+            .filter(|&&terminal| terminal == TerminalState::Truncated)
+            .count();
+        let cut_boundary = steps < actions.len() && terminals[steps - 1] == TerminalState::None;
+        if cut_boundary {
+            // The first discarded row is still available in `states`, so use
+            // it as the critic bootstrap for the repaired boundary.
+            terminals[steps - 1] = TerminalState::Truncated;
+        }
 
         self.set_widths(state_width, action_mask_width);
         self.states
-            .extend(states.into_iter().take(steps * state_width));
+            .extend(states.iter().copied().take(steps * state_width));
         self.actions.extend(actions.into_iter().take(steps));
         self.log_probs.extend(log_probs.into_iter().take(steps));
         self.rewards.extend(rewards.into_iter().take(steps));
@@ -278,6 +286,52 @@ impl Memory {
                 .into_iter()
                 .take(truncations * state_width),
         );
+        if cut_boundary {
+            let next_start = steps * state_width;
+            self.trunc_next_states
+                .extend_from_slice(&states[next_start..next_start + state_width]);
+        }
+    }
+
+    /// Validate the row and boundary contract expected by the learner.
+    pub fn validate(&self) -> Result<(), String> {
+        let rows = self.len();
+        if self.states.len() != rows.saturating_mul(self.state_width) {
+            return Err(format!(
+                "states has {} scalars for {rows} rows of width {}",
+                self.states.len(),
+                self.state_width
+            ));
+        }
+        if self.log_probs.len() != rows || self.rewards.len() != rows {
+            return Err("log_probs and rewards must be row-aligned with actions".into());
+        }
+        if self.terminals.len() != rows {
+            return Err("terminals must be row-aligned with actions".into());
+        }
+        if self.action_masks.len() != rows.saturating_mul(self.action_mask_width) {
+            return Err(format!(
+                "action_masks has {} values for {rows} rows of width {}",
+                self.action_masks.len(),
+                self.action_mask_width
+            ));
+        }
+        let truncations = self
+            .terminals
+            .iter()
+            .filter(|&&terminal| terminal == TerminalState::Truncated)
+            .count();
+        if self.trunc_next_states.len() != truncations.saturating_mul(self.state_width) {
+            return Err(format!(
+                "trunc_next_states has {} scalars for {truncations} truncation rows of width {}",
+                self.trunc_next_states.len(),
+                self.state_width
+            ));
+        }
+        if rows > 0 && self.terminals[rows - 1] == TerminalState::None {
+            return Err("the final learner row must have an explicit terminal boundary".into());
+        }
+        Ok(())
     }
 
     pub fn states(&self) -> &[f32] {
@@ -400,10 +454,32 @@ mod regression_tests {
             &[
                 TerminalState::Truncated,
                 TerminalState::Truncated,
-                TerminalState::None,
+                TerminalState::Truncated,
             ]
         );
-        assert_eq!(destination.trunc_next_states(), &[1.0, 2.0]);
+        assert_eq!(destination.trunc_next_states(), &[1.0, 2.0, 3.0]);
+        assert!(destination.validate().is_ok());
+    }
+
+    #[test]
+    fn regression_prefix_merge_preserves_an_existing_terminal_boundary() {
+        let mut source = Memory::with_capacity(3);
+        push_steps(&mut source, 0, 2, TerminalState::Normal);
+        push_steps(&mut source, 2, 2, TerminalState::Normal);
+
+        let mut destination = Memory::with_capacity(1);
+        destination.merge_prefix(source, 3);
+
+        assert_eq!(
+            destination.terminals(),
+            &[
+                TerminalState::None,
+                TerminalState::Normal,
+                TerminalState::Truncated
+            ]
+        );
+        assert_eq!(destination.trunc_next_states(), &[3.0]);
+        assert!(destination.validate().is_ok());
     }
 
     #[test]

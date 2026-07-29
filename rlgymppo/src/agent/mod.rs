@@ -161,17 +161,14 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     ) -> (Actic<B>, usize) {
         // Overbatching uses the complete bounded rollout, including the final
         // trajectory prefix that extends beyond `timesteps_per_iteration`.
-        let rollout_size = if memory.len() > self.config.timesteps_per_iteration
-            && (self.config.overbatching
-                || self.config.gae_estimator == config::GaeEstimator::TerminationTime)
-        {
-            // Paper-faithful collection may overrun the nominal global budget
-            // to retain its final complete trajectory. Train on that complete
-            // trajectory instead of silently cutting it back to the budget.
-            memory.len()
-        } else {
-            self.config.timesteps_per_iteration
-        };
+        let rollout_size =
+            if memory.len() > self.config.timesteps_per_iteration && self.config.overbatching {
+                // Train on the complete collected rollout instead of cutting it back
+                // to the nominal budget.
+                memory.len()
+            } else {
+                self.config.timesteps_per_iteration
+            };
 
         let memory_indices = (0..rollout_size).collect::<Vec<_>>();
 

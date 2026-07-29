@@ -26,9 +26,8 @@ fn merge_worker_memory(
     incoming: Memory,
     rollout_budget: usize,
     overbatching: bool,
-    complete_trajectories: bool,
 ) {
-    if overbatching || complete_trajectories {
+    if overbatching {
         target.merge(incoming);
         return;
     }
@@ -58,19 +57,12 @@ fn collect_worker_responses(
     metrics: &mut Report,
     rollout_budget: usize,
     overbatching: bool,
-    complete_trajectories: bool,
 ) -> Result<(), String> {
     for _ in 0..response_count {
         let response = recv
             .recv()
             .map_err(|_| "collector worker disconnected without a response".to_owned())??;
-        merge_worker_memory(
-            target,
-            response.memory,
-            rollout_budget,
-            overbatching,
-            complete_trajectories,
-        );
+        merge_worker_memory(target, response.memory, rollout_budget, overbatching);
         *metrics += response.metrics;
     }
     Ok(())
@@ -113,7 +105,6 @@ where
     memory: Memory,
     rollout_budget: usize,
     overbatching: bool,
-    complete_trajectories: bool,
     _marker: PhantomData<fn(SS, OBS, ACT, REW, TERM, TRUNC, SI)>,
 }
 
@@ -258,7 +249,6 @@ where
             metrics: Report::default(),
             rollout_budget,
             overbatching,
-            complete_trajectories,
             _marker: PhantomData,
         }
     }
@@ -297,7 +287,6 @@ where
             &mut self.metrics,
             self.rollout_budget,
             self.overbatching,
-            self.complete_trajectories,
         )
         .unwrap_or_else(|message| panic!("collector rollout failed: {message}"));
 
@@ -351,8 +340,7 @@ mod regression_tests {
 
         let mut target = Memory::with_capacity(100);
         let mut metrics = Report::default();
-        collect_worker_responses(&receiver, 3, &mut target, &mut metrics, 100, true, false)
-            .unwrap();
+        collect_worker_responses(&receiver, 3, &mut target, &mut metrics, 100, true).unwrap();
 
         assert_eq!(target.len(), 150);
         assert_eq!(target.actions().first(), Some(&0));
@@ -378,9 +366,8 @@ mod regression_tests {
 
         let mut target = Memory::with_capacity(10);
         let mut metrics = Report::default();
-        let error =
-            collect_worker_responses(&receiver, 2, &mut target, &mut metrics, 10, false, false)
-                .unwrap_err();
+        let error = collect_worker_responses(&receiver, 2, &mut target, &mut metrics, 10, false)
+            .unwrap_err();
 
         assert_eq!(error, "simulated worker panic");
         assert!(target.is_empty());
@@ -389,12 +376,22 @@ mod regression_tests {
     #[test]
     fn regression_exact_batching_discards_worker_overflow() {
         let mut target = Memory::with_capacity(100);
-        merge_worker_memory(&mut target, memory(0, 60), 100, false, false);
-        merge_worker_memory(&mut target, memory(60, 60), 100, false, false);
-        merge_worker_memory(&mut target, memory(120, 30), 100, false, false);
+        merge_worker_memory(&mut target, memory(0, 60), 100, false);
+        merge_worker_memory(&mut target, memory(60, 60), 100, false);
+        merge_worker_memory(&mut target, memory(120, 30), 100, false);
 
         assert_eq!(target.len(), 100);
         assert_eq!(target.actions().first(), Some(&0));
+        assert_eq!(target.actions().last(), Some(&99));
+    }
+
+    #[test]
+    fn regression_complete_trajectories_respect_exact_batching() {
+        let mut target = Memory::with_capacity(100);
+        merge_worker_memory(&mut target, memory(0, 60), 100, false);
+        merge_worker_memory(&mut target, memory(60, 60), 100, false);
+
+        assert_eq!(target.len(), 100);
         assert_eq!(target.actions().last(), Some(&99));
     }
 }

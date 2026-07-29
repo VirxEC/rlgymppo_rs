@@ -11,8 +11,8 @@ pub enum GaeEstimator {
     /// Ordinary GAE truncated at explicit rollout boundaries.
     #[default]
     Truncated,
-    /// Paper finite-time GAE over complete trajectories through their actual
-    /// environment or configured maximum-length termination.
+    /// Finite-horizon GAE computed over complete trajectories, ending at
+    /// actual environment termination or the configured maximum episode length.
     TerminationTime,
 }
 

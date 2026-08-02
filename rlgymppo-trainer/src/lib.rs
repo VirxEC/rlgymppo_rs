@@ -14,8 +14,8 @@ use rlgymppo::utils::terminal::{
 };
 use rlgymppo::utils::{AvgTracker, Report, rewards};
 use rlgymppo::{
-    LearnerConfig, PpoLearnerConfig, SelfPlayConfig, SkillTrackerConfig, any_terminal,
-    combined_rewards, default_adamw_optimizer, weighted_state,
+    GaeEstimator, LearnerConfig, PpoLearnerConfig, SelfPlayConfig, SkillTrackerConfig,
+    any_terminal, combined_rewards, default_adamw_optimizer, weighted_state,
 };
 
 pub struct SharedInfo {
@@ -164,6 +164,7 @@ pub fn default_config<B: AutodiffBackend>(
             epochs: 2,
             learning_rate: lr,
             entropy_scale: 0.024,
+            gae_estimator: GaeEstimator::TerminationTime,
             max_episode_length: None,
             ..Default::default()
         },

@@ -9,8 +9,29 @@ use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
 use super::sim::{GameInstance, RewardSamplingConfig};
 use crate::agent::model::Actic;
 use crate::base::{Memory, TerminalState};
-use crate::utils::Report;
 use crate::utils::shared_info::SharedInfoReport;
+use crate::utils::{AvgTracker, Report};
+
+const EPISODE_LENGTH_EMA_ALPHA: f64 = 0.1;
+const TRAJECTORY_CAPACITY_HEADROOM: f64 = 1.25;
+const MIN_TRAJECTORY_BASELINE_STEPS: usize = 32;
+
+fn compute_trajectory_baseline_steps(
+    episode_length_ema: Option<f64>,
+    fallback_steps: usize,
+    max_episode_length: Option<usize>,
+) -> usize {
+    let Some(average) = episode_length_ema.filter(|average| average.is_finite() && *average > 0.0)
+    else {
+        return fallback_steps;
+    };
+
+    let baseline = ((average * TRAJECTORY_CAPACITY_HEADROOM).ceil() as usize)
+        .max(MIN_TRAJECTORY_BASELINE_STEPS);
+    max_episode_length
+        .filter(|&max_length| max_length > 0)
+        .map_or(baseline, |max_length| baseline.min(max_length))
+}
 
 /// Per-player trajectory buffer that persists across collection calls
 /// so incomplete episodes carry over to the next iteration.
@@ -26,13 +47,21 @@ struct PlayerTraj {
     /// Per-step action masks stored row-major.
     action_masks: Vec<bool>,
     action_mask_width: usize,
+    /// Retained row capacity after a trajectory is cleared. This keeps a small
+    /// reusable baseline without retaining an entire unusually long episode.
+    baseline_steps: usize,
 }
 
 impl PlayerTraj {
-    fn with_width(state_width: usize, action_mask_width: usize) -> Self {
+    fn with_width_and_baseline(
+        state_width: usize,
+        action_mask_width: usize,
+        baseline_steps: usize,
+    ) -> Self {
         Self {
             state_width,
             action_mask_width,
+            baseline_steps,
             ..Self::default()
         }
     }
@@ -41,12 +70,20 @@ impl PlayerTraj {
         self.actions.len()
     }
 
+    fn set_baseline_steps(&mut self, baseline_steps: usize) {
+        self.baseline_steps = baseline_steps;
+    }
+
     /// Move the accumulated samples out while keeping this slot ready for the
     /// next episode with the same row widths.
     fn take(&mut self) -> Self {
         let state_width = self.state_width;
         let action_mask_width = self.action_mask_width;
-        mem::replace(self, Self::with_width(state_width, action_mask_width))
+        let baseline_steps = self.baseline_steps;
+        mem::replace(
+            self,
+            Self::with_width_and_baseline(state_width, action_mask_width, baseline_steps),
+        )
     }
 
     fn split_off(&mut self, at: usize) -> Self {
@@ -59,12 +96,24 @@ impl PlayerTraj {
             terminals: self.terminals.split_off(at),
             action_masks: self.action_masks.split_off(at * self.action_mask_width),
             action_mask_width: self.action_mask_width,
+            baseline_steps: self.baseline_steps,
         }
     }
 
     fn state_at(&self, index: usize) -> Vec<f32> {
         let start = index * self.state_width;
         self.states[start..start + self.state_width].to_vec()
+    }
+
+    fn shrink_to_baseline(&mut self) {
+        self.states
+            .shrink_to(self.baseline_steps * self.state_width);
+        self.actions.shrink_to(self.baseline_steps);
+        self.log_probs.shrink_to(self.baseline_steps);
+        self.rewards.shrink_to(self.baseline_steps);
+        self.terminals.shrink_to(self.baseline_steps);
+        self.action_masks
+            .shrink_to(self.baseline_steps * self.action_mask_width);
     }
 
     fn clear(&mut self) {
@@ -74,6 +123,7 @@ impl PlayerTraj {
         self.rewards.clear();
         self.terminals.clear();
         self.action_masks.clear();
+        self.shrink_to_baseline();
     }
 
     fn truncate(&mut self, len: usize) {
@@ -261,6 +311,10 @@ where
     /// buffers from the previous policy snapshot are discarded at collection
     /// start, so no learner update spans policy publications.
     complete_trajectories: bool,
+    /// Retained per-player trajectory capacity, adjusted from the smoothed
+    /// completed-trajectory length after each collection.
+    trajectory_baseline_steps: usize,
+    episode_length_ema: Option<f64>,
 
     // ── Self‑play state ──────────────────────────────────────────
     /// Per-player team index (0 = Blue, 1 = Orange), cached at
@@ -290,6 +344,7 @@ where
         num_games: usize,
         device: B::Device,
         reward_sampling: RewardSamplingConfig,
+        trajectory_capacity_hint: usize,
         max_episode_length: Option<usize>,
         retain_overflow_episodes: bool,
         complete_trajectories: bool,
@@ -325,8 +380,11 @@ where
         let state_width = next_obs.first().map_or(0, Vec::len);
         let action_mask_width = next_masks.first().map_or(0, Vec::len);
         debug_assert!(state_width > 0);
+        let baseline_steps = trajectory_capacity_hint.div_ceil(total_players.max(1));
         let player_trajs = (0..total_players)
-            .map(|_| PlayerTraj::with_width(state_width, action_mask_width))
+            .map(|_| {
+                PlayerTraj::with_width_and_baseline(state_width, action_mask_width, baseline_steps)
+            })
             .collect();
 
         Self {
@@ -349,6 +407,8 @@ where
             self_play_log_probs: Vec::new(),
             max_episode_length,
             complete_trajectories,
+            trajectory_baseline_steps: baseline_steps,
+            episode_length_ema: None,
         }
     }
 
@@ -369,13 +429,33 @@ where
     ) -> (Memory, Report) {
         let (old_model, old_team) = self_play.unzip();
 
+        let baseline_steps = compute_trajectory_baseline_steps(
+            self.episode_length_ema,
+            self.trajectory_baseline_steps,
+            self.max_episode_length,
+        );
+        self.trajectory_baseline_steps = baseline_steps;
+        for trajectory in &mut self.player_trajs {
+            trajectory.set_baseline_steps(baseline_steps);
+        }
+        for (trajectory, _) in &mut self.overflow_trajs {
+            trajectory.set_baseline_steps(baseline_steps);
+        }
+
         if self.complete_trajectories {
             // These rows were generated under the previous published model.
             // Keeping them would make the next update span policy snapshots.
+            // Clearing also trims any episode-sized high-water allocations.
             for trajectory in &mut self.player_trajs {
                 trajectory.clear();
             }
             self.overflow_trajs.clear();
+        } else {
+            // Preserve live carry-over rows, but do not retain capacity from a
+            // much longer episode than the normal per-worker rollout share.
+            for trajectory in &mut self.player_trajs {
+                trajectory.shrink_to_baseline();
+            }
         }
 
         // Build per-player tracking mask: `true` when player uses
@@ -421,6 +501,8 @@ where
 
         let mut total_infer_time = 0.0_f64;
         let mut total_env_step_time = 0.0_f64;
+        let mut completed_episode_steps = 0_usize;
+        let mut completed_episode_count = 0_usize;
 
         while remaining_steps.load(Ordering::Relaxed) > 0
             || (self.complete_trajectories && !completed_for_update)
@@ -594,6 +676,8 @@ where
                             let traj_len = self.player_trajs[ti].len();
                             let trunc_next = (terminal_type == TerminalState::Truncated)
                                 .then(|| result.obs[p].clone());
+                            completed_episode_steps += traj_len;
+                            completed_episode_count += 1;
                             let traj = self.player_trajs[ti].take();
                             if self.complete_trajectories {
                                 let claimed = claim_complete_steps(
@@ -680,6 +764,35 @@ where
             total_env_step_time += env_start.elapsed().as_secs_f64();
         }
 
+        if completed_episode_count > 0 {
+            let collection_average =
+                completed_episode_steps as f64 / completed_episode_count as f64;
+            self.episode_length_ema = Some(match self.episode_length_ema {
+                Some(previous) => {
+                    previous * (1.0 - EPISODE_LENGTH_EMA_ALPHA)
+                        + collection_average * EPISODE_LENGTH_EMA_ALPHA
+                }
+                None => collection_average,
+            });
+        }
+
+        // Apply the newly observed line immediately. Live rows are retained;
+        // only capacity above the new line is released.
+        let baseline_steps = compute_trajectory_baseline_steps(
+            self.episode_length_ema,
+            self.trajectory_baseline_steps,
+            self.max_episode_length,
+        );
+        self.trajectory_baseline_steps = baseline_steps;
+        for trajectory in &mut self.player_trajs {
+            trajectory.set_baseline_steps(baseline_steps);
+            trajectory.shrink_to_baseline();
+        }
+        for (trajectory, _) in &mut self.overflow_trajs {
+            trajectory.set_baseline_steps(baseline_steps);
+            trajectory.shrink_to_baseline();
+        }
+
         let mut report = self.get_metrics();
         report["Collect/inference time"] = total_infer_time.into();
         report["Collect/env step time"] = total_env_step_time.into();
@@ -692,6 +805,9 @@ where
             self.metrics += game.get_metrics();
             game.clear_metrics();
         }
+
+        self.metrics["Collect/trajectory capacity baseline"] +=
+            AvgTracker::from(self.trajectory_baseline_steps as f64);
 
         let metrics = self.metrics.clone();
         self.metrics.clear();
@@ -716,12 +832,63 @@ mod regression_tests {
             terminals,
             action_masks: vec![true; len],
             action_mask_width: 1,
+            baseline_steps: 0,
         }
     }
 
     #[test]
+    fn regression_episode_baseline_uses_ema_headroom_and_maximum() {
+        assert_eq!(
+            compute_trajectory_baseline_steps(None, 270, Some(1800)),
+            270
+        );
+        assert_eq!(
+            compute_trajectory_baseline_steps(Some(100.0), 270, Some(1800)),
+            125
+        );
+        assert_eq!(
+            compute_trajectory_baseline_steps(Some(2.0), 270, Some(1800)),
+            32
+        );
+        assert_eq!(
+            compute_trajectory_baseline_steps(Some(2_000.0), 270, Some(1800)),
+            1800
+        );
+    }
+
+    #[test]
+    fn regression_clear_trims_capacity_to_baseline() {
+        let baseline = 2;
+        let mut trajectory = PlayerTraj::with_width_and_baseline(2, 3, baseline);
+        for _ in 0..16 {
+            trajectory.states.extend_from_slice(&[0.0, 0.0]);
+            trajectory.actions.push(0);
+            trajectory.log_probs.push(0.0);
+            trajectory.rewards.push(1.0);
+            trajectory.terminals.push(TerminalState::None);
+            trajectory
+                .action_masks
+                .extend_from_slice(&[true, false, true]);
+        }
+
+        let grown_state_capacity = trajectory.states.capacity();
+        let grown_mask_capacity = trajectory.action_masks.capacity();
+        trajectory.clear();
+
+        assert_eq!(trajectory.len(), 0);
+        assert!(trajectory.states.capacity() >= baseline * 2);
+        assert!(trajectory.states.capacity() < grown_state_capacity);
+        assert!(trajectory.action_masks.capacity() >= baseline * 3);
+        assert!(trajectory.action_masks.capacity() < grown_mask_capacity);
+        assert_eq!(trajectory.actions.capacity(), baseline);
+        assert_eq!(trajectory.log_probs.capacity(), baseline);
+        assert_eq!(trajectory.rewards.capacity(), baseline);
+        assert_eq!(trajectory.terminals.capacity(), baseline);
+    }
+
+    #[test]
     fn regression_episode_reuse_preserves_flat_row_widths() {
-        let mut trajectory = PlayerTraj::with_width(2, 1);
+        let mut trajectory = PlayerTraj::with_width_and_baseline(2, 1, 0);
         trajectory.states.extend_from_slice(&[1.0, 2.0]);
         trajectory.actions.push(0);
         trajectory.log_probs.push(0.0);

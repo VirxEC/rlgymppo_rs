@@ -177,6 +177,7 @@ where
                         num_games_per_thread,
                         device,
                         reward_sampling,
+                        worker_memory_capacity,
                         max_episode_length,
                         retain_overflow_episodes,
                         complete_trajectories,

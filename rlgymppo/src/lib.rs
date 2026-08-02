@@ -21,7 +21,7 @@ pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
 pub use agent::skill_tracker::SkillTrackerConfig;
 use agent::skill_tracker::{AsyncSkillTracker, SkillTrackerUpdate};
-use base::TerminalState;
+use base::{Memory, TerminalState};
 pub use burn;
 use burn::module::{AutodiffModule, Module, Quantizer};
 use burn::nn::modules::norm::NormalizationConfig;
@@ -259,6 +259,17 @@ fn apply_skill_update_to_report(report: &mut Report, update: &SkillTrackerUpdate
         report[key.as_str()] = rating.into();
     }
     report["Timing/skill tracker"] = update.elapsed_secs.into();
+}
+
+fn calculate_episode_length(memory: &Memory) -> f64 {
+    let terminal_count = (0..memory.len())
+        .filter(|&i| memory.terminals()[i] != TerminalState::None)
+        .count();
+    if terminal_count > 0 {
+        memory.len() as f64 / terminal_count as f64
+    } else {
+        memory.len() as f64
+    }
 }
 
 fn spawn_metrics_actor(
@@ -1071,15 +1082,9 @@ where
                 cur_ratings,
             );
 
-            // Episode length = total_steps / number of NORMAL terminals.
-            let n_term = (0..memory.len())
-                .filter(|&i| memory.terminals()[i] == TerminalState::Normal)
-                .count();
-            let ep_len = if n_term > 0 {
-                memory.len() as f64 / n_term as f64
-            } else {
-                memory.len() as f64
-            };
+            // Count both normal ends and truncations so this agrees with the
+            // collector's trajectory-length accounting.
+            let ep_len = calculate_episode_length(memory);
             metrics["Collect/episode length"] = ep_len.into();
             metrics["Collect/timesteps"] = num_new_steps.into();
             metrics["Timing/collection"] = collect_elapsed.into();
@@ -1220,5 +1225,39 @@ where
         self.renderer.join().unwrap();
 
         println!("Done.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn episode_length_counts_truncated_boundaries() {
+        let mut memory = Memory::with_capacity(3);
+        memory.push_player(
+            vec![0.0, 1.0],
+            1,
+            vec![0, 0],
+            vec![0.0, 0.0],
+            vec![0.0, 0.0],
+            vec![TerminalState::None, TerminalState::Truncated],
+            vec![true, true],
+            1,
+            Some(vec![2.0]),
+        );
+        memory.push_player(
+            vec![2.0],
+            1,
+            vec![0],
+            vec![0.0],
+            vec![0.0],
+            vec![TerminalState::Normal],
+            vec![true],
+            1,
+            None,
+        );
+
+        assert_eq!(calculate_episode_length(&memory), 1.5);
     }
 }

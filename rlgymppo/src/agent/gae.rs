@@ -78,9 +78,7 @@ pub(crate) fn get_gae(
         if term != TerminalState::None {
             remaining = 1;
         } else {
-            remaining = remaining
-                .checked_add(1)
-                .expect("GAE trajectory suffix length overflowed");
+            remaining += 1;
         }
         assert!(remaining > 0, "GAE suffix length must be positive");
 
@@ -95,9 +93,7 @@ pub(crate) fn get_gae(
         total_clipped_reward += norm_reward.abs();
 
         let next_val = if is_trunc {
-            trunc_cursor = trunc_cursor
-                .checked_sub(1)
-                .expect("GAE truncation bootstrap cursor underflowed");
+            trunc_cursor -= 1;
             trunc_val_preds[trunc_cursor]
         } else if !is_done && i + 1 < n_returns {
             values[i + 1]

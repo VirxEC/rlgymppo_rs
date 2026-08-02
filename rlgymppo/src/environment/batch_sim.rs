@@ -13,11 +13,11 @@ use crate::utils::shared_info::SharedInfoReport;
 use crate::utils::{AvgTracker, Report};
 
 const EPISODE_LENGTH_EMA_ALPHA: f64 = 0.1;
-const TRAJECTORY_CAPACITY_HEADROOM: f64 = 1.25;
 const MIN_TRAJECTORY_BASELINE_STEPS: usize = 32;
 
 fn compute_trajectory_baseline_steps(
     episode_length_ema: Option<f64>,
+    episode_length_std_ema: Option<f64>,
     fallback_steps: usize,
     max_episode_length: Option<usize>,
 ) -> usize {
@@ -25,9 +25,13 @@ fn compute_trajectory_baseline_steps(
     else {
         return fallback_steps;
     };
+    let standard_deviation = episode_length_std_ema
+        .filter(|standard_deviation| standard_deviation.is_finite() && *standard_deviation >= 0.0)
+        .unwrap_or(0.0);
 
-    let baseline = ((average * TRAJECTORY_CAPACITY_HEADROOM).ceil() as usize)
-        .max(MIN_TRAJECTORY_BASELINE_STEPS);
+    let baseline = (average - standard_deviation)
+        .max(MIN_TRAJECTORY_BASELINE_STEPS as f64)
+        .ceil() as usize;
     max_episode_length
         .filter(|&max_length| max_length > 0)
         .map_or(baseline, |max_length| baseline.min(max_length))
@@ -315,6 +319,8 @@ where
     /// completed-trajectory length after each collection.
     trajectory_baseline_steps: usize,
     episode_length_ema: Option<f64>,
+    /// EMA of the second moment, used with `episode_length_ema` to estimate σ.
+    episode_length_second_moment_ema: Option<f64>,
 
     // ── Self‑play state ──────────────────────────────────────────
     /// Per-player team index (0 = Blue, 1 = Orange), cached at
@@ -409,7 +415,19 @@ where
             complete_trajectories,
             trajectory_baseline_steps: baseline_steps,
             episode_length_ema: None,
+            episode_length_second_moment_ema: None,
         }
+    }
+
+    fn episode_length_std_ema(&self) -> Option<f64> {
+        let (Some(average), Some(second_moment)) = (
+            self.episode_length_ema,
+            self.episode_length_second_moment_ema,
+        ) else {
+            return None;
+        };
+
+        Some((second_moment - average * average).max(0.0).sqrt())
     }
 
     /// Collect complete episodes until the shared iteration budget is exhausted.
@@ -431,6 +449,7 @@ where
 
         let baseline_steps = compute_trajectory_baseline_steps(
             self.episode_length_ema,
+            self.episode_length_std_ema(),
             self.trajectory_baseline_steps,
             self.max_episode_length,
         );
@@ -502,6 +521,7 @@ where
         let mut total_infer_time = 0.0_f64;
         let mut total_env_step_time = 0.0_f64;
         let mut completed_episode_steps = 0_usize;
+        let mut completed_episode_squared_steps = 0.0_f64;
         let mut completed_episode_count = 0_usize;
 
         while remaining_steps.load(Ordering::Relaxed) > 0
@@ -677,6 +697,8 @@ where
                             let trunc_next = (terminal_type == TerminalState::Truncated)
                                 .then(|| result.obs[p].clone());
                             completed_episode_steps += traj_len;
+                            let traj_len_f64 = traj_len as f64;
+                            completed_episode_squared_steps += traj_len_f64 * traj_len_f64;
                             completed_episode_count += 1;
                             let traj = self.player_trajs[ti].take();
                             if self.complete_trajectories {
@@ -767,6 +789,8 @@ where
         if completed_episode_count > 0 {
             let collection_average =
                 completed_episode_steps as f64 / completed_episode_count as f64;
+            let collection_second_moment =
+                completed_episode_squared_steps / completed_episode_count as f64;
             self.episode_length_ema = Some(match self.episode_length_ema {
                 Some(previous) => {
                     previous * (1.0 - EPISODE_LENGTH_EMA_ALPHA)
@@ -774,12 +798,21 @@ where
                 }
                 None => collection_average,
             });
+            self.episode_length_second_moment_ema =
+                Some(match self.episode_length_second_moment_ema {
+                    Some(previous) => {
+                        previous * (1.0 - EPISODE_LENGTH_EMA_ALPHA)
+                            + collection_second_moment * EPISODE_LENGTH_EMA_ALPHA
+                    }
+                    None => collection_second_moment,
+                });
         }
 
         // Apply the newly observed line immediately. Live rows are retained;
         // only capacity above the new line is released.
         let baseline_steps = compute_trajectory_baseline_steps(
             self.episode_length_ema,
+            self.episode_length_std_ema(),
             self.trajectory_baseline_steps,
             self.max_episode_length,
         );
@@ -837,21 +870,21 @@ mod regression_tests {
     }
 
     #[test]
-    fn regression_episode_baseline_uses_ema_headroom_and_maximum() {
+    fn regression_episode_baseline_uses_mean_minus_std_and_maximum() {
         assert_eq!(
-            compute_trajectory_baseline_steps(None, 270, Some(1800)),
+            compute_trajectory_baseline_steps(None, None, 270, Some(1800)),
             270
         );
         assert_eq!(
-            compute_trajectory_baseline_steps(Some(100.0), 270, Some(1800)),
-            125
+            compute_trajectory_baseline_steps(Some(100.0), Some(20.0), 270, Some(1800)),
+            80
         );
         assert_eq!(
-            compute_trajectory_baseline_steps(Some(2.0), 270, Some(1800)),
+            compute_trajectory_baseline_steps(Some(20.0), Some(30.0), 270, Some(1800)),
             32
         );
         assert_eq!(
-            compute_trajectory_baseline_steps(Some(2_000.0), 270, Some(1800)),
+            compute_trajectory_baseline_steps(Some(2_000.0), Some(0.0), 270, Some(1800)),
             1800
         );
     }

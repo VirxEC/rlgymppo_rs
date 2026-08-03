@@ -64,12 +64,13 @@ where
         // The renderer doesn't track training metrics, so disable reward sampling.
         let mut game = GameInstance::new(
             env,
+            None,
             RewardSamplingConfig {
                 add_rewards_to_metrics: false,
                 ..Default::default()
             },
         );
-        let (last_obs, _last_masks) = game.reset();
+        let (last_obs, _old_obs, _last_masks) = game.reset();
 
         Self {
             controller,

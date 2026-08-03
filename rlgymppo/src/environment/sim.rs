@@ -10,6 +10,9 @@ use crate::utils::{AvgTracker, Report};
 #[derive(Clone)]
 pub struct StepResult {
     pub obs: FullObs,
+    /// Per-player observations from the old (teacher) obs builder for the same
+    /// states as `obs`. Empty when no old obs builder is configured.
+    pub old_obs: FullObs,
     pub action_masks: Vec<Vec<bool>>,
     pub rewards: Vec<f32>,
     pub is_terminal: bool,
@@ -63,6 +66,10 @@ where
     TRUNC: Truncate<SI>,
 {
     env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+    /// Optional old (teacher) obs builder, run in lockstep with the env's own
+    /// builder so transfer learning can score the same states with a
+    /// different observation space.
+    old_obs: Option<Box<dyn Obs<SI>>>,
     last_state: GameState,
     metrics: Report,
     step_counter: usize,
@@ -81,10 +88,12 @@ where
 {
     pub fn new(
         env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+        old_obs: Option<Box<dyn Obs<SI>>>,
         reward_sampling: RewardSamplingConfig,
     ) -> Self {
         Self {
             env,
+            old_obs,
             last_state: GameState {
                 tick_count: 0,
                 game_mode: GameMode::Soccar,
@@ -129,11 +138,21 @@ where
             .collect()
     }
 
-    pub fn reset(&mut self) -> (FullObs, Vec<Vec<bool>>) {
+    pub fn reset(&mut self) -> (FullObs, FullObs, Vec<Vec<bool>>) {
         let (state, obs, masks) = self.env.reset();
-        self.last_state = state;
+        self.last_state = state.clone();
 
-        (obs, masks)
+        // Run the old obs builder in lockstep: reset it with the same initial
+        // state, then build the initial observations.
+        let old_obs = if let Some(builder) = &mut self.old_obs {
+            let shared_info = self.env.get_mut_shared_info();
+            builder.reset(&state, shared_info);
+            builder.build_obs(&state, shared_info)
+        } else {
+            Vec::new()
+        };
+
+        (obs, old_obs, masks)
     }
 
     pub fn step(&mut self, actions: &[ACT::Input]) -> StepResult {
@@ -183,7 +202,17 @@ where
 
     fn finish_step(&mut self) -> StepResult {
         let result = self.env.post_step();
-        self.last_state = result.state;
+        self.last_state = result.state.clone();
+
+        // Build the old (teacher) observations for the same states the env's
+        // obs builder just scored. The old builder consumes shared info after
+        // the rewards/terminals have run, matching GigaLearn's ordering.
+        let old_obs = if let Some(builder) = &mut self.old_obs {
+            let shared_info = self.env.get_mut_shared_info();
+            builder.build_obs(&result.state, shared_info)
+        } else {
+            Vec::new()
+        };
 
         let shared_info = self.env.get_mut_shared_info();
         let report = shared_info.report();
@@ -208,6 +237,7 @@ where
 
         StepResult {
             obs: result.obs,
+            old_obs,
             action_masks: result.action_masks,
             rewards: result.rewards,
             is_terminal: result.is_terminal,

@@ -7,7 +7,7 @@ training, built on [RocketSim v3](https://github.com/ZealanL/RocketSim/tree/v3-r
 
 ### Project structure
 
-The workspace is split into seven crates:
+The workspace is split into eight crates:
 
 | Crate | Purpose |
 |---|---|
@@ -18,6 +18,7 @@ The workspace is split into seven crates:
 | `rlgymppo-tui` | Terminal-based dashboard that renders live training metrics (ratatui). |
 | `rlgymppo-wandb` | Weights & Biases integration via an embedded Python interpreter (pyo3). |
 | `rlgymppo-trainer` | Bundled training example with shared logic, self-play, and skill tracking. |
+| `rlgymppo-transfer` | Transfer-learning example that pretends `rlgymppo-trainer` is the parent model. |
 
 `rlgymppo-utils` contains the shared `DefaultObs`, `AdvancedObs`, and
 `DefaultAction` implementations used by the trainer. It re-exports `rlgym` and
@@ -120,6 +121,68 @@ automatically tracked. Configure sampling with `reward_sample_interval` and
 Models, optimizer states, and training stats are saved to the folder specified
 by `checkpoints_folder` (defaults to `./checkpoints`). On restart, `learner.load()`
 resumes from the latest checkpoint — safe to call unconditionally.
+
+### Transfer learning
+
+If you have an already-trained model that is too large, you can distill it
+into a smaller policy with `learner.transfer_learn(...)`. The student acts in
+the environment while the frozen teacher (described by a `TeacherConfig`)
+scores the same states; the student's actor and shared head are trained to
+match the teacher's action distribution (mean-absolute-difference or KL-div
+loss, scaled by `loss_scale`). The critic is not trained.
+
+The teacher and student must share the same action space, but the observation
+space may differ: pass an old (teacher) obs builder factory to
+`init_with_old_obs` and it runs alongside the student's obs builder in the
+collector, scoring the same game states with a different layout. Everything
+else (actions, rewards, terminals, shared info) must be identical.
+
+```rust
+// same obs space: nothing extra needed at init
+let mut learner = config.init(create_env, default_adamw_optimizer::<B>());
+
+// different obs space: the teacher's obs builder, run in lockstep
+let mut learner = config.init_with_old_obs(
+    create_env,
+    default_adamw_optimizer::<B>(),
+    || Box::new(OldObs) as Box<dyn Obs<SharedInfo>>,
+);
+
+learner.load(); // resume an earlier distillation run if one exists
+learner.transfer_learn(
+    TeacherConfig {
+        models_path: PathBuf::from("checkpoints"), // the big model
+        policy_layer_sizes: vec![256; 3],
+        shared_head_layer_sizes: vec![256; 2],
+        norm: NormSelection::RmsNorm,
+    },
+    TransferLearnConfig::default(), // distillation hyperparameters
+);
+```
+
+`TeacherConfig` describes the teacher (its `policy_layer_sizes`,
+`shared_head_layer_sizes`, and `norm`); its observation size is probed
+automatically from the old obs builder. `models_path` may point directly at a
+checkpoint folder (containing `actor.mpk.gz`) or at a directory of timestamped
+checkpoints (the latest is used). Keep it distinct from the folder this run
+saves its own checkpoints to. The distillation hyperparameters (learning rate,
+batch sizes, epochs, loss) live in `TransferLearnConfig`.
+
+Run it with a small `config` (smaller `policy_layer_sizes` etc.) and watch
+`Transfer/loss` and `Transfer/accuracy` (argmax agreement with the teacher).
+Once distillation has converged, stop with `Q`, then continue with normal PPO
+training (`learner.load()` + `learner.learn()`) to fine-tune.
+
+The `rlgymppo-transfer` crate bundles a ready-to-run transfer-learning
+example that pretends `rlgymppo-trainer` is the parent model: it loads the
+model trained by the trainer's `run` example (architecture, checkpoint folder,
+and obs builder are copied from the trainer) and distills it into a smaller
+student that observes with `DefaultObs<1>` (53 floats) instead of the parent's
+`DefaultObs<3>` (141 floats):
+
+```sh
+cargo run -p rlgymppo-transfer --example transfer_learn --features torch
+```
 
 ### wandb integration
 

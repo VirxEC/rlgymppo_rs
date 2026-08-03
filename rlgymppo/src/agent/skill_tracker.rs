@@ -219,7 +219,7 @@ fn send_skill_reset<OBS, ACT, SI>(
     ACT: Action<SI, Input = usize>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
 {
-    let (obs, masks) = game.reset();
+    let (obs, _old_obs, masks) = game.reset();
     let teams = game.player_teams();
     result_tx
         .send(SkillArenaResult {
@@ -248,7 +248,7 @@ fn send_skill_step<OBS, ACT, SI>(
         let ball_y = game.last_game_state().ball.pos.y;
         let goal_teams = game.player_teams();
         let blue_scored = ball_y.is_sign_positive();
-        let (obs, masks) = game.reset();
+        let (obs, _old_obs, masks) = game.reset();
         let teams = game.player_teams();
         (
             teams,
@@ -319,7 +319,7 @@ where
                     shared_info,
                 );
 
-                let mut game = GameInstance::new(env, reward_sampling);
+                let mut game = GameInstance::new(env, None, reward_sampling);
                 send_skill_reset(game_idx, &mut game, &result_tx);
 
                 while let Ok(cmd) = cmd_rx.recv() {

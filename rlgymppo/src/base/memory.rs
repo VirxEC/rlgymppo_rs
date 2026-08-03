@@ -123,6 +123,11 @@ pub struct Memory {
     /// Action-validity masks stored row-major as `[step * action_mask_width..]`.
     action_masks: Vec<bool>,
     action_mask_width: usize,
+    /// Per-step observations from the old (teacher) obs builder, stored
+    /// row-major as `[step * old_state_width..]`. Empty when no old obs
+    /// builder is configured (same-obs transfer learning).
+    old_states: Vec<f32>,
+    old_state_width: usize,
     /// Baseline capacity in rollout rows. Flat buffers convert this to scalar
     /// capacity using their stable row width.
     baseline_steps: usize,
@@ -148,27 +153,36 @@ impl Memory {
             trunc_next_states: Vec::new(),
             action_masks: Vec::new(),
             action_mask_width: 0,
+            old_states: Vec::new(),
+            old_state_width: 0,
             baseline_steps: capacity,
         }
     }
 
-    fn set_widths(&mut self, state_width: usize, action_mask_width: usize) {
+    fn set_widths(&mut self, state_width: usize, action_mask_width: usize, old_state_width: usize) {
         debug_assert!(state_width > 0);
         if self.state_width == 0 {
             self.state_width = state_width;
             self.action_mask_width = action_mask_width;
+            self.old_state_width = old_state_width;
             self.states.reserve(self.baseline_steps * state_width);
             self.action_masks
                 .reserve(self.baseline_steps * action_mask_width);
+            self.old_states
+                .reserve(self.baseline_steps * old_state_width);
         } else {
             debug_assert_eq!(self.state_width, state_width);
             debug_assert_eq!(self.action_mask_width, action_mask_width);
+            debug_assert_eq!(self.old_state_width, old_state_width);
         }
     }
 
     /// Push a complete per-player trajectory.
     /// All vectors must have the same length.
     /// `trunc_next_state` is `Some` only when the last terminal is `Truncated`.
+    /// `old_states` holds the per-step observations produced by the teacher's
+    /// (old) obs builder, row-major with width `old_state_width`; pass empty
+    /// buffers when no old obs builder is configured.
     #[allow(clippy::too_many_arguments)]
     pub fn push_player(
         &mut self,
@@ -180,6 +194,8 @@ impl Memory {
         terminals: Vec<TerminalState>,
         action_masks: Vec<bool>,
         action_mask_width: usize,
+        old_states: Vec<f32>,
+        old_state_width: usize,
         trunc_next_state: Option<Vec<f32>>,
     ) {
         let n = actions.len();
@@ -188,11 +204,12 @@ impl Memory {
         debug_assert_eq!(n, rewards.len());
         debug_assert_eq!(n, terminals.len());
         debug_assert_eq!(action_masks.len(), n * action_mask_width);
+        debug_assert_eq!(old_states.len(), n * old_state_width);
         if n == 0 {
             return;
         }
 
-        self.set_widths(state_width, action_mask_width);
+        self.set_widths(state_width, action_mask_width, old_state_width);
         if let Some(ref ns) = trunc_next_state {
             debug_assert_eq!(ns.len(), state_width);
         }
@@ -203,6 +220,7 @@ impl Memory {
         self.rewards.extend(rewards);
         self.terminals.extend(terminals);
         self.action_masks.extend(action_masks);
+        self.old_states.extend(old_states);
         if let Some(ns) = trunc_next_state {
             self.trunc_next_states.extend(ns);
         }
@@ -219,11 +237,13 @@ impl Memory {
             trunc_next_states,
             action_masks,
             action_mask_width,
+            old_states,
+            old_state_width,
             ..
         } = other;
 
         if !actions.is_empty() {
-            self.set_widths(state_width, action_mask_width);
+            self.set_widths(state_width, action_mask_width, old_state_width);
         }
         self.states.extend(states);
         self.actions.extend(actions);
@@ -232,6 +252,7 @@ impl Memory {
         self.terminals.extend(terminals);
         self.trunc_next_states.extend(trunc_next_states);
         self.action_masks.extend(action_masks);
+        self.old_states.extend(old_states);
     }
 
     /// Move at most `max_steps` samples from `other` into this memory.
@@ -257,6 +278,8 @@ impl Memory {
             trunc_next_states,
             action_masks,
             action_mask_width,
+            old_states,
+            old_state_width,
             ..
         } = other;
         let mut terminals = terminals;
@@ -272,7 +295,7 @@ impl Memory {
             terminals[steps - 1] = TerminalState::Truncated;
         }
 
-        self.set_widths(state_width, action_mask_width);
+        self.set_widths(state_width, action_mask_width, old_state_width);
         self.states
             .extend(states.iter().copied().take(steps * state_width));
         self.actions.extend(actions.into_iter().take(steps));
@@ -281,6 +304,8 @@ impl Memory {
         self.terminals.extend(terminals.into_iter().take(steps));
         self.action_masks
             .extend(action_masks.into_iter().take(steps * action_mask_width));
+        self.old_states
+            .extend(old_states.into_iter().take(steps * old_state_width));
         self.trunc_next_states.extend(
             trunc_next_states
                 .into_iter()
@@ -314,6 +339,13 @@ impl Memory {
                 "action_masks has {} values for {rows} rows of width {}",
                 self.action_masks.len(),
                 self.action_mask_width
+            ));
+        }
+        if self.old_states.len() != rows.saturating_mul(self.old_state_width) {
+            return Err(format!(
+                "old_states has {} values for {rows} rows of width {}",
+                self.old_states.len(),
+                self.old_state_width
             ));
         }
         let truncations = self
@@ -377,6 +409,16 @@ impl Memory {
         self.action_mask_width
     }
 
+    /// Per-step observations from the old (teacher) obs builder, row-major.
+    /// Empty when no old obs builder is configured.
+    pub fn old_states(&self) -> &[f32] {
+        &self.old_states
+    }
+
+    pub fn old_state_width(&self) -> usize {
+        self.old_state_width
+    }
+
     pub fn len(&self) -> usize {
         self.actions.len()
     }
@@ -404,6 +446,9 @@ impl Memory {
         self.action_masks.clear();
         self.action_masks
             .shrink_to(self.baseline_steps * self.action_mask_width);
+        self.old_states.clear();
+        self.old_states
+            .shrink_to(self.baseline_steps * self.old_state_width);
     }
 }
 
@@ -425,6 +470,8 @@ mod regression_tests {
             terminals,
             vec![true; count],
             1,
+            Vec::new(),
+            0,
             (terminal == TerminalState::Truncated).then(|| vec![(start + count) as f32]),
         );
     }
@@ -494,6 +541,8 @@ mod regression_tests {
             vec![TerminalState::None, TerminalState::Normal],
             vec![true, false, false, true],
             2,
+            Vec::new(),
+            0,
             None,
         );
 

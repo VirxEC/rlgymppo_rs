@@ -44,6 +44,10 @@ struct PlayerTraj {
     /// Per-step observations stored row-major as `[step * state_width..]`.
     states: Vec<f32>,
     state_width: usize,
+    /// Per-step observations from the old (teacher) obs builder, row-major
+    /// as `[step * old_state_width..]`. Empty when no old obs is configured.
+    old_states: Vec<f32>,
+    old_state_width: usize,
     actions: Vec<usize>,
     log_probs: Vec<f32>,
     rewards: Vec<f32>,
@@ -59,11 +63,13 @@ struct PlayerTraj {
 impl PlayerTraj {
     fn with_width_and_baseline(
         state_width: usize,
+        old_state_width: usize,
         action_mask_width: usize,
         baseline_steps: usize,
     ) -> Self {
         Self {
             state_width,
+            old_state_width,
             action_mask_width,
             baseline_steps,
             ..Self::default()
@@ -82,11 +88,17 @@ impl PlayerTraj {
     /// next episode with the same row widths.
     fn take(&mut self) -> Self {
         let state_width = self.state_width;
+        let old_state_width = self.old_state_width;
         let action_mask_width = self.action_mask_width;
         let baseline_steps = self.baseline_steps;
         mem::replace(
             self,
-            Self::with_width_and_baseline(state_width, action_mask_width, baseline_steps),
+            Self::with_width_and_baseline(
+                state_width,
+                old_state_width,
+                action_mask_width,
+                baseline_steps,
+            ),
         )
     }
 
@@ -94,6 +106,8 @@ impl PlayerTraj {
         Self {
             states: self.states.split_off(at * self.state_width),
             state_width: self.state_width,
+            old_states: self.old_states.split_off(at * self.old_state_width),
+            old_state_width: self.old_state_width,
             actions: self.actions.split_off(at),
             log_probs: self.log_probs.split_off(at),
             rewards: self.rewards.split_off(at),
@@ -112,6 +126,8 @@ impl PlayerTraj {
     fn shrink_to_baseline(&mut self) {
         self.states
             .shrink_to(self.baseline_steps * self.state_width);
+        self.old_states
+            .shrink_to(self.baseline_steps * self.old_state_width);
         self.actions.shrink_to(self.baseline_steps);
         self.log_probs.shrink_to(self.baseline_steps);
         self.rewards.shrink_to(self.baseline_steps);
@@ -122,6 +138,7 @@ impl PlayerTraj {
 
     fn clear(&mut self) {
         self.states.clear();
+        self.old_states.clear();
         self.actions.clear();
         self.log_probs.clear();
         self.rewards.clear();
@@ -132,6 +149,7 @@ impl PlayerTraj {
 
     fn truncate(&mut self, len: usize) {
         self.states.truncate(len * self.state_width);
+        self.old_states.truncate(len * self.old_state_width);
         self.actions.truncate(len);
         self.log_probs.truncate(len);
         self.rewards.truncate(len);
@@ -271,6 +289,8 @@ fn push_traj_prefix(
         traj.terminals,
         traj.action_masks,
         traj.action_mask_width,
+        traj.old_states,
+        traj.old_state_width,
         trunc_next_state,
     );
 }
@@ -304,6 +324,8 @@ where
     held_actions: Vec<Vec<usize>>,
     action_delay_primed: Vec<bool>,
     next_obs: Vec<Vec<f32>>,
+    /// Pre-step observations from the old obs builders, parallel to `next_obs`.
+    next_old_obs: Vec<Vec<f32>>,
     next_masks: Vec<Vec<bool>>,
     player_trajs: Vec<PlayerTraj>,
     overflow_trajs: VecDeque<(PlayerTraj, Option<Vec<f32>>)>,
@@ -344,8 +366,9 @@ where
     TRUNC: Truncate<SI>,
 {
     #[allow(clippy::too_many_arguments)]
-    pub fn new<F>(
+    pub fn new<F, FO>(
         create_env_fn: F,
+        make_old_obs: Option<FO>,
         thread_num: usize,
         num_games: usize,
         device: B::Device,
@@ -357,11 +380,13 @@ where
     ) -> Self
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+        FO: Fn() -> Box<dyn Obs<SI>>,
     {
         let mut games = Vec::with_capacity(num_games);
         let mut np = Vec::with_capacity(num_games);
         let mut player_offsets = Vec::with_capacity(num_games);
         let mut next_obs = Vec::with_capacity(num_games);
+        let mut next_old_obs = Vec::with_capacity(num_games);
         let mut next_masks = Vec::with_capacity(num_games);
         let mut held_actions = Vec::with_capacity(num_games);
         let mut player_teams = Vec::new();
@@ -369,10 +394,12 @@ where
         let mut player_offset = 0;
         for i in 0..num_games {
             let env = create_env_fn(Some(thread_num * (i + 1)));
-            let mut game = GameInstance::new(env, reward_sampling.clone());
-            let (obs, masks) = game.reset();
+            let old_obs = make_old_obs.as_ref().map(|make| make());
+            let mut game = GameInstance::new(env, old_obs, reward_sampling.clone());
+            let (obs, old_obs, masks) = game.reset();
             let n = game.num_players();
             next_obs.extend(obs);
+            next_old_obs.extend(old_obs);
             next_masks.extend(masks);
             np.push(n);
             player_offsets.push(player_offset);
@@ -384,18 +411,25 @@ where
 
         let total_players: usize = np.iter().sum();
         let state_width = next_obs.first().map_or(0, Vec::len);
+        let old_state_width = next_old_obs.first().map_or(0, Vec::len);
         let action_mask_width = next_masks.first().map_or(0, Vec::len);
         debug_assert!(state_width > 0);
         let baseline_steps = trajectory_capacity_hint.div_ceil(total_players.max(1));
         let player_trajs = (0..total_players)
             .map(|_| {
-                PlayerTraj::with_width_and_baseline(state_width, action_mask_width, baseline_steps)
+                PlayerTraj::with_width_and_baseline(
+                    state_width,
+                    old_state_width,
+                    action_mask_width,
+                    baseline_steps,
+                )
             })
             .collect();
 
         Self {
             metrics: Report::default(),
             next_obs,
+            next_old_obs,
             next_masks,
             games,
             np,
@@ -628,8 +662,14 @@ where
                     self.player_trajs[i].action_masks.extend_from_slice(mask);
                 }
             }
+            for (i, old_obs) in self.next_old_obs.iter().enumerate() {
+                if player_is_tracked[i] {
+                    self.player_trajs[i].old_states.extend_from_slice(old_obs);
+                }
+            }
 
             self.next_obs.clear();
+            self.next_old_obs.clear();
             self.next_masks.clear();
 
             // Step games in forward order.
@@ -755,9 +795,10 @@ where
 
                     if result.is_terminal || result.truncated {
                         // Env-level terminal — reset the game.
-                        let (obs, masks) = game.reset();
+                        let (obs, old_obs, masks) = game.reset();
                         self.action_delay_primed[game_idx] = false;
                         self.next_obs.extend(obs);
+                        self.next_old_obs.extend(old_obs);
                         self.next_masks.extend(masks);
 
                         // Refresh cached team info.
@@ -768,10 +809,12 @@ where
                         // Force truncation: game continues from current state
                         // (matches GGL behaviour).
                         self.next_obs.extend(result.obs);
+                        self.next_old_obs.extend(result.old_obs);
                         self.next_masks.extend(result.action_masks);
                     }
                 } else {
                     self.next_obs.extend(result.obs);
+                    self.next_old_obs.extend(result.old_obs);
                     self.next_masks.extend(result.action_masks);
                 }
 
@@ -859,6 +902,8 @@ mod regression_tests {
         PlayerTraj {
             states: (0..len).map(|i| i as f32).collect(),
             state_width: 1,
+            old_states: Vec::new(),
+            old_state_width: 0,
             actions: (0..len).collect(),
             log_probs: vec![0.0; len],
             rewards: vec![1.0; len],
@@ -892,7 +937,7 @@ mod regression_tests {
     #[test]
     fn regression_clear_trims_capacity_to_baseline() {
         let baseline = 2;
-        let mut trajectory = PlayerTraj::with_width_and_baseline(2, 3, baseline);
+        let mut trajectory = PlayerTraj::with_width_and_baseline(2, 0, 3, baseline);
         for _ in 0..16 {
             trajectory.states.extend_from_slice(&[0.0, 0.0]);
             trajectory.actions.push(0);
@@ -921,7 +966,7 @@ mod regression_tests {
 
     #[test]
     fn regression_episode_reuse_preserves_flat_row_widths() {
-        let mut trajectory = PlayerTraj::with_width_and_baseline(2, 1, 0);
+        let mut trajectory = PlayerTraj::with_width_and_baseline(2, 0, 1, 0);
         trajectory.states.extend_from_slice(&[1.0, 2.0]);
         trajectory.actions.push(0);
         trajectory.log_probs.push(0.0);

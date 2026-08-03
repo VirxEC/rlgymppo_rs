@@ -3,6 +3,7 @@ mod gae;
 pub mod model;
 pub mod self_play;
 pub mod skill_tracker;
+pub mod transfer_learn;
 
 use std::path::Path;
 use std::time::{Duration, Instant};

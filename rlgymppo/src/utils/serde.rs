@@ -120,6 +120,17 @@ pub fn latest_checkpoint_folder(base_folder: &Path) -> Option<PathBuf> {
         .map(|(_, path)| path)
 }
 
+/// Resolve the folder containing a saved model's component files: `path`
+/// itself when it directly contains an `actor.mpk.gz`, otherwise the latest
+/// timestamped checkpoint subfolder (see [`latest_checkpoint_folder`]).
+pub fn resolve_model_folder(path: &Path) -> Option<PathBuf> {
+    if path.join("actor.mpk.gz").is_file() {
+        Some(path.to_owned())
+    } else {
+        latest_checkpoint_folder(path)
+    }
+}
+
 pub fn load_latest_model<B: Backend, P: AsRef<Path>>(
     model: Actic<B>,
     base_folder: P,
@@ -197,6 +208,32 @@ mod regression_tests {
         fs::write(root.join("not-a-checkpoint"), []).unwrap();
 
         assert_eq!(latest_checkpoint_folder(&root), Some(root.join("100")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_resolve_model_folder_prefers_direct_checkpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "rlgymppo-serde-resolve-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("direct")).unwrap();
+        fs::write(root.join("direct").join("actor.mpk.gz"), []).unwrap();
+        fs::create_dir_all(root.join("10")).unwrap();
+        fs::create_dir_all(root.join("20")).unwrap();
+
+        // A folder that directly contains model files wins over timestamp
+        // discovery from the parent.
+        assert_eq!(
+            resolve_model_folder(&root.join("direct")),
+            Some(root.join("direct"))
+        );
+        assert_eq!(resolve_model_folder(&root), Some(root.join("20")));
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -120,8 +120,9 @@ where
     TRUNC: Truncate<SI>,
 {
     #[allow(clippy::too_many_arguments)]
-    pub fn new<F>(
+    pub fn new<F, FO>(
         create_env_fn: F,
+        make_old_obs: Option<FO>,
         rollout_budget: usize,
         num_threads: usize,
         num_games_per_thread: usize,
@@ -134,6 +135,7 @@ where
     ) -> Self
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        FO: Fn() -> Box<dyn Obs<SI>> + Clone + Send + 'static,
         B::Device: Send,
     {
         assert!(
@@ -165,6 +167,7 @@ where
             let (command_sender, command_recv) = channel();
             command_senders.push(command_sender);
             let create_env_fn = create_env_fn.clone();
+            let make_old_obs = make_old_obs.clone();
             let device = device.clone();
             let control = control.clone();
             let reward_sampling = reward_sampling.clone();
@@ -173,6 +176,7 @@ where
                 let batch_sim = catch_unwind(AssertUnwindSafe(|| {
                     BatchSim::new(
                         create_env_fn,
+                        make_old_obs,
                         t + 1,
                         num_games_per_thread,
                         device,
@@ -265,12 +269,29 @@ where
         model: Actic<B>,
         self_play: Option<(Actic<B>, usize)>,
     ) -> (&Memory, Report) {
+        self.run_internal(model, self_play, self.rollout_budget)
+    }
+
+    /// Like [`Self::run`], but with an explicit rollout budget.
+    ///
+    /// Used by transfer learning, whose batch size is independent of the
+    /// PPO `timesteps_per_iteration`.
+    pub fn run_with_budget(&mut self, model: Actic<B>, budget: usize) -> (&Memory, Report) {
+        self.run_internal(model, None, budget)
+    }
+
+    fn run_internal(
+        &mut self,
+        model: Actic<B>,
+        self_play: Option<(Actic<B>, usize)>,
+        budget: usize,
+    ) -> (&Memory, Report) {
         self.metrics.clear();
         self.memory.clear();
 
         self.control
             .remaining_steps
-            .store(self.rollout_budget, Ordering::Release);
+            .store(budget, Ordering::Release);
         let command = ThreadCommand::Run {
             model: Arc::new(model),
             self_play: self_play.map(|(model, team)| (Arc::new(model), team)),
@@ -286,7 +307,7 @@ where
             self.threads.len(),
             &mut self.memory,
             &mut self.metrics,
-            self.rollout_budget,
+            budget,
             self.overbatching,
         )
         .unwrap_or_else(|message| panic!("collector rollout failed: {message}"));
@@ -322,6 +343,8 @@ mod regression_tests {
             terminals,
             vec![true; count],
             1,
+            Vec::new(),
+            0,
             None,
         );
         memory

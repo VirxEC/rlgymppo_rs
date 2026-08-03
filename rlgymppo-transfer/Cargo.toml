@@ -1,0 +1,28 @@
+[package]
+name = "rlgymppo-transfer"
+version = "0.1.0"
+edition = "2024"
+description = "Transfer-learning (distillation) example that treats rlgymppo-trainer as the parent model"
+
+[[example]]
+name = "transfer_learn"
+required-features = ["backend"]
+
+[dependencies]
+burn = { version = "0.21.0", features = ["autodiff"] }
+rlgymppo = { path = "../rlgymppo", default-features = false }
+rlgymppo-trainer = { path = "../rlgymppo-trainer", default-features = false }
+
+[features]
+default = ["torch"]
+backend = []
+tui = ["rlgymppo/tui"]
+wandb = ["rlgymppo/wandb"]
+
+candle = ["backend", "burn/candle"]
+cuda = ["backend", "burn/cuda"]
+flex = ["backend", "burn/flex"]
+metal = ["backend", "burn/metal"]
+rocm = ["backend", "burn/rocm"]
+torch = ["backend", "burn/tch"]
+wgpu = ["backend", "burn/wgpu"]

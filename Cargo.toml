@@ -5,6 +5,7 @@ members = [
   "rlgymppo-model",
   "rlgymppo-rlbot",
   "rlgymppo-trainer",
+  "rlgymppo-transfer",
   "rlgymppo-tui",
   "rlgymppo-utils",
   "rlgymppo-wandb",

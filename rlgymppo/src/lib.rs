@@ -21,6 +21,7 @@ pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
 pub use agent::skill_tracker::SkillTrackerConfig;
 use agent::skill_tracker::{AsyncSkillTracker, SkillTrackerUpdate};
+pub use agent::transfer_learn::{TeacherConfig, TransferLearnConfig};
 use base::{Memory, TerminalState};
 pub use burn;
 use burn::module::{AutodiffModule, Module, Quantizer};
@@ -37,10 +38,14 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng, rng};
 pub use rlgym::{self, rocketsim};
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
+use rlgymppo_model::{
+    NormSelection as TeacherNormSelection, Policy as TeacherPolicy, PolicyConfig,
+};
 use utils::Report;
 use utils::running_stat::Stats;
 use utils::serde::{
-    latest_checkpoint_folder, load_latest_model, save_checkpoint as save_checkpoint_files,
+    latest_checkpoint_folder, load_latest_model, resolve_model_folder,
+    save_checkpoint as save_checkpoint_files,
 };
 use utils::shared_info::{SharedInfoReport, SharedInfoRng};
 
@@ -551,14 +556,47 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         O: Optimizer<Net<B>, B>,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         SS: StateSetter<SI>,
-        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + 'static,
         OBS: Obs<SI>,
         ACT: Action<SI, Input = usize>,
         REW: Reward<SI>,
         TERM: Terminal<SI>,
         TRUNC: Truncate<SI>,
     {
-        self.init_internal(create_env, |device, ppo, _model| {
+        self.init_internal(
+            create_env,
+            None::<fn() -> Box<dyn Obs<SI>>>,
+            |device, ppo, _model| ppo.init_with(device, make_optim),
+        )
+    }
+
+    /// Initialize a [`Learner`] with a simple optimizer factory and an old
+    /// (teacher) observation builder.
+    ///
+    /// The `make_old_obs` closure is called once per game (and once more for
+    /// a size probe) and must return a freshly created obs builder each time.
+    /// The builder runs in lockstep with the env's own obs builder so transfer
+    /// learning can distill a teacher trained on a *different* observation
+    /// space; everything else (actions, rewards, shared info) must match.
+    pub fn init_with_old_obs<O, F, FO, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+        self,
+        create_env: F,
+        make_optim: MakeOptim<O>,
+        make_old_obs: FO,
+    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+    where
+        O: Optimizer<Net<B>, B>,
+        F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        FO: Fn() -> Box<dyn Obs<SI>> + Clone + Send + 'static,
+        SS: StateSetter<SI>,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + 'static,
+        OBS: Obs<SI>,
+        ACT: Action<SI, Input = usize>,
+        REW: Reward<SI>,
+        TERM: Terminal<SI>,
+        TRUNC: Truncate<SI>,
+    {
+        self.init_internal(create_env, Some(make_old_obs), |device, ppo, _model| {
             ppo.init_with(device, make_optim)
         })
     }
@@ -577,26 +615,55 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         O: Optimizer<Net<B>, B> + 'static,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         SS: StateSetter<SI>,
-        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + 'static,
         OBS: Obs<SI>,
         ACT: Action<SI, Input = usize>,
         REW: Reward<SI>,
         TERM: Terminal<SI>,
         TRUNC: Truncate<SI>,
     {
-        self.init_internal(create_env, |device, ppo, model| {
+        self.init_internal(
+            create_env,
+            None::<fn() -> Box<dyn Obs<SI>>>,
+            |device, ppo, model| ppo.init_with_model(device, model, make_optim),
+        )
+    }
+
+    /// Initialize a [`Learner`] with a model-aware optimizer factory and an
+    /// old (teacher) observation builder. See [`Self::init_with_old_obs`].
+    pub fn init_with_model_and_old_obs<O, F, FO, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+        self,
+        create_env: F,
+        make_optim: MakeOptimForNet<B, O>,
+        make_old_obs: FO,
+    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+    where
+        O: Optimizer<Net<B>, B> + 'static,
+        F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        FO: Fn() -> Box<dyn Obs<SI>> + Clone + Send + 'static,
+        SS: StateSetter<SI>,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + 'static,
+        OBS: Obs<SI>,
+        ACT: Action<SI, Input = usize>,
+        REW: Reward<SI>,
+        TERM: Terminal<SI>,
+        TRUNC: Truncate<SI>,
+    {
+        self.init_internal(create_env, Some(make_old_obs), |device, ppo, model| {
             ppo.init_with_model(device, model, make_optim)
         })
     }
 
-    fn init_internal<O, F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+    fn init_internal<O, F, FO, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         self,
         create_env: F,
+        make_old_obs: Option<FO>,
         build_ppo: impl FnOnce(B::Device, PpoLearnerConfig, &Actic<B>) -> Ppo<B, O>,
     ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
         O: Optimizer<Net<B>, B>,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
+        FO: Fn() -> Box<dyn Obs<SI>> + Clone + Send + 'static,
         SS: StateSetter<SI>,
         SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
         OBS: Obs<SI>,
@@ -628,9 +695,18 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             self.timesteps_per_save, 0,
             "timesteps_per_save must not be 0"
         );
-        let env = (create_env)(None);
+        let mut env = (create_env)(None);
         let obs_space = env.get_obs_space();
         let action_space = env.get_action_space();
+
+        // Probe the old (teacher) obs builder's space so transfer learning can
+        // construct the teacher network without asking the caller for a size.
+        let old_obs_space = make_old_obs
+            .as_ref()
+            .map(|make| make().get_obs_space(env.get_mut_shared_info()));
+        if let Some(size) = old_obs_space {
+            println!("# old (teacher) obs space: {size}");
+        }
 
         let norm_config = match self.norm {
             NormSelection::None => None,
@@ -701,6 +777,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
 
         let thread_sim = ThreadSim::new(
             create_env,
+            make_old_obs,
             self.ppo.timesteps_per_iteration,
             self.num_threads,
             self.num_games_per_thread,
@@ -731,6 +808,9 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             device: self.device,
             quantizer: self.quantizer,
             model,
+            obs_space,
+            action_space,
+            old_obs_space,
             wandb_project_name: self.wandb_project_name,
             wandb_group_name: self.wandb_group_name,
             wandb_run_name: self.wandb_run_name,
@@ -767,6 +847,15 @@ where
     device: B::Device,
     quantizer: Option<Quantizer>,
     model: Actic<B>,
+    /// Raw observation-space size (needed to construct the teacher policy
+    /// during transfer learning).
+    obs_space: usize,
+    /// Raw action-space size (needed to construct the teacher policy
+    /// during transfer learning).
+    action_space: usize,
+    /// The old (teacher) obs builder's space, probed at init. `None` when no
+    /// old obs builder was configured (same-obs transfer learning).
+    old_obs_space: Option<usize>,
     wandb_project_name: Option<String>,
     #[cfg_attr(not(feature = "wandb"), allow(dead_code))]
     wandb_group_name: Option<String>,
@@ -1176,6 +1265,285 @@ where
         println!("Done.")
     }
 
+    /// Distill an already-trained (typically larger) teacher policy into this
+    /// learner's smaller student policy.
+    ///
+    /// `teacher` describes the teacher policy (its architecture and where its
+    /// checkpoints live); `tl` holds the distillation hyperparameters (see
+    /// [`TransferLearnConfig`]). The student acts in the environment while the
+    /// frozen teacher scores the same states; the student's actor and shared
+    /// head are trained to match the teacher's action distribution. When the
+    /// learner was initialized with [`LearnerConfig::init_with_old_obs`],
+    /// the teacher consumes the old obs builder's (different) observation
+    /// space; otherwise it shares the student's. The critic is not trained, so
+    /// once distillation has produced a good warm start, restart the run and
+    /// call [`Learner::learn`] to continue with normal PPO training.
+    pub fn transfer_learn(mut self, teacher: TeacherConfig, tl: TransferLearnConfig) {
+        teacher.validate();
+        tl.validate();
+
+        #[cfg(not(feature = "wandb"))]
+        assert_eq!(
+            self.wandb_project_name, None,
+            "'wandb' feature is not enabled, but wandb_project_name is set. \
+             Enable the 'wandb' feature in Cargo.toml to use Weights & Biases logging."
+        );
+
+        // Transfer learning doesn't use the skill tracker (it evaluates the
+        // policy against old versions, which is meaningless mid-distillation),
+        // so shut it down before collecting any batches.
+        if let Some(st) = self.skill_tracker.take() {
+            let ratings = st.join(&mut self.version_mgr.versions);
+            self.stats.skill_ratings = Some(ratings.data);
+        }
+
+        // ── Load the teacher (old, larger) policy ──────────────────────
+        let teacher_folder = resolve_model_folder(&teacher.models_path).unwrap_or_else(|| {
+            panic!(
+                "No teacher checkpoint found in: {}",
+                teacher.models_path.display()
+            )
+        });
+        let teacher_config = PolicyConfig {
+            input_size: self.old_obs_space.unwrap_or(self.obs_space),
+            action_size: self.action_space,
+            actor_layer_sizes: teacher.policy_layer_sizes.clone(),
+            shared_head_layer_sizes: teacher.shared_head_layer_sizes.clone(),
+            norm: match teacher.norm {
+                NormSelection::None => TeacherNormSelection::None,
+                NormSelection::LayerNorm => TeacherNormSelection::LayerNorm,
+                NormSelection::RmsNorm => TeacherNormSelection::RmsNorm,
+            },
+        };
+        let teacher =
+            TeacherPolicy::<B::InnerBackend>::load(&teacher_folder, &teacher_config, &self.device)
+                .unwrap_or_else(|e| {
+                    panic!("Failed to load teacher policy from {teacher_folder:?}: {e}")
+                });
+        let teacher_params = teacher.actor.num_params()
+            + teacher
+                .shared_head
+                .as_ref()
+                .map_or(0, |head| head.num_params());
+        println!(
+            " > Transfer learning: teacher has {teacher_params} params, \
+             student actor has {} params",
+            self.model.actor.num_params()
+        );
+
+        // Initialise the wandb MetricSender via embedded Python before
+        // the TUI so the "wandb run started" message goes to stdout
+        // before the alternate screen takes over.
+        #[cfg(feature = "wandb")]
+        #[cfg_attr(not(all(feature = "tui", feature = "wandb")), allow(dead_code))]
+        let (wandb_tx, wandb_handle, wandb_run_id) = if let Some(project_name) =
+            self.wandb_project_name.as_ref()
+        {
+            let group = self.wandb_group_name.as_deref().unwrap_or("unnamed-runs");
+            let name = self.wandb_run_name.as_deref().unwrap_or("rlgymppo-run");
+            let run_id = self
+                .stats
+                .wandb_run
+                .as_ref()
+                .map(|r| r.run_id.as_str())
+                .unwrap_or("");
+
+            match rlgymppo_wandb::MetricSender::new(project_name, group, name, run_id) {
+                Ok(sender) => {
+                    let id = sender.run_id().to_owned();
+                    self.stats.wandb_run =
+                        Some(crate::utils::running_stat::WandbRun { run_id: id.clone() });
+                    println!(" > wandb run started with ID: \"{id}\"");
+
+                    let (tx, rx) =
+                        std::sync::mpsc::sync_channel::<std::collections::HashMap<String, f64>>(1);
+                    let handle = thread::Builder::new()
+                        .name("wandb".into())
+                        .spawn(move || {
+                            // `sender` moves into this thread; dropped
+                            // when the channel closes -> calls finish().
+                            while let Ok(metrics) = rx.recv() {
+                                if let Err(e) = sender.send(&metrics) {
+                                    eprintln!("Warning: wandb send failed: {e}");
+                                }
+                            }
+                        })
+                        .expect("Failed to spawn wandb-sender thread");
+                    (Some(tx), Some(handle), Some(id))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to initialise wandb MetricSender: {e}\n\
+                             Metrics will not be logged to wandb."
+                    );
+                    (None, None, None)
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+
+        // Initialise the TUI display (ratatui-based terminal dashboard).
+        #[cfg(feature = "tui")]
+        let tui_display = match rlgymppo_tui::TuiHandle::new() {
+            Ok(tui) => Some(tui),
+            Err(e) => {
+                eprintln!("Warning: Failed to initialise TUI display: {e}",);
+                eprintln!("Falling back to plain-text iteration logs.");
+                None
+            }
+        };
+
+        #[cfg(feature = "tui")]
+        let tui_notifier = tui_display.as_ref().map(|tui| tui.notifier());
+        #[cfg(not(feature = "tui"))]
+        let tui_notifier = None;
+
+        let (metric_tx, metric_rx) = channel();
+        let skill_metric_rx = self.skill_metric_rx.take().unwrap();
+
+        let metrics_actor = spawn_metrics_actor(
+            metric_rx,
+            skill_metric_rx,
+            #[cfg(feature = "tui")]
+            tui_display,
+            #[cfg(feature = "wandb")]
+            wandb_tx,
+            #[cfg(feature = "wandb")]
+            wandb_handle,
+            #[cfg(all(feature = "tui", feature = "wandb"))]
+            wandb_run_id,
+        );
+
+        let (s, r) = channel();
+
+        {
+            let renderer_controls = self.renderer_controls.clone();
+            let input_tui_notifier = tui_notifier.clone();
+            thread::spawn(move || {
+                stdin_reader(s, renderer_controls, input_tui_notifier);
+            });
+        }
+
+        #[cfg(not(feature = "tui"))]
+        println!("Running transfer learning. This might be slow at first...");
+        Self::print_controls_prompt();
+
+        let inital_cumulative_updates = self.stats.cumulative_model_updates;
+        'train: while self
+            .num_additional_iterations
+            .is_none_or(|n| self.stats.cumulative_model_updates - inital_cumulative_updates < n)
+        {
+            let collect_start = Instant::now();
+
+            let mut nodiff_model = self.model.valid();
+            if let Some(quantizer) = &mut self.quantizer {
+                nodiff_model = nodiff_model.quantize_weights(quantizer);
+            }
+
+            // update the model the renderer is using
+            {
+                let (controls, start_rendering) = &*self.renderer_controls;
+                let mut guard = controls.lock();
+                guard.model = Some(nodiff_model.clone());
+                drop(guard);
+
+                start_rendering.notify_all();
+            }
+
+            // collect a batch of environment steps with the student acting
+            let (memory, mut metrics) = self.collector.run_with_budget(nodiff_model, tl.batch_size);
+            let collect_elapsed = collect_start.elapsed().as_secs_f64();
+
+            // distill the teacher's action distribution into the student
+            let train_start = Instant::now();
+            let num_new_steps;
+            (self.model, num_new_steps) =
+                self.ppo
+                    .transfer_learn(self.model, &teacher, memory, &tl, &mut metrics);
+            let consumption_elapsed = train_start.elapsed().as_secs_f64();
+
+            // ── Self-play: snapshot policy versions on timestep boundaries ──
+            let prev_timesteps = self.stats.cumulative_timesteps;
+            self.stats.cumulative_timesteps += num_new_steps as u64;
+            self.stats.cumulative_model_updates += 1;
+            self.stats.cumulative_epochs += tl.epochs as u64;
+            self.version_mgr.on_iteration(
+                &self.model.valid(),
+                self.stats.cumulative_timesteps,
+                prev_timesteps,
+                None,
+            );
+
+            metrics["Collect/timesteps"] = num_new_steps.into();
+            metrics["Timing/collection"] = collect_elapsed.into();
+            metrics["Timing/consumption"] = consumption_elapsed.into();
+            metrics["Throughput/collected"] = (num_new_steps as f64 / collect_elapsed).into();
+            metrics["Throughput/consumption"] =
+                (num_new_steps as f64 / consumption_elapsed.max(1e-12)).into();
+            metrics["Throughput/overall"] =
+                (num_new_steps as f64 / collect_start.elapsed().as_secs_f64()).into();
+            metrics["Cumulative/steps"] = self.stats.cumulative_timesteps.into();
+            metrics["Cumulative/epochs"] = self.stats.cumulative_epochs.into();
+            metrics["Cumulative/updates"] = self.stats.cumulative_model_updates.into();
+
+            let _ = metric_tx.send(MetricEvent::Report(PendingMetricReport {
+                waiting_for_skill_eval: None,
+                #[cfg(feature = "tui")]
+                fresh_rating: false,
+                report: metrics,
+            }));
+
+            let (keep_running, handled_inputs) = self.drain_input(&r);
+            if let Some(ref notifier) = tui_notifier {
+                for input in handled_inputs {
+                    Self::notify_input(notifier, input);
+                }
+            } else {
+                drop(handled_inputs);
+            }
+
+            if !keep_running {
+                break 'train;
+            }
+
+            if self.stats.cumulative_timesteps - self.last_save_timestep > self.timesteps_per_save {
+                if let Some(ref notifier) = tui_notifier {
+                    let _ = notifier.notify("Auto-saving model...");
+                }
+
+                self.save_checkpoint();
+                self.version_mgr.save_versions();
+                self.last_save_timestep = self.stats.cumulative_timesteps;
+            }
+
+            Self::print_controls_prompt();
+        }
+
+        {
+            // Make render thread exit
+            let (controls, start_renderer) = &*self.renderer_controls;
+            let mut guard = controls.lock();
+            guard.quit = true;
+            drop(guard);
+
+            // if render = false, this will wake the thread up to exit
+            start_renderer.notify_all();
+        }
+
+        self.save_checkpoint();
+        self.version_mgr.save_versions();
+
+        let _ = metric_tx.send(MetricEvent::Shutdown);
+        let _ = metrics_actor.join();
+
+        println!("Waiting for threads to exit...");
+        self.collector.join();
+        self.renderer.join().unwrap();
+
+        println!("Done.")
+    }
+
     /// Only run the renderer. Useful for debugging.
     pub fn render(mut self) {
         let (s, r) = channel();
@@ -1244,6 +1612,8 @@ mod tests {
             vec![TerminalState::None, TerminalState::Truncated],
             vec![true, true],
             1,
+            Vec::new(),
+            0,
             Some(vec![2.0]),
         );
         memory.push_player(
@@ -1255,6 +1625,8 @@ mod tests {
             vec![TerminalState::Normal],
             vec![true],
             1,
+            Vec::new(),
+            0,
             None,
         );
 

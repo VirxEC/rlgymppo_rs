@@ -87,6 +87,18 @@ impl<B: Backend> Policy<B> {
         Ok(Self { shared_head, actor })
     }
 
+    /// Compute the stochastic action distribution `softmax(masked_logits)`
+    /// clamped to `[1e-11, 1]`, optionally masking invalid actions with a large
+    /// negative logit bias. Used as the teacher target distribution during
+    /// transfer learning (knowledge distillation).
+    pub fn infer(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+        let features = match &self.shared_head {
+            Some(head) => head.forward(input),
+            None => input,
+        };
+        self.actor.infer(features, mask)
+    }
+
     #[must_use]
     pub fn react_deterministic_indexed(
         &self,

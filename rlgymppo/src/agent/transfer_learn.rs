@@ -93,7 +93,7 @@ impl Default for TransferLearnConfig {
         Self {
             lr: 3e-4,
             batch_size: 50_000,
-            mini_batch_size: 20_000,
+            mini_batch_size: 10_000,
             epochs: 5,
             use_kl_div: false,
             loss_scale: 500.0,

@@ -44,7 +44,7 @@ struct CachedColumnPlan {
 pub(crate) const SPARKLINE_HISTORY_LEN: usize = 12;
 const SPARKLINE_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-use crate::format::{display_width, format_num, metric_value_display};
+use crate::format::{display_width, format_num, metric_value_display, metric_value_for_sparkline};
 
 /// Category grouping information for the display layout.
 #[derive(Clone)]
@@ -774,7 +774,9 @@ fn render_group_lines<'a>(
             let full_key = format!("{}/{name}", group.key_prefix);
             history
                 .get(&full_key)
-                .and_then(|values| sparkline_for_values(values, max_sparkline_available_width))
+                .and_then(|values| {
+                    sparkline_for_values(group, name, values, max_sparkline_available_width)
+                })
                 .map(|sparkline| display_width(&sparkline))
         })
         .max()
@@ -786,9 +788,9 @@ fn render_group_lines<'a>(
         let name_width = display_width(&name_text);
         let value_width = display_width(&value);
         let full_key = format!("{}/{name}", group.key_prefix);
-        let sparkline = history
-            .get(&full_key)
-            .and_then(|values| sparkline_for_values(values, max_sparkline_available_width));
+        let sparkline = history.get(&full_key).and_then(|values| {
+            sparkline_for_values(group, name, values, max_sparkline_available_width)
+        });
         let sparkline_width = sparkline.as_deref().map(display_width).unwrap_or(0);
         let name_padding = name_col_width.saturating_sub(name_width);
         let value_padding = value_col_width.saturating_sub(value_width);
@@ -851,12 +853,20 @@ fn sparkline_required_width(group: &MetricGroup, name: &str, history: &MetricHis
     }
 }
 
-fn sparkline_for_values(values: &VecDeque<f64>, max_width: usize) -> Option<String> {
+fn sparkline_for_values(
+    group: &MetricGroup,
+    name: &str,
+    values: &VecDeque<f64>,
+    max_width: usize,
+) -> Option<String> {
     if values.len() < 2 || max_width < 2 {
         return None;
     }
 
-    let samples = downsample_values(values, max_width);
+    let samples: Vec<f64> = downsample_values(values, max_width)
+        .into_iter()
+        .map(|value| metric_value_for_sparkline(group, name, value))
+        .collect();
     let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
     let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let range = max - min;
@@ -993,23 +1003,50 @@ mod tests {
         );
     }
 
+    fn loss_group() -> MetricGroup {
+        MetricGroup {
+            name: "Loss".into(),
+            key_prefix: "Loss".into(),
+            color: Color::Red,
+        }
+    }
+
     #[test]
     fn test_sparkline_for_constant_values() {
         let values = VecDeque::from([3.0, 3.0, 3.0]);
-        assert_eq!(sparkline_for_values(&values, 8), Some("▁▁▁".to_string()));
+        assert_eq!(
+            sparkline_for_values(&loss_group(), "policy", &values, 8),
+            Some("▁▁▁".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sparkline_is_flat_when_displayed_values_are_equal() {
+        let values = VecDeque::from([1.231, 1.234]);
+        assert_eq!(
+            sparkline_for_values(&loss_group(), "policy", &values, 8),
+            Some("▁▁".to_string())
+        );
     }
 
     #[test]
     fn test_sparkline_respects_max_width() {
         let values = VecDeque::from([1.0, 2.0, 3.0, 4.0, 5.0]);
-        let sparkline = sparkline_for_values(&values, 3).expect("sparkline");
+        let sparkline =
+            sparkline_for_values(&loss_group(), "policy", &values, 3).expect("sparkline");
         assert_eq!(display_width(&sparkline), 3);
     }
 
     #[test]
     fn test_sparkline_too_narrow_or_short() {
-        assert_eq!(sparkline_for_values(&VecDeque::from([1.0, 2.0]), 1), None);
-        assert_eq!(sparkline_for_values(&VecDeque::from([1.0]), 8), None);
+        assert_eq!(
+            sparkline_for_values(&loss_group(), "policy", &VecDeque::from([1.0, 2.0]), 1),
+            None
+        );
+        assert_eq!(
+            sparkline_for_values(&loss_group(), "policy", &VecDeque::from([1.0]), 8),
+            None
+        );
     }
 
     #[test]

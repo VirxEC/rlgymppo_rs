@@ -18,6 +18,18 @@ pub(crate) fn metric_value_display(group: &MetricGroup, name: &str, value: f64) 
     }
 }
 
+/// Return the numeric value represented by [`metric_value_display`].
+///
+/// Sparklines use this value so changes hidden by display rounding do not alter
+/// their scale. Removing separators also handles integer displays such as
+/// `"1,234"` without duplicating the formatting rules numerically.
+pub(crate) fn metric_value_for_sparkline(group: &MetricGroup, name: &str, value: f64) -> f64 {
+    metric_value_display(group, name, value)
+        .replace(',', "")
+        .parse()
+        .unwrap_or(value)
+}
+
 /// Format a number for display (commas for integers, 4-decimal for floats).
 pub(crate) fn format_num(val: f64) -> String {
     if val == (val as i64) as f64 {
@@ -71,5 +83,39 @@ mod tests {
         assert_eq!(format_num(f64::INFINITY), "inf");
         assert_eq!(format_num(f64::NEG_INFINITY), "-inf");
         assert_eq!(format_num(-0.0), "0");
+    }
+
+    #[test]
+    fn test_metric_value_for_sparkline_matches_display_rounding() {
+        let group = |key_prefix: &str| MetricGroup {
+            name: key_prefix.to_string(),
+            key_prefix: key_prefix.to_string(),
+            color: ratatui::style::Color::Reset,
+        };
+
+        assert_eq!(
+            metric_value_for_sparkline(&group("Rating"), "overall", 1_234.04),
+            1_234.0
+        );
+        assert_eq!(
+            metric_value_for_sparkline(&group("Throughput"), "steps/s", 1_234.4),
+            1_234.0
+        );
+        assert_eq!(
+            metric_value_for_sparkline(&group("Collect"), "episode length", 12.4),
+            12.0
+        );
+        assert_eq!(
+            metric_value_for_sparkline(&group("Loss"), "policy", 1.234),
+            1.23
+        );
+        assert_eq!(
+            metric_value_for_sparkline(&group("Loss"), "policy", 0.12344),
+            0.1234
+        );
+        assert_eq!(
+            metric_value_for_sparkline(&group("Loss"), "policy", 0.00012344),
+            0.000123
+        );
     }
 }

@@ -165,7 +165,6 @@ pub fn default_config<B: AutodiffBackend>(
             learning_rate: lr,
             entropy_scale: 0.024,
             gae_estimator: GaeEstimator::TerminationTime,
-            max_episode_length: None,
             ..Default::default()
         },
         self_play: SelfPlayConfig {

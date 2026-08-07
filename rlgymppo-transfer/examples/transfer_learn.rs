@@ -26,6 +26,7 @@
     feature = "metal",
     feature = "rocm",
     feature = "wgpu",
+    feature = "vulkan",
     feature = "flex",
     feature = "candle"
 )))]
@@ -41,6 +42,7 @@ compile_error!(
             feature = "metal",
             feature = "rocm",
             feature = "wgpu",
+            feature = "vulkan",
             feature = "flex",
             feature = "candle"
         )
@@ -51,6 +53,7 @@ compile_error!(
             feature = "metal",
             feature = "rocm",
             feature = "wgpu",
+            feature = "vulkan",
             feature = "flex",
             feature = "candle"
         )
@@ -60,15 +63,25 @@ compile_error!(
         any(
             feature = "rocm",
             feature = "wgpu",
+            feature = "vulkan",
             feature = "flex",
             feature = "candle"
         )
     ),
     all(
         feature = "rocm",
-        any(feature = "wgpu", feature = "flex", feature = "candle")
+        any(
+            feature = "wgpu",
+            feature = "vulkan",
+            feature = "flex",
+            feature = "candle"
+        )
     ),
-    all(feature = "wgpu", any(feature = "flex", feature = "candle")),
+    all(
+        feature = "wgpu",
+        any(feature = "vulkan", feature = "flex", feature = "candle")
+    ),
+    all(feature = "vulkan", any(feature = "flex", feature = "candle")),
     all(feature = "flex", feature = "candle"),
 ))]
 compile_error!(
@@ -138,6 +151,21 @@ fn main() {
             WgpuDevice::default(),
             Some(WgpuDevice::Cpu),
             true,
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    {
+        use burn::backend::wgpu::WgpuDevice;
+        use burn::backend::{Autodiff, Vulkan};
+
+        // The skill tracker shares the main device: `WgpuDevice::Cpu` selects
+        // the llvmpipe adapter, where cubecl's kernels are unimplemented.
+        rlgymppo_transfer::transfer_learn::<Autodiff<Vulkan>>(
+            WgpuDevice::default(),
+            WgpuDevice::default(),
+            None,
+            false,
         );
     }
 

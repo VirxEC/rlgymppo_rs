@@ -3,7 +3,7 @@ use rand::distr::weighted::WeightedIndex;
 use rlgym::StateSetter;
 use rlgym::rocketsim::Arena;
 
-use crate::utils::shared_info::SharedInfoRng;
+use crate::shared_info::SharedInfoRng;
 
 #[macro_export]
 macro_rules! weighted_state {

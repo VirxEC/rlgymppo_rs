@@ -2,7 +2,7 @@ use rand::RngExt;
 use rlgym::rocketsim::{ArenaEvent, Vec3A};
 use rlgym::{GameState, Terminal};
 
-use crate::utils::shared_info::SharedInfoRng;
+use crate::shared_info::SharedInfoRng;
 
 /// Ends the episode after a random duration, but only if the ball has hit the floor at least once.
 ///

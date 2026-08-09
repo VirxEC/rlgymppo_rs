@@ -14,10 +14,7 @@ burn = {
   features = ["flex", "std"]
 }
 rand = { workspace = true }
-rlbot-rocketsim = {
-  git = "https://github.com/VirxEC/rlbot-rocketsim.git",
-  rev = "da0746db918cf4154a5ac78ac99d9da97566674a"
-}
+rlbot-rocketsim = { git = "https://github.com/VirxEC/rlbot-rocketsim.git" }
 rlgymppo-model = { path = "../rlgymppo-model" }
 rlgymppo-utils = { path = "../rlgymppo-utils" }
 rustc-hash = { workspace = true }

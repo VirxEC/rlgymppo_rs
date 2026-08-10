@@ -19,17 +19,17 @@ use std::path::PathBuf;
 use burn::tensor::backend::AutodiffBackend;
 use rlgymppo::rlgym::{Env, Obs};
 use rlgymppo::rocketsim::{Arena, CarBodyConfig, GameMode, Team, init_from_default};
-use rlgymppo::utils::actions::DefaultAction;
-use rlgymppo::utils::obs::DefaultObs;
-use rlgymppo::utils::rewards;
-use rlgymppo::utils::state_setters::{KickoffState, RandomState, WeightedState};
-use rlgymppo::utils::terminal::{
-    AnyTerminal, NoTouchCondition, OnGoalCondition, RandomGameEndedCondition,
-};
 use rlgymppo::{
     GaeEstimator, LearnerConfig, NormSelection, PpoLearnerConfig, SelfPlayConfig,
     SkillTrackerConfig, TeacherConfig, TransferLearnConfig, any_terminal, combined_rewards,
     default_adamw_optimizer, weighted_state,
+};
+use rlgymppo_utils::actions::DefaultAction;
+use rlgymppo_utils::obs::DefaultObs;
+use rlgymppo_utils::rewards;
+use rlgymppo_utils::state_setters::{KickoffState, RandomState, WeightedState};
+use rlgymppo_utils::terminal::{
+    AnyTerminal, NoTouchCondition, OnGoalCondition, RandomGameEndedCondition,
 };
 
 const MIN_GAME_DURATION: u64 = 60 * 120;

@@ -9,8 +9,8 @@ use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
 use super::sim::{GameInstance, RewardSamplingConfig};
 use crate::agent::model::Actic;
 use crate::base::{Memory, TerminalState};
-use crate::utils::shared_info::SharedInfoReport;
-use crate::utils::{AvgTracker, Report};
+use rlgymppo_utils::shared_info::SharedInfoReport;
+use rlgymppo_utils::{AvgTracker, Report};
 
 const EPISODE_LENGTH_EMA_ALPHA: f64 = 0.1;
 const MIN_TRAJECTORY_BASELINE_STEPS: usize = 32;

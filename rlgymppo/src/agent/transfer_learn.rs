@@ -12,7 +12,7 @@ use crate::NormSelection;
 use crate::agent::Ppo;
 use crate::agent::model::{Actic, Net};
 use crate::base::{Memory, get_action_masks_batch, get_states_batch_range};
-use crate::utils::Report;
+use rlgymppo_utils::Report;
 
 /// What the teacher (old, larger) policy is: its architecture and where its
 /// checkpoints live. Passed to `Learner::transfer_learn` alongside a

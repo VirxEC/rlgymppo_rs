@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use super::model::Actic;
 use super::self_play::PolicyVersion;
 use crate::environment::sim::{GameInstance, RewardSamplingConfig};
-use crate::utils::Report;
-use crate::utils::shared_info::{SharedInfoReport, SharedInfoRng};
-use crate::utils::state_setters::KickoffState;
-use crate::utils::terminal::OnGoalCondition;
+use rlgymppo_utils::Report;
+use rlgymppo_utils::shared_info::{SharedInfoReport, SharedInfoRng};
+use rlgymppo_utils::state_setters::KickoffState;
+use rlgymppo_utils::terminal::OnGoalCondition;
 
 /// Per-mode Elo ratings (e.g. `"1v1"`, `"2v2"`, `"3v3"`).
 ///

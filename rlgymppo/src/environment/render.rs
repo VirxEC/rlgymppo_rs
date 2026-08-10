@@ -9,7 +9,7 @@ use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
 
 use super::sim::{GameInstance, RewardSamplingConfig};
 use crate::agent::model::Actic;
-use crate::utils::shared_info::SharedInfoReport;
+use rlgymppo_utils::shared_info::SharedInfoReport;
 
 pub struct RendererControls<B: Backend> {
     pub model: Option<Actic<B>>,

@@ -28,8 +28,8 @@ use crate::base::{
     Memory, get_action_batch, get_action_masks_batch, get_batch_1d, get_generic_batch,
     get_log_probs_batch, get_states_batch, get_states_batch_range,
 };
-use crate::utils::Report;
 use crate::utils::running_stat::Stats;
+use rlgymppo_utils::Report;
 
 pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<AdamW, Net<B>, B>> {
     config: PpoLearnerConfig,

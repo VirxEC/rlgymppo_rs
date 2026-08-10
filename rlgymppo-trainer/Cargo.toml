@@ -11,6 +11,7 @@ required-features = ["backend"]
 burn = { version = "0.21.0", features = ["autodiff"] }
 rand = { workspace = true }
 rlgymppo = { path = "../rlgymppo", default-features = false }
+rlgymppo-utils = {path = "../rlgymppo-utils"}
 
 [features]
 default = ["wandb", "tui", "torch"]

@@ -8,7 +8,7 @@ use crate::shared_info::SharedInfoRng;
 #[macro_export]
 macro_rules! weighted_state {
     ($($state:ty, $weight:expr;)+) => {
-        $crate::utils::state_setters::WeightedState::new(vec![
+        $crate::state_setters::WeightedState::new(vec![
             $((Box::<$state>::default(), $weight),)+
         ])
     };

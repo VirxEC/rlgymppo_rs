@@ -48,6 +48,7 @@ use utils::serde::{
     save_checkpoint as save_checkpoint_files,
 };
 use utils::shared_info::{SharedInfoReport, SharedInfoRng};
+pub use utils::{any_terminal, combined_rewards, weighted_state};
 
 #[derive(Clone, Copy)]
 enum HumanInput {

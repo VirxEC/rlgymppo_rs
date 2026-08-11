@@ -3,7 +3,18 @@ name = "rlgymppo-tui"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+bench = []
+
 [dependencies]
 crossterm = { workspace = true }
 ratatui = "0.30"
 unicode-width = "0.2"
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "layout"
+harness = false
+required-features = ["bench"]

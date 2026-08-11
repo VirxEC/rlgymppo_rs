@@ -9,3 +9,5 @@ mod format;
 mod render;
 
 pub use app::{ScrollCommand, TuiDisplay, TuiHandle, TuiNotifier};
+#[cfg(feature = "bench")]
+pub use render::bench;

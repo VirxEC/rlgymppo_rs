@@ -481,12 +481,17 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// An optional callback invoked after each checkpoint is saved.
     /// The callback receives the path to the newly-created checkpoint folder.
     pub checkpoint_callback: Option<CheckpointCallback>,
-    /// The number of threads to use for collecting data.
-    pub num_threads: usize,
-    /// The number of games to run per thread.
+    /// The number of threads in one collection pool's rayon pool.
+    pub num_threads_per_pool: usize,
+    /// The number of independent collection pools.
+    /// Each pool owns its own games, its own inference batch,
+    /// and its own rayon pool.
+    /// Total games = num_pools * num_games_per_pool.
+    pub num_pools: usize,
+    /// The number of games to run per pool.
     /// Increasing this will increase GPU utilization
-    /// and the utilization of 1 cpu thread.
-    pub num_games_per_thread: usize,
+    /// and the utilization of one CPU thread.
+    pub num_games_per_pool: usize,
 
     /// The number of additional iterations (episodes) to run training for,
     /// exiting after that.
@@ -530,8 +535,9 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             checkpoints_limit: None,
             timesteps_per_save: 1_000_000,
             checkpoint_callback: None,
-            num_threads: 4,
-            num_games_per_thread: 64,
+            num_threads_per_pool: 4,
+            num_pools: 1,
+            num_games_per_pool: 64,
             num_additional_iterations: None,
             render: false,
             self_play: SelfPlayConfig::default(),
@@ -556,17 +562,17 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     where
         O: Optimizer<Net<B>, B>,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
-        SS: StateSetter<SI>,
-        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + 'static,
-        OBS: Obs<SI>,
-        ACT: Action<SI, Input = usize>,
-        REW: Reward<SI>,
-        TERM: Terminal<SI>,
-        TRUNC: Truncate<SI>,
+        SS: StateSetter<SI> + Send,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send + 'static,
+        OBS: Obs<SI> + Send,
+        ACT: Action<SI, Input = usize> + Send,
+        REW: Reward<SI> + Send,
+        TERM: Terminal<SI> + Send,
+        TRUNC: Truncate<SI> + Send,
     {
         self.init_internal(
             create_env,
-            None::<fn() -> Box<dyn Obs<SI>>>,
+            None::<fn() -> Box<dyn Obs<SI> + Send>>,
             |device, ppo, _model| ppo.init_with(device, make_optim),
         )
     }
@@ -588,14 +594,14 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     where
         O: Optimizer<Net<B>, B>,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
-        FO: Fn() -> Box<dyn Obs<SI>> + Clone + Send + 'static,
-        SS: StateSetter<SI>,
-        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + 'static,
-        OBS: Obs<SI>,
-        ACT: Action<SI, Input = usize>,
-        REW: Reward<SI>,
-        TERM: Terminal<SI>,
-        TRUNC: Truncate<SI>,
+        FO: Fn() -> Box<dyn Obs<SI> + Send> + Clone + Send + 'static,
+        SS: StateSetter<SI> + Send,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send + 'static,
+        OBS: Obs<SI> + Send,
+        ACT: Action<SI, Input = usize> + Send,
+        REW: Reward<SI> + Send,
+        TERM: Terminal<SI> + Send,
+        TRUNC: Truncate<SI> + Send,
     {
         self.init_internal(create_env, Some(make_old_obs), |device, ppo, _model| {
             ppo.init_with(device, make_optim)
@@ -615,17 +621,17 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     where
         O: Optimizer<Net<B>, B> + 'static,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
-        SS: StateSetter<SI>,
-        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + 'static,
-        OBS: Obs<SI>,
-        ACT: Action<SI, Input = usize>,
-        REW: Reward<SI>,
-        TERM: Terminal<SI>,
-        TRUNC: Truncate<SI>,
+        SS: StateSetter<SI> + Send,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send + 'static,
+        OBS: Obs<SI> + Send,
+        ACT: Action<SI, Input = usize> + Send,
+        REW: Reward<SI> + Send,
+        TERM: Terminal<SI> + Send,
+        TRUNC: Truncate<SI> + Send,
     {
         self.init_internal(
             create_env,
-            None::<fn() -> Box<dyn Obs<SI>>>,
+            None::<fn() -> Box<dyn Obs<SI> + Send>>,
             |device, ppo, model| ppo.init_with_model(device, model, make_optim),
         )
     }
@@ -641,14 +647,14 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     where
         O: Optimizer<Net<B>, B> + 'static,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
-        FO: Fn() -> Box<dyn Obs<SI>> + Clone + Send + 'static,
-        SS: StateSetter<SI>,
-        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + 'static,
-        OBS: Obs<SI>,
-        ACT: Action<SI, Input = usize>,
-        REW: Reward<SI>,
-        TERM: Terminal<SI>,
-        TRUNC: Truncate<SI>,
+        FO: Fn() -> Box<dyn Obs<SI> + Send> + Clone + Send + 'static,
+        SS: StateSetter<SI> + Send,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send + 'static,
+        OBS: Obs<SI> + Send,
+        ACT: Action<SI, Input = usize> + Send,
+        REW: Reward<SI> + Send,
+        TERM: Terminal<SI> + Send,
+        TRUNC: Truncate<SI> + Send,
     {
         self.init_internal(create_env, Some(make_old_obs), |device, ppo, model| {
             ppo.init_with_model(device, model, make_optim)
@@ -664,23 +670,27 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     where
         O: Optimizer<Net<B>, B>,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
-        FO: Fn() -> Box<dyn Obs<SI>> + Clone + Send + 'static,
-        SS: StateSetter<SI>,
-        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
-        OBS: Obs<SI>,
-        ACT: Action<SI, Input = usize>,
-        REW: Reward<SI>,
-        TERM: Terminal<SI>,
-        TRUNC: Truncate<SI>,
+        FO: Fn() -> Box<dyn Obs<SI> + Send> + Clone + Send + 'static,
+        SS: StateSetter<SI> + Send,
+        SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send,
+        OBS: Obs<SI> + Send,
+        ACT: Action<SI, Input = usize> + Send,
+        REW: Reward<SI> + Send,
+        TERM: Terminal<SI> + Send,
+        TRUNC: Truncate<SI> + Send,
     {
         self.ppo.validate_batching();
         assert!(
-            self.num_threads > 0,
-            "Number of collector threads must be greater than zero"
+            self.num_threads_per_pool > 0,
+            "Number of threads per collection pool must be greater than zero"
         );
         assert!(
-            self.num_games_per_thread > 0,
-            "Number of games per collector thread must be greater than zero"
+            self.num_pools > 0,
+            "Number of collection pools must be greater than zero"
+        );
+        assert!(
+            self.num_games_per_pool > 0,
+            "Number of games per pool must be greater than zero"
         );
         assert_ne!(
             self.policy_layer_sizes.len(),
@@ -780,8 +790,9 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             create_env,
             make_old_obs,
             self.ppo.timesteps_per_iteration,
-            self.num_threads,
-            self.num_games_per_thread,
+            self.num_threads_per_pool,
+            self.num_pools,
+            self.num_games_per_pool,
             self.device.clone(),
             reward_sampling,
             self.ppo.max_episode_length,
@@ -834,13 +845,13 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
 
 pub struct Learner<B: AutodiffBackend, O: Optimizer<Net<B>, B>, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    SS: StateSetter<SI>,
-    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
-    OBS: Obs<SI>,
-    ACT: Action<SI, Input = usize>,
-    REW: Reward<SI>,
-    TERM: Terminal<SI>,
-    TRUNC: Truncate<SI>,
+    SS: StateSetter<SI> + Send,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send,
+    OBS: Obs<SI> + Send,
+    ACT: Action<SI, Input = usize> + Send,
+    REW: Reward<SI> + Send,
+    TERM: Terminal<SI> + Send,
+    TRUNC: Truncate<SI> + Send,
 {
     ppo: Ppo<B, O>,
     rng: SmallRng,
@@ -883,13 +894,13 @@ where
 impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>, SS, OBS, ACT, REW, TERM, TRUNC, SI>
     Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    SS: StateSetter<SI>,
-    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
-    OBS: Obs<SI>,
-    ACT: Action<SI, Input = usize>,
-    REW: Reward<SI>,
-    TERM: Terminal<SI>,
-    TRUNC: Truncate<SI>,
+    SS: StateSetter<SI> + Send,
+    SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send,
+    OBS: Obs<SI> + Send,
+    ACT: Action<SI, Input = usize> + Send,
+    REW: Reward<SI> + Send,
+    TERM: Terminal<SI> + Send,
+    TRUNC: Truncate<SI> + Send,
 {
     /// Load the previously saved model, training stats, and optimizer state.
     /// Does nothing if the model can't be loaded, this is safe to call unconditionally.
@@ -1260,7 +1271,6 @@ where
         let _ = metrics_actor.join();
 
         println!("Waiting for threads to exit...");
-        self.collector.join();
         self.renderer.join().unwrap();
 
         println!("Done.")
@@ -1539,7 +1549,6 @@ where
         let _ = metrics_actor.join();
 
         println!("Waiting for threads to exit...");
-        self.collector.join();
         self.renderer.join().unwrap();
 
         println!("Done.")

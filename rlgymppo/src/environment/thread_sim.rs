@@ -1,92 +1,20 @@
-use std::any::Any;
 use std::marker::PhantomData;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread;
 
 use burn::prelude::Backend;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 
-use super::batch_sim::BatchSim;
+use super::batch_sim::{COLLECT_ENV_STEP_TIME_KEY, COLLECT_INFERENCE_TIME_KEY};
+use super::pool_collector::PoolCollector;
 use super::sim::RewardSamplingConfig;
 use crate::agent::model::Actic;
 use crate::base::Memory;
 use rlgymppo_utils::Report;
 use rlgymppo_utils::shared_info::SharedInfoReport;
 
-pub struct DataResponse {
-    pub memory: Memory,
-    pub metrics: Report,
-}
-
-fn merge_worker_memory(
-    target: &mut Memory,
-    incoming: Memory,
-    rollout_budget: usize,
-    overbatching: bool,
-) {
-    if overbatching {
-        target.merge(incoming);
-        return;
-    }
-
-    let remaining = rollout_budget.saturating_sub(target.len());
-    if incoming.len() <= remaining {
-        target.merge(incoming);
-    } else if remaining > 0 {
-        target.merge_prefix(incoming, remaining);
-    }
-}
-
-type WorkerResponse = Result<DataResponse, String>;
-
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|message| (*message).to_owned())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic payload".to_owned())
-}
-
-fn collect_worker_responses(
-    recv: &Receiver<WorkerResponse>,
-    response_count: usize,
-    target: &mut Memory,
-    metrics: &mut Report,
-    rollout_budget: usize,
-    overbatching: bool,
-) -> Result<(), String> {
-    for _ in 0..response_count {
-        let response = recv
-            .recv()
-            .map_err(|_| "collector worker disconnected without a response".to_owned())??;
-        merge_worker_memory(target, response.memory, rollout_budget, overbatching);
-        *metrics += response.metrics;
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-enum ThreadCommand<B: Backend> {
-    Run {
-        model: Arc<Actic<B>>,
-        self_play: Option<(Arc<Actic<B>>, usize)>,
-    },
-    Shutdown,
-}
-
-struct ThreadControl {
-    remaining_steps: AtomicUsize,
-}
-
-/// Multi‑threaded collector.  Each thread owns an independent pool of
-/// `num_games_per_thread` games so completions stay frequent regardless of
-/// the total thread count — scaling up just adds more parallel pools.
+/// Rollout supervisor for multiple independent collectors.
 ///
-/// 1 thread  × 256 games  →  acts like GigaLearn
-/// 2 threads × 256 games  →  2× CPU parallelism, same completion rate
+/// Each pool owns its games, its inference batch, and its rayon pool.
+/// The results merge in pool order.
 pub struct ThreadSim<B: Backend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
@@ -97,35 +25,35 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    recv: Receiver<WorkerResponse>,
-    command_senders: Vec<Sender<ThreadCommand<B>>>,
-    control: Arc<ThreadControl>,
-    threads: Vec<thread::JoinHandle<()>>,
-    metrics: Report,
+    collectors: Vec<PoolCollector<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>>,
+    num_pools: usize,
     memory: Memory,
+    metrics: Report,
     rollout_budget: usize,
-    overbatching: bool,
     _marker: PhantomData<fn(SS, OBS, ACT, REW, TERM, TRUNC, SI)>,
 }
 
 impl<B, SS, OBS, ACT, REW, TERM, TRUNC, SI> ThreadSim<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     B: Backend + Send + 'static,
-    SS: StateSetter<SI>,
-    SI: SharedInfoProvider + SharedInfoReport,
-    OBS: Obs<SI>,
-    ACT: Action<SI, Input = usize>,
-    REW: Reward<SI>,
-    TERM: Terminal<SI>,
-    TRUNC: Truncate<SI>,
+    SS: StateSetter<SI> + Send,
+    SI: SharedInfoProvider + SharedInfoReport + Send,
+    OBS: Obs<SI> + Send,
+    ACT: Action<SI, Input = usize> + Send,
+    REW: Reward<SI> + Send,
+    TERM: Terminal<SI> + Send,
+    TRUNC: Truncate<SI> + Send,
 {
+    /// Build `num_pools` collectors. Pool `p` seeds its games with the
+    /// multiplier `p + 1`.
     #[allow(clippy::too_many_arguments)]
     pub fn new<F, FO>(
         create_env_fn: F,
         make_old_obs: Option<FO>,
         rollout_budget: usize,
-        num_threads: usize,
-        num_games_per_thread: usize,
+        num_threads_per_pool: usize,
+        num_pools: usize,
+        num_games_per_pool: usize,
         device: B::Device,
         reward_sampling: RewardSamplingConfig,
         max_episode_length: Option<usize>,
@@ -135,135 +63,46 @@ where
     ) -> Self
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
-        FO: Fn() -> Box<dyn Obs<SI>> + Clone + Send + 'static,
+        FO: Fn() -> Box<dyn Obs<SI> + Send> + Clone + Send + 'static,
         B::Device: Send,
     {
         assert!(
-            num_threads > 0,
-            "Number of collector threads must be greater than zero"
+            num_threads_per_pool > 0,
+            "Each pool needs at least one thread."
         );
-        assert!(
-            num_games_per_thread > 0,
-            "Number of games per collector thread must be greater than zero"
-        );
+        assert!(num_pools > 0, "The trainer needs at least one pool.");
+        assert!(num_games_per_pool > 0, "Each pool needs at least one game.");
 
-        let (sender, recv) = channel();
-        // These are initial capacities, not hard limits. Complete-trajectory
-        // mode may grow for its bounded final-trajectory overrun.
-        let coordinator_memory_capacity = rollout_budget;
-        let worker_memory_capacity = rollout_budget.div_ceil(num_threads);
-
-        let control = Arc::new(ThreadControl {
-            remaining_steps: AtomicUsize::new(0),
-        });
-
-        let (startup_sender, startup_recv) = channel();
-        let mut command_senders = Vec::with_capacity(num_threads);
-        let mut threads = Vec::with_capacity(num_threads);
-
-        for t in 0..num_threads {
-            let sender: Sender<WorkerResponse> = sender.clone();
-            let startup_sender = startup_sender.clone();
-            let (command_sender, command_recv) = channel();
-            command_senders.push(command_sender);
-            let create_env_fn = create_env_fn.clone();
-            let make_old_obs = make_old_obs.clone();
-            let device = device.clone();
-            let control = control.clone();
-            let reward_sampling = reward_sampling.clone();
-
-            let thread = thread::spawn(move || {
-                let batch_sim = catch_unwind(AssertUnwindSafe(|| {
-                    BatchSim::new(
-                        create_env_fn,
-                        make_old_obs,
-                        t + 1,
-                        num_games_per_thread,
-                        device,
-                        reward_sampling,
-                        worker_memory_capacity,
-                        max_episode_length,
-                        retain_overflow_episodes,
-                        complete_trajectories,
-                    )
-                }));
-                let mut batch_sim = match batch_sim {
-                    Ok(batch_sim) => {
-                        let _ = startup_sender.send(Ok(()));
-                        batch_sim
-                    }
-                    Err(payload) => {
-                        let _ = startup_sender.send(Err(panic_message(payload)));
-                        return;
-                    }
-                };
-                while let Ok(command) = command_recv.recv() {
-                    match command {
-                        ThreadCommand::Run { model, self_play } => {
-                            let response = catch_unwind(AssertUnwindSafe(|| {
-                                let (memory, metrics) = batch_sim.run_with_budget(
-                                    model.as_ref(),
-                                    &control.remaining_steps,
-                                    worker_memory_capacity,
-                                    rollout_budget,
-                                    self_play.as_ref().map(|(m, t)| (m.as_ref(), *t)),
-                                    overbatching,
-                                );
-                                DataResponse { memory, metrics }
-                            }))
-                            .map_err(panic_message);
-                            let failed = response.is_err();
-                            if sender.send(response).is_err() || failed {
-                                break;
-                            }
-                        }
-                        ThreadCommand::Shutdown => break,
-                    }
-                }
-            });
-            threads.push(thread);
-        }
-        drop(startup_sender);
-
-        for _ in 0..num_threads {
-            match startup_recv.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(message)) => {
-                    drop(command_senders);
-                    for thread in threads {
-                        let _ = thread.join();
-                    }
-                    panic!("collector worker failed to initialize: {message}");
-                }
-                Err(_) => {
-                    drop(command_senders);
-                    for thread in threads {
-                        let _ = thread.join();
-                    }
-                    panic!("collector worker disconnected during initialization");
-                }
-            }
-        }
+        let collectors = (0..num_pools)
+            .map(|pool_index| {
+                PoolCollector::new(
+                    create_env_fn.clone(),
+                    make_old_obs.clone(),
+                    pool_index,
+                    num_games_per_pool,
+                    num_threads_per_pool,
+                    device.clone(),
+                    reward_sampling.clone(),
+                    max_episode_length,
+                    retain_overflow_episodes,
+                    overbatching,
+                    complete_trajectories,
+                )
+            })
+            .collect();
 
         Self {
-            recv,
-            command_senders,
-            control,
-            threads,
-            memory: Memory::with_capacity(coordinator_memory_capacity),
+            collectors,
+            num_pools,
+            memory: Memory::with_capacity(rollout_budget),
             metrics: Report::default(),
             rollout_budget,
-            overbatching,
             _marker: PhantomData,
         }
     }
 
-    /// Publish the model (and optionally an old self-play model), wake
-    /// all collector threads, and collect the resulting trajectories.
-    ///
-    /// `self_play` optionally supplies an old policy version and which
-    /// team (0 = Blue, 1 = Orange) should use it.  Only current-policy
-    /// player trajectories are recorded in the returned memory.
+    /// Publish the model (and optionally an old self-play model) and
+    /// collect the resulting trajectories.
     pub fn run(
         &mut self,
         model: Actic<B>,
@@ -272,150 +111,101 @@ where
         self.run_internal(model, self_play, self.rollout_budget)
     }
 
-    /// Like [`Self::run`], but with an explicit rollout budget.
-    ///
-    /// Used by transfer learning, whose batch size is independent of the
-    /// PPO `timesteps_per_iteration`.
+    /// Like [`Self::run`], but with an explicit rollout budget. Used by
+    /// transfer learning.
     pub fn run_with_budget(&mut self, model: Actic<B>, budget: usize) -> (&Memory, Report) {
         self.run_internal(model, None, budget)
     }
 
+    /// Split the budget across the collectors, run them, and merge the
+    /// results in pool order. With one collector, it runs inline. The
+    /// `Collect/*` wall-clock keys are per-pool sums, so they are
+    /// averaged for comparability.
     fn run_internal(
         &mut self,
         model: Actic<B>,
         self_play: Option<(Actic<B>, usize)>,
         budget: usize,
     ) -> (&Memory, Report) {
-        self.metrics.clear();
         self.memory.clear();
+        self.metrics.clear();
 
-        self.control
-            .remaining_steps
-            .store(budget, Ordering::Release);
-        let command = ThreadCommand::Run {
-            model: Arc::new(model),
-            self_play: self_play.map(|(model, team)| (Arc::new(model), team)),
-        };
-        for sender in &self.command_senders {
-            sender
-                .send(command.clone())
-                .expect("collector worker disconnected before rollout");
+        let shares = split_budget(budget, self.num_pools);
+        let self_play = self_play.as_ref().map(|(model, team)| (model, *team));
+        let model = &model;
+
+        if self.num_pools == 1 {
+            let (memory, metrics) = self.collectors[0].run(model, self_play, shares[0]);
+            self.memory.merge(memory);
+            self.metrics += metrics;
+        } else {
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = self
+                    .collectors
+                    .iter_mut()
+                    .zip(&shares)
+                    .map(|(collector, &share)| {
+                        scope.spawn(move || collector.run(model, self_play, share))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            for (memory, metrics) in results {
+                self.memory.merge(memory);
+                self.metrics += metrics;
+            }
         }
 
-        collect_worker_responses(
-            &self.recv,
-            self.threads.len(),
-            &mut self.memory,
-            &mut self.metrics,
-            budget,
-            self.overbatching,
-        )
-        .unwrap_or_else(|message| panic!("collector rollout failed: {message}"));
+        let num_pools = self.num_pools as f64;
+        *self.metrics[COLLECT_INFERENCE_TIME_KEY].as_float_mut() /= num_pools;
+        *self.metrics[COLLECT_ENV_STEP_TIME_KEY].as_float_mut() /= num_pools;
 
         (&self.memory, self.metrics.clone())
     }
+}
 
-    pub fn join(self) {
-        for sender in self.command_senders {
-            let _ = sender.send(ThreadCommand::Shutdown);
-        }
-        for thread in self.threads {
-            thread.join().expect("collector worker panicked");
-        }
-    }
+/// Split a rollout budget into one share per pool. The remainder goes to
+/// the last pool.
+fn split_budget(budget: usize, num_pools: usize) -> Vec<usize> {
+    let mut shares = vec![budget / num_pools; num_pools];
+    shares[num_pools - 1] += budget % num_pools;
+    shares
 }
 
 #[cfg(test)]
-mod regression_tests {
+mod tests {
     use super::*;
-    use crate::base::TerminalState;
-
-    fn memory(start: usize, count: usize) -> Memory {
-        let mut memory = Memory::with_capacity(count);
-        let mut terminals = vec![TerminalState::None; count];
-        terminals[count - 1] = TerminalState::Normal;
-        memory.push_player(
-            (start..start + count).map(|i| i as f32).collect::<Vec<_>>(),
-            1,
-            (start..start + count).collect(),
-            vec![0.0; count],
-            vec![1.0; count],
-            terminals,
-            vec![true; count],
-            1,
-            Vec::new(),
-            0,
-            None,
-        );
-        memory
-    }
 
     #[test]
-    fn regression_overbatching_receives_and_merges_every_worker_response() {
-        let (sender, receiver) = channel();
-        for (start, count) in [(0, 60), (60, 60), (120, 30)] {
-            sender
-                .send(Ok(DataResponse {
-                    memory: memory(start, count),
-                    metrics: Report::default(),
-                }))
-                .unwrap();
+    fn split_budget_shares_sum_to_budget() {
+        for (budget, num_pools) in [(100, 3), (1, 5), (0, 2)] {
+            let shares = split_budget(budget, num_pools);
+            assert_eq!(shares.len(), num_pools);
+            assert_eq!(shares.iter().sum::<usize>(), budget);
         }
-
-        let mut target = Memory::with_capacity(100);
-        let mut metrics = Report::default();
-        collect_worker_responses(&receiver, 3, &mut target, &mut metrics, 100, true).unwrap();
-
-        assert_eq!(target.len(), 150);
-        assert_eq!(target.actions().first(), Some(&0));
-        assert_eq!(target.actions().last(), Some(&149));
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
     }
 
     #[test]
-    fn regression_worker_failure_returns_without_waiting_for_other_responses() {
-        let (sender, receiver) = channel();
-        sender
-            .send(Err("simulated worker panic".to_owned()))
-            .unwrap();
-        sender
-            .send(Ok(DataResponse {
-                memory: memory(0, 10),
-                metrics: Report::default(),
-            }))
-            .unwrap();
-
-        let mut target = Memory::with_capacity(10);
-        let mut metrics = Report::default();
-        let error = collect_worker_responses(&receiver, 2, &mut target, &mut metrics, 10, false)
-            .unwrap_err();
-
-        assert_eq!(error, "simulated worker panic");
-        assert!(target.is_empty());
+    fn split_budget_remainder_lands_in_last_pool() {
+        assert_eq!(split_budget(100, 3), vec![33usize, 33, 34]);
     }
 
     #[test]
-    fn regression_exact_batching_discards_worker_overflow() {
-        let mut target = Memory::with_capacity(100);
-        merge_worker_memory(&mut target, memory(0, 60), 100, false);
-        merge_worker_memory(&mut target, memory(60, 60), 100, false);
-        merge_worker_memory(&mut target, memory(120, 30), 100, false);
-
-        assert_eq!(target.len(), 100);
-        assert_eq!(target.actions().first(), Some(&0));
-        assert_eq!(target.actions().last(), Some(&99));
+    fn split_budget_below_pool_count_keeps_remainder_in_last_pool() {
+        assert_eq!(split_budget(1, 5), vec![0usize, 0, 0, 0, 1]);
+        assert_eq!(split_budget(2, 5), vec![0usize, 0, 0, 0, 2]);
     }
 
     #[test]
-    fn regression_complete_trajectories_respect_exact_batching() {
-        let mut target = Memory::with_capacity(100);
-        merge_worker_memory(&mut target, memory(0, 60), 100, false);
-        merge_worker_memory(&mut target, memory(60, 60), 100, false);
-
-        assert_eq!(target.len(), 100);
-        assert_eq!(target.actions().last(), Some(&99));
+    fn split_budget_shares_are_base_or_base_plus_one() {
+        let base = 100 / 3;
+        assert!(
+            split_budget(100, 3)
+                .iter()
+                .all(|&share| share == base || share == base + 1)
+        );
     }
 }

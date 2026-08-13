@@ -34,8 +34,8 @@ impl PpoBotConfig for DefaultConfig {
         PolicyConfig {
             input_size,
             action_size,
-            actor_layer_sizes: vec![256; 2],
-            shared_head_layer_sizes: vec![256; 3],
+            shared_head_layer_sizes: vec![256; 2],
+            actor_layer_sizes: vec![256; 3],
             norm: NormSelection::RmsNorm,
         }
     }

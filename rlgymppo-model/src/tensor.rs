@@ -56,6 +56,55 @@ pub(crate) fn to_state_tensor_2d_indexed<B: Backend>(
     Tensor::from_data(TensorData::new(data, [indices.len(), columns]), device)
 }
 
+pub(crate) fn to_state_tensor_2d_flat<B: Backend>(
+    state: &[f32],
+    rows: usize,
+    columns: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    Tensor::from_data(TensorData::new(state.to_vec(), [rows, columns]), device)
+}
+
+pub(crate) fn to_mask_tensor_2d_flat<B: Backend>(
+    masks: &[bool],
+    rows: usize,
+    columns: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let data: Vec<f32> = masks.iter().map(|&value| f32::from(value)).collect();
+    Tensor::from_data(TensorData::new(data, [rows, columns]), device)
+}
+
+pub(crate) fn to_state_tensor_2d_indexed_flat<B: Backend>(
+    state: &[f32],
+    columns: usize,
+    indices: &[usize],
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let mut data: Vec<f32> = Vec::with_capacity(indices.len() * columns);
+    for &index in indices {
+        data.extend_from_slice(&state[index * columns..(index + 1) * columns]);
+    }
+    Tensor::from_data(TensorData::new(data, [indices.len(), columns]), device)
+}
+
+pub(crate) fn to_mask_tensor_2d_indexed_flat<B: Backend>(
+    masks: &[bool],
+    columns: usize,
+    indices: &[usize],
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let mut data: Vec<f32> = Vec::with_capacity(indices.len() * columns);
+    for &index in indices {
+        data.extend(
+            masks[index * columns..(index + 1) * columns]
+                .iter()
+                .map(|&value| f32::from(value)),
+        );
+    }
+    Tensor::from_data(TensorData::new(data, [indices.len(), columns]), device)
+}
+
 pub(crate) struct SampledActions<B: Backend> {
     pub actions: Tensor<B, 2, Int>,
     pub log_probs: Tensor<B, 2>,

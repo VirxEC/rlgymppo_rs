@@ -52,12 +52,12 @@ macro_rules! combined_rewards {
 /// ];
 /// ```
 pub struct CombinedRewards<SI: SharedInfoReport> {
-    rewards: Vec<(&'static str, Box<dyn Reward<SI>>, f32)>,
+    rewards: Vec<(&'static str, Box<dyn Reward<SI> + Send>, f32)>,
 }
 
 impl<SI: SharedInfoReport> CombinedRewards<SI> {
     /// Prefer the [`combined_rewards!`] macro over calling this directly.
-    pub fn new(rewards: Vec<(&'static str, Box<dyn Reward<SI>>, f32)>) -> Self {
+    pub fn new(rewards: Vec<(&'static str, Box<dyn Reward<SI> + Send>, f32)>) -> Self {
         Self { rewards }
     }
 }

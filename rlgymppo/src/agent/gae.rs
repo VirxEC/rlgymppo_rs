@@ -198,10 +198,13 @@ mod tests {
             GaeEstimator::Truncated,
         );
 
-        // Reverse traversal must assign 20 to row 2 and 10 to row 0.
-        approx_eq(advantages[0], 10.0);
-        approx_eq(advantages[1], 0.9 * 0.5 * 20.0);
-        approx_eq(advantages[2], 20.0);
+        // Reverse traversal must assign the gamma-discounted bootstraps:
+        // delta = r + gamma * next_val - value, so row 2 gets 0.9 * 20 and
+        // row 0 gets 0.9 * 10 (matches GGL's GAE: predReturn = curReward +
+        // gamma * nextValPred * (1 - done)).
+        approx_eq(advantages[0], 0.9 * 10.0);
+        approx_eq(advantages[1], 0.9 * 0.5 * 0.9 * 20.0);
+        approx_eq(advantages[2], 0.9 * 20.0);
         approx_eq(advantages[3], 0.0);
     }
 

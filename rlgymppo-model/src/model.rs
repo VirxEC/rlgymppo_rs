@@ -5,8 +5,9 @@ use burn::tensor::activation::{log_softmax, relu, softmax};
 
 use crate::tensor::{
     SampledActions, argmax_actions, sample_actions_from_logits, sample_actions_from_logits_tensor,
-    sampled_actions_to_vec, to_mask_tensor_2d, to_mask_tensor_2d_indexed, to_state_tensor_2d,
-    to_state_tensor_2d_indexed,
+    sampled_actions_to_vec, to_mask_tensor_2d, to_mask_tensor_2d_flat, to_mask_tensor_2d_indexed,
+    to_mask_tensor_2d_indexed_flat, to_state_tensor_2d, to_state_tensor_2d_flat,
+    to_state_tensor_2d_indexed, to_state_tensor_2d_indexed_flat,
 };
 
 pub struct PPOOutput<B: Backend> {
@@ -341,6 +342,67 @@ impl<B: Backend> Actic<B> {
         device: &B::Device,
     ) -> (Vec<usize>, Vec<f32>) {
         self.submit_react_indexed(state, masks, indices, device)
+            .wait()
+    }
+
+    /// Dispatch stochastic inference for a flat, pre-sized obs batch and
+    /// retain the sampled output on the backend device until
+    /// [`PendingActions::wait`] is called. The collector stores all player
+    /// obs in one contiguous buffer in global player order.
+    pub fn submit_react_flat(
+        &self,
+        state: &[f32],
+        rows: usize,
+        state_width: usize,
+        masks: &[bool],
+        mask_width: usize,
+        device: &B::Device,
+    ) -> PendingActions<B> {
+        let input = to_state_tensor_2d_flat(state, rows, state_width, device);
+        let features = self.apply_shared_head(input);
+        let mask_tensor =
+            (mask_width > 0).then(|| to_mask_tensor_2d_flat(masks, rows, mask_width, device));
+        PendingActions {
+            sampled: sample_actions_from_logits_tensor(
+                self.actor.masked_logits(features, mask_tensor),
+                device,
+            ),
+        }
+    }
+
+    /// Like [`Self::submit_react_flat`], but for selected player rows.
+    pub fn submit_react_indexed_flat(
+        &self,
+        state: &[f32],
+        state_width: usize,
+        masks: &[bool],
+        mask_width: usize,
+        indices: &[usize],
+        device: &B::Device,
+    ) -> PendingActions<B> {
+        let input = to_state_tensor_2d_indexed_flat(state, state_width, indices, device);
+        let features = self.apply_shared_head(input);
+        let mask_tensor = (mask_width > 0)
+            .then(|| to_mask_tensor_2d_indexed_flat(masks, mask_width, indices, device));
+        PendingActions {
+            sampled: sample_actions_from_logits_tensor(
+                self.actor.masked_logits(features, mask_tensor),
+                device,
+            ),
+        }
+    }
+
+    /// Synchronous stochastic inference for a flat, pre-sized obs batch.
+    pub fn react_flat(
+        &self,
+        state: &[f32],
+        rows: usize,
+        state_width: usize,
+        masks: &[bool],
+        mask_width: usize,
+        device: &B::Device,
+    ) -> (Vec<usize>, Vec<f32>) {
+        self.submit_react_flat(state, rows, state_width, masks, mask_width, device)
             .wait()
     }
 

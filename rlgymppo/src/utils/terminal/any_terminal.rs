@@ -21,12 +21,12 @@ use rlgym::{GameState, Terminal};
 /// ```
 #[derive(Default)]
 pub struct AnyTerminal<SI> {
-    terminals: Vec<Box<dyn Terminal<SI>>>,
+    terminals: Vec<Box<dyn Terminal<SI> + Send>>,
 }
 
 impl<SI> AnyTerminal<SI> {
     /// Prefer the [`any_terminal!`] macro over calling this directly.
-    pub fn new(terminals: Vec<Box<dyn Terminal<SI>>>) -> Self {
+    pub fn new(terminals: Vec<Box<dyn Terminal<SI> + Send>>) -> Self {
         Self { terminals }
     }
 }

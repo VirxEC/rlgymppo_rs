@@ -25,8 +25,8 @@ use crate::agent::config::PpoLearnerConfig;
 use crate::agent::gae::{GAEOutput, get_gae};
 use crate::agent::model::{Actic, Net, PPOOutput};
 use crate::base::{
-    Memory, get_action_batch, get_action_masks_batch, get_batch_1d, get_generic_batch,
-    get_log_probs_batch, get_states_batch, get_states_batch_range,
+    Memory, TerminalState, get_action_batch, get_action_masks_batch, get_batch_1d,
+    get_generic_batch, get_log_probs_batch, get_states_batch, get_states_batch_range,
 };
 use crate::utils::Report;
 use crate::utils::running_stat::Stats;
@@ -211,19 +211,30 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         // Run the critic on truncation next-state observations for the
         // bootstrap in configurable batches on a non-autodiff model clone.
         let trunc_val_preds = {
-            if memory.trunc_next_states().is_empty() {
+            // Only truncated rows inside the training window receive a
+            // bootstrap prediction. Complete-trajectories mode can push a
+            // final trajectory past `timesteps_per_iteration`; its truncated
+            // boundary row is excluded from training, so its prediction must
+            // be excluded too. Predictions are stored in forward terminal
+            // order, so the windowed rows are the first `window_truncations`.
+            let window_truncations = terminals
+                .iter()
+                .filter(|&&terminal| terminal == TerminalState::Truncated)
+                .count();
+            if window_truncations == 0 {
                 Vec::new()
             } else {
                 let nodiff_net = net.valid();
                 let mb = self.config.truncation_value_batch_size;
-                let n = memory.truncation_len();
+                let width = memory.state_width();
+                let states = &memory.trunc_next_states()[..window_truncations * width];
 
-                let mut values = Vec::with_capacity(n);
-                for start in (0..n).step_by(mb) {
-                    let end = (start + mb).min(n);
+                let mut values = Vec::with_capacity(window_truncations);
+                for start in (0..window_truncations).step_by(mb) {
+                    let end = (start + mb).min(window_truncations);
                     let batch = get_states_batch_range::<B::InnerBackend>(
-                        memory.trunc_next_states(),
-                        memory.state_width(),
+                        states,
+                        width,
                         start,
                         end,
                         &self.device,

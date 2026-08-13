@@ -69,7 +69,7 @@ where
     /// Optional old (teacher) obs builder, run in lockstep with the env's own
     /// builder so transfer learning can score the same states with a
     /// different observation space.
-    old_obs: Option<Box<dyn Obs<SI>>>,
+    old_obs: Option<Box<dyn Obs<SI> + Send>>,
     last_state: GameState,
     metrics: Report,
     step_counter: usize,
@@ -88,7 +88,7 @@ where
 {
     pub fn new(
         env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
-        old_obs: Option<Box<dyn Obs<SI>>>,
+        old_obs: Option<Box<dyn Obs<SI> + Send>>,
         reward_sampling: RewardSamplingConfig,
     ) -> Self {
         Self {

@@ -15,6 +15,7 @@ members = [
 arrayvec = "0.7.6"
 crossterm = "0.29"
 rand = "0.10.1"
+rayon = "1.12.0"
 rlgym = { git = "https://github.com/VirxEC/rlgym_rs.git", branch = "native-rust" }
 rustc-hash = "2.1.1"
 thiserror = "2.0.18"

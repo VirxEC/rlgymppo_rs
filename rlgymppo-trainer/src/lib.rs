@@ -92,7 +92,7 @@ pub fn create_env(
 ) -> Env<
     WeightedState<SharedInfo>,
     DefaultObs<3>,
-    DefaultAction<6, 8, 1>,
+    DefaultAction<6, 8, 0>,
     rewards::CombinedRewards<SharedInfo>,
     AnyTerminal<SharedInfo>,
     NoTouchCondition<MAX_NO_TOUCH_DURATION>,
@@ -153,7 +153,7 @@ pub fn default_config<B: AutodiffBackend>(
         render: false,
         num_threads: 4,
         num_games_per_thread: 64,
-        timesteps_per_save: 10_000_000,
+        timesteps_per_save: 100_000_000,
         checkpoints_limit: None,
         ppo: PpoLearnerConfig {
             timesteps_per_iteration,
@@ -161,11 +161,10 @@ pub fn default_config<B: AutodiffBackend>(
             mini_batch_size,
             gpu_timestep_buffer_size,
             truncation_value_batch_size,
-            epochs: 2,
+            epochs: 1,
             learning_rate: lr,
             entropy_scale: 0.024,
             gae_estimator: GaeEstimator::TerminationTime,
-            max_episode_length: None,
             ..Default::default()
         },
         self_play: SelfPlayConfig {

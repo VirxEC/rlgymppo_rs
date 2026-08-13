@@ -9,8 +9,8 @@ use super::batch_sim::BatchSim;
 use super::sim::RewardSamplingConfig;
 use crate::agent::model::Actic;
 use crate::base::Memory;
-use crate::utils::Report;
-use crate::utils::shared_info::SharedInfoReport;
+use rlgymppo_utils::Report;
+use rlgymppo_utils::shared_info::SharedInfoReport;
 
 /// One independent rollout collector: a [`BatchSim`], its rayon pool, and
 /// its budget share. Pool jobs never touch the GPU or call `wait()`.

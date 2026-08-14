@@ -125,12 +125,12 @@ mod flex_gated {
     use super::*;
     use crate::agent::model::Actic;
     use crate::environment::thread_sim::ThreadSim;
-    use crate::utils::actions::DefaultAction;
-    use crate::utils::obs::DefaultObs;
-    use crate::utils::rewards::FaceBallReward;
-    use crate::utils::shared_info::SharedInfoRng;
-    use crate::utils::state_setters::RandomState;
-    use crate::utils::terminal::{NoTouchCondition, OnGoalCondition};
+    use rlgymppo_utils::actions::DefaultAction;
+    use rlgymppo_utils::obs::DefaultObs;
+    use rlgymppo_utils::rewards::FaceBallReward;
+    use rlgymppo_utils::shared_info::SharedInfoRng;
+    use rlgymppo_utils::state_setters::RandomState;
+    use rlgymppo_utils::terminal::{NoTouchCondition, OnGoalCondition};
 
     type StateSetter = RandomState<true, false, true>;
     type Action = DefaultAction<1, 8, 0>;

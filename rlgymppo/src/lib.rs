@@ -8,9 +8,10 @@ pub mod utils;
 use std::collections::{HashMap, VecDeque};
 #[cfg(not(feature = "tui"))]
 use std::io::{Read, stdin};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -68,6 +69,18 @@ struct PendingMetricReport {
 enum MetricEvent {
     Report(PendingMetricReport),
     Shutdown,
+}
+
+struct CollectCommand<B: burn::prelude::Backend> {
+    model: Actic<B>,
+    self_play: Option<(Actic<B>, usize)>,
+    recycled_memory: Option<Memory>,
+}
+
+struct CollectResponse {
+    memory: Memory,
+    metrics: Report,
+    elapsed: f64,
 }
 
 #[cfg(feature = "tui")]
@@ -464,6 +477,10 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// When `None`, uses the training device. Set this to another device from
     /// the same backend, for example a CPU device while training on GPU.
     pub skill_tracker_device: Option<B::Device>,
+    /// If set, collect the next rollout on this device while the current
+    /// rollout is being consumed. This improves throughput at the cost of a
+    /// one-update policy lag after the first rollout.
+    pub pipelined_collection_device: Option<B::Device>,
     /// The layer sizes for the policy network.
     pub policy_layer_sizes: Vec<usize>,
     /// The layer sizes for the critic network.
@@ -528,6 +545,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             quantizer: None,
             render_device: B::Device::default(),
             skill_tracker_device: None,
+            pipelined_collection_device: None,
             policy_layer_sizes: vec![256; 3],
             critic_layer_sizes: vec![256; 3],
             norm: NormSelection::RmsNorm,
@@ -786,6 +804,10 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             None
         };
 
+        let collector_device = self
+            .pipelined_collection_device
+            .clone()
+            .unwrap_or_else(|| self.device.clone());
         let thread_sim = ThreadSim::new(
             create_env,
             make_old_obs,
@@ -793,7 +815,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             self.num_threads_per_pool,
             self.num_pools,
             self.num_games_per_pool,
-            self.device.clone(),
+            collector_device,
             reward_sampling,
             self.ppo.max_episode_length,
             self.ppo.retain_overflow_episodes,
@@ -832,9 +854,10 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             checkpoint_callback: self.checkpoint_callback,
             last_save_timestep: 0,
             num_additional_iterations: self.num_additional_iterations,
+            pipelined_collection_device: self.pipelined_collection_device,
             renderer_controls: renderer_controls.clone(),
             renderer,
-            collector: thread_sim,
+            collector: Some(thread_sim),
             self_play_config,
             version_mgr,
             skill_tracker,
@@ -879,6 +902,7 @@ where
     checkpoint_callback: Option<CheckpointCallback>,
     last_save_timestep: u64,
     num_additional_iterations: Option<u64>,
+    pipelined_collection_device: Option<B::Device>,
     renderer_controls: Arc<(Mutex<RendererControls<B::InnerBackend>>, Condvar)>,
     renderer: thread::JoinHandle<()>,
     // ── Self‑Play ──────────────────────────────────────────────────
@@ -888,7 +912,7 @@ where
     skill_tracker: Option<AsyncSkillTracker<B::InnerBackend, OBS, ACT, SI>>,
     skill_metric_rx: Option<Receiver<SkillTrackerUpdate>>,
 
-    collector: ThreadSim<B::InnerBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+    collector: Option<ThreadSim<B::InnerBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>>,
 }
 
 impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>, SS, OBS, ACT, REW, TERM, TRUNC, SI>
@@ -990,6 +1014,30 @@ where
         (keep_running, handled)
     }
 
+    /// ── Self‑play: stochastically decide to use an old version ──
+    fn maybe_self_play(&mut self) -> Option<(Actic<B::InnerBackend>, usize)> {
+        if self.self_play_config.train_against_old_versions
+            && !self.version_mgr.is_empty()
+            && (self.rng.next_u32() as f64 / u32::MAX as f64)
+                < self.self_play_config.train_against_old_chance as f64
+        {
+            let idx = self.version_mgr.random_index(&mut self.rng);
+            let old_team = if self.rng.next_u32().is_multiple_of(2) {
+                0
+            } else {
+                1
+            };
+            #[cfg(not(feature = "tui"))]
+            println!(
+                " > Training against old version {} (team {})",
+                self.version_mgr.versions[idx].timesteps, old_team
+            );
+            Some((self.version_mgr.versions[idx].model.clone(), old_team))
+        } else {
+            None
+        }
+    }
+
     fn notify_input(tui: &TuiNotifier, input: HumanInput) {
         if matches!(input, HumanInput::Save) {
             let _ = tui.notify("Saved model.");
@@ -997,7 +1045,16 @@ where
     }
 
     /// Train the model, and automatically saves it before exiting.
-    pub fn learn(mut self) {
+    pub fn learn(mut self)
+    where
+        SS: 'static,
+        SI: 'static,
+        OBS: 'static,
+        ACT: 'static,
+        REW: 'static,
+        TERM: 'static,
+        TRUNC: 'static,
+    {
         #[cfg(not(feature = "wandb"))]
         assert_eq!(
             self.wandb_project_name, None,
@@ -1104,60 +1161,145 @@ where
         Self::print_controls_prompt();
 
         let inital_cumulative_updates = self.stats.cumulative_model_updates;
+
+        // Initialize collector thread and communication channels if pipelined_collection_device is Some
+        let (pipeline_cmd_tx, pipeline_mem_rx, collector_handle) = if self
+            .pipelined_collection_device
+            .is_some()
+        {
+            let mut collector = self.collector.take().unwrap();
+            let mut quantizer = self.quantizer.take();
+            let renderer_controls = self.renderer_controls.clone();
+            let (cmd_tx, cmd_rx) = sync_channel::<CollectCommand<B::InnerBackend>>(1);
+            let (mem_tx, mem_rx) = sync_channel::<Result<CollectResponse, String>>(1);
+
+            let handle = thread::Builder::new()
+                .name("collector".into())
+                .spawn(move || {
+                    while let Ok(command) = cmd_rx.recv() {
+                        let response = catch_unwind(AssertUnwindSafe(|| {
+                            let collect_start = Instant::now();
+                            let mut model = command.model;
+                            if let Some(quantizer) = &mut quantizer {
+                                model = model.quantize_weights(quantizer);
+                            }
+
+                            {
+                                let (controls, start_rendering) = &*renderer_controls;
+                                let mut guard = controls.lock();
+                                guard.model = Some(model.clone());
+                                drop(guard);
+                                start_rendering.notify_all();
+                            }
+
+                            let (memory, metrics) =
+                                collector.run(model, command.self_play, command.recycled_memory);
+                            CollectResponse {
+                                memory,
+                                metrics,
+                                elapsed: collect_start.elapsed().as_secs_f64(),
+                            }
+                        }))
+                        .map_err(|s| {
+                            s.downcast_ref::<&str>()
+                                .map(|message| (*message).to_owned())
+                                .or_else(|| s.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic payload".to_owned())
+                        });
+                        let failed = response.is_err();
+                        if mem_tx.send(response).is_err() || failed {
+                            break;
+                        }
+                    }
+                })
+                .expect("Failed to spawn collector thread");
+
+            (Some(cmd_tx), Some(mem_rx), Some(handle))
+        } else {
+            (None, None, None)
+        };
+
+        // Have to clone this to not have to mutably borrow self to get the device.
+        let collection_device = self.pipelined_collection_device.clone();
+        let mut recycled_memory = None;
+
+        // Send first collect command to offset pipeline
+        if let Some(cmd_tx) = &pipeline_cmd_tx {
+            print!("Sending initial collection command");
+            let collection_device = collection_device.as_ref().unwrap();
+            let self_play = self
+                .maybe_self_play()
+                .map(|(model, team)| (model.to_device(collection_device), team));
+            cmd_tx
+                .send(CollectCommand {
+                    model: self.model.valid().to_device(collection_device),
+                    self_play,
+                    recycled_memory: None,
+                })
+                .expect("collector thread terminated before the first rollout");
+        }
+
         'train: while self
             .num_additional_iterations
             .is_none_or(|n| self.stats.cumulative_model_updates - inital_cumulative_updates < n)
         {
-            let collect_start = Instant::now();
+            let iter_start = Instant::now();
 
-            let mut nodiff_model = self.model.valid();
-            if let Some(quantizer) = &mut self.quantizer {
-                nodiff_model = nodiff_model.quantize_weights(quantizer);
-            }
+            // If pipelining, get memory from collection thread, otherwise generate the memory
+            let (memory, mut metrics, collect_elapsed) = if let Some(mem_rx) = &pipeline_mem_rx {
+                // Send new collection command before learning to overlap collection/consumption.
+                // Unwrap allowed due to mem_rx being Some iff collection_device = pipelined_collection_device is Some
+                let collection_device = collection_device.as_ref().unwrap();
+                let self_play = self
+                    .maybe_self_play()
+                    .map(|(model, team)| (model.to_device(collection_device), team));
+                pipeline_cmd_tx
+                    .as_ref()
+                    .unwrap()
+                    .send(CollectCommand {
+                        model: self.model.valid().to_device(collection_device),
+                        self_play,
+                        recycled_memory: recycled_memory.take(),
+                    })
+                    .expect("collector thread terminated before the next rollout");
 
-            // update the model the renderer is using
-            {
-                let (controls, start_rendering) = &*self.renderer_controls;
-                let mut guard = controls.lock();
-                guard.model = Some(nodiff_model.clone());
-                drop(guard);
+                // Collect previous response
+                let response = mem_rx
+                    .recv()
+                    .expect("collector thread disconnected before returning a rollout")
+                    .unwrap_or_else(|message| panic!("collector rollout failed: {message}"));
 
-                start_rendering.notify_all();
-            }
-
-            // ── Self‑play: stochastically decide to use an old version ──
-            let self_play = if self.self_play_config.train_against_old_versions
-                && !self.version_mgr.is_empty()
-                && (self.rng.next_u32() as f64 / u32::MAX as f64)
-                    < self.self_play_config.train_against_old_chance as f64
-            {
-                let idx = self.version_mgr.random_index(&mut self.rng);
-                let old_team = if self.rng.next_u32().is_multiple_of(2) {
-                    0
-                } else {
-                    1
-                };
-                #[cfg(not(feature = "tui"))]
-                println!(
-                    " > Training against old version {} (team {})",
-                    self.version_mgr.versions[idx].timesteps, old_team
-                );
-                Some((self.version_mgr.versions[idx].model.clone(), old_team))
+                (response.memory, response.metrics, response.elapsed)
             } else {
-                None
+                let collect_start = Instant::now();
+                let mut nodiff_model = self.model.valid();
+                if let Some(quantizer) = &mut self.quantizer {
+                    nodiff_model = nodiff_model.quantize_weights(quantizer);
+                }
+
+                {
+                    let (controls, start_rendering) = &*self.renderer_controls;
+                    let mut guard = controls.lock();
+                    guard.model = Some(nodiff_model.clone());
+                    drop(guard);
+                    start_rendering.notify_all();
+                }
+
+                let self_play = self.maybe_self_play();
+                let (memory, metrics) = self.collector.as_mut().unwrap().run(
+                    nodiff_model,
+                    self_play,
+                    recycled_memory.take(),
+                );
+                (memory, metrics, collect_start.elapsed().as_secs_f64())
             };
-
-            // collect steps
-            let (memory, mut metrics) = self.collector.run(nodiff_model, self_play);
-            let collect_elapsed = collect_start.elapsed().as_secs_f64();
-
             // train the model
             let is_first_iteration = self.stats.cumulative_model_updates == 0;
             let train_start = Instant::now();
             let num_new_steps;
             (self.model, num_new_steps) = self.ppo.learn(
                 self.model,
-                memory,
+                &memory,
                 &mut self.rng,
                 &mut metrics,
                 &mut self.stats,
@@ -1185,7 +1327,8 @@ where
 
             // Count both normal ends and truncations so this agrees with the
             // collector's trajectory-length accounting.
-            let ep_len = calculate_episode_length(memory);
+            let ep_len = calculate_episode_length(&memory);
+            recycled_memory = Some(memory);
             metrics["Collect/episode length"] = ep_len.into();
             metrics["Collect/timesteps"] = num_new_steps.into();
             metrics["Timing/collection"] = collect_elapsed.into();
@@ -1194,7 +1337,7 @@ where
             metrics["Throughput/consumption"] =
                 (num_new_steps as f64 / consumption_elapsed.max(1e-12)).into();
             metrics["Throughput/overall"] =
-                (num_new_steps as f64 / collect_start.elapsed().as_secs_f64()).into();
+                (num_new_steps as f64 / iter_start.elapsed().as_secs_f64()).into();
             metrics["Cumulative/steps"] = self.stats.cumulative_timesteps.into();
             metrics["Cumulative/epochs"] = self.stats.cumulative_epochs.into();
             metrics["Cumulative/updates"] = self.stats.cumulative_model_updates.into();
@@ -1246,6 +1389,11 @@ where
             }
 
             Self::print_controls_prompt();
+        }
+
+        drop(pipeline_cmd_tx);
+        if let Some(handle) = collector_handle {
+            handle.join().expect("collector thread panicked");
         }
 
         {
@@ -1463,7 +1611,14 @@ where
             }
 
             // collect a batch of environment steps with the student acting
-            let (memory, mut metrics) = self.collector.run_with_budget(nodiff_model, tl.batch_size);
+            if let Some(collection_device) = &self.pipelined_collection_device {
+                nodiff_model = nodiff_model.to_device(collection_device);
+            }
+            let (memory, mut metrics) = self
+                .collector
+                .as_mut()
+                .unwrap()
+                .run_with_budget(nodiff_model, tl.batch_size);
             let collect_elapsed = collect_start.elapsed().as_secs_f64();
 
             // distill the teacher's action distribution into the student

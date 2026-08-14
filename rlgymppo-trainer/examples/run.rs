@@ -63,6 +63,8 @@ fn main() {
         rlgymppo_trainer::run::<Autodiff<LibTorch>>(
             LibTorchDevice::Cuda(0),
             LibTorchDevice::Cpu,
+            None,
+            //LibTorchDevice::Cuda(1), // Maybe good to set a laptops iGPU here and dGPU above
             Some(LibTorchDevice::Cpu),
             true,
         );
@@ -78,6 +80,7 @@ fn main() {
             CudaDevice::new(0),
             CudaDevice::default(),
             None,
+            None,
             false,
         );
     }
@@ -91,6 +94,7 @@ fn main() {
         rlgymppo_trainer::run::<Autodiff<Metal>>(
             WgpuDevice::default(),
             WgpuDevice::default(),
+            None,
             None,
             false,
         );
@@ -106,6 +110,7 @@ fn main() {
             RocmDevice::new(0),
             RocmDevice::default(),
             None,
+            None,
             false,
         );
     }
@@ -119,6 +124,7 @@ fn main() {
         rlgymppo_trainer::run::<Autodiff<Wgpu>>(
             WgpuDevice::default(),
             WgpuDevice::default(),
+            None,
             Some(WgpuDevice::Cpu),
             true,
         );
@@ -129,7 +135,13 @@ fn main() {
         use burn::backend::Flex;
         use rlgymppo::burn::backend::Autodiff;
 
-        rlgymppo_trainer::run::<Autodiff<Flex>>(Default::default(), Default::default(), None, true);
+        rlgymppo_trainer::run::<Autodiff<Flex>>(
+            Default::default(),
+            Default::default(),
+            None,
+            None,
+            true,
+        );
     }
 
     #[cfg(feature = "candle")]
@@ -141,6 +153,7 @@ fn main() {
         rlgymppo_trainer::run::<Autodiff<Candle>>(
             CandleDevice::default(),
             CandleDevice::default(),
+            None,
             Some(CandleDevice::Cpu),
             true,
         );

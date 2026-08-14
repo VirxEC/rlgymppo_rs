@@ -101,14 +101,23 @@ where
         }
     }
 
-    /// Publish the model (and optionally an old self-play model) and
-    /// collect the resulting trajectories.
+    /// Collect trajectories and move them out so they can be shared between threads.
+    /// `recycled_memory` allows reusing old allocations for better performance.
     pub fn run(
         &mut self,
         model: Actic<B>,
         self_play: Option<(Actic<B>, usize)>,
-    ) -> (&Memory, Report) {
-        self.run_internal(model, self_play, self.rollout_budget)
+        recycled_memory: Option<Memory>,
+    ) -> (Memory, Report) {
+        let budget = self.rollout_budget;
+        self.run_internal(model, self_play, budget);
+        (
+            std::mem::replace(
+                &mut self.memory,
+                recycled_memory.unwrap_or_else(|| Memory::with_capacity(budget)),
+            ),
+            std::mem::take(&mut self.metrics),
+        )
     }
 
     /// Like [`Self::run`], but with an explicit rollout budget. Used by

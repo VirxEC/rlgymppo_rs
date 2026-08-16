@@ -41,13 +41,14 @@ use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
 use rlgymppo_model::{
     NormSelection as TeacherNormSelection, Policy as TeacherPolicy, PolicyConfig,
 };
-use utils::Report;
+use rlgymppo_utils::Report;
+use rlgymppo_utils::shared_info::{SharedInfoReport, SharedInfoRng};
+pub use rlgymppo_utils::{any_terminal, combined_rewards, weighted_state};
 use utils::running_stat::Stats;
 use utils::serde::{
     latest_checkpoint_folder, load_latest_model, resolve_model_folder,
     save_checkpoint as save_checkpoint_files,
 };
-use utils::shared_info::{SharedInfoReport, SharedInfoRng};
 
 #[derive(Clone, Copy)]
 enum HumanInput {

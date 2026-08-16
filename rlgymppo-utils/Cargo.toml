@@ -7,3 +7,4 @@ edition = "2024"
 arrayvec = { workspace = true }
 rand = { workspace = true }
 rlgym = { workspace = true }
+rustc-hash = { workspace = true }

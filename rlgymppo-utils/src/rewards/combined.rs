@@ -1,12 +1,12 @@
 use rlgym::{GameState, Reward};
 
-use crate::utils::AvgTracker;
-use crate::utils::shared_info::SharedInfoReport;
+use crate::avg_tracker::AvgTracker;
+use crate::shared_info::SharedInfoReport;
 
 #[macro_export]
 macro_rules! combined_rewards {
     ($($name:expr, $reward:expr => $weight:expr;)+) => {
-        $crate::utils::rewards::CombinedRewards::new(vec![
+        $crate::rewards::CombinedRewards::new(vec![
             $(($name, Box::new($reward), $weight),)+
         ])
     };

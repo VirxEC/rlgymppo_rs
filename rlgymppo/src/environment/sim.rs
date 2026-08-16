@@ -3,9 +3,8 @@ use rlgym::{
     Action, Env, FullObs, GameState, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
     Truncate,
 };
-
-use crate::utils::shared_info::SharedInfoReport;
-use crate::utils::{AvgTracker, Report};
+use rlgymppo_utils::shared_info::SharedInfoReport;
+use rlgymppo_utils::{AvgTracker, Report};
 
 #[derive(Clone)]
 pub struct StepResult {

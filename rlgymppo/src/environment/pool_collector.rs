@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use burn::prelude::Backend;
 use rayon::ThreadPool;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
+use rlgymppo_utils::Report;
+use rlgymppo_utils::shared_info::SharedInfoReport;
 
 use super::batch_sim::BatchSim;
 use super::sim::RewardSamplingConfig;
 use crate::agent::model::Actic;
 use crate::base::Memory;
-use crate::utils::Report;
-use crate::utils::shared_info::SharedInfoReport;
 
 /// One independent rollout collector: a [`BatchSim`], its rayon pool, and
 /// its budget share. Pool jobs never touch the GPU or call `wait()`.
@@ -121,16 +121,16 @@ mod flex_gated {
     use rand::rngs::SmallRng;
     use rlgym::GameState;
     use rlgym::rocketsim::{Arena, ArenaConfig, CarBodyConfig, GameMode, Team};
+    use rlgymppo_utils::actions::DefaultAction;
+    use rlgymppo_utils::obs::DefaultObs;
+    use rlgymppo_utils::rewards::FaceBallReward;
+    use rlgymppo_utils::shared_info::SharedInfoRng;
+    use rlgymppo_utils::state_setters::RandomState;
+    use rlgymppo_utils::terminal::{NoTouchCondition, OnGoalCondition};
 
     use super::*;
     use crate::agent::model::Actic;
     use crate::environment::thread_sim::ThreadSim;
-    use crate::utils::actions::DefaultAction;
-    use crate::utils::obs::DefaultObs;
-    use crate::utils::rewards::FaceBallReward;
-    use crate::utils::shared_info::SharedInfoRng;
-    use crate::utils::state_setters::RandomState;
-    use crate::utils::terminal::{NoTouchCondition, OnGoalCondition};
 
     type StateSetter = RandomState<true, false, true>;
     type Action = DefaultAction<1, 8, 0>;

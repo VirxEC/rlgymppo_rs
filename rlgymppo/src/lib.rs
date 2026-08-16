@@ -20,7 +20,7 @@ pub use agent::model::{Actic, Net, linear_weight_param_ids};
 pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
 pub use agent::skill_tracker::SkillTrackerConfig;
-use agent::skill_tracker::{AsyncSkillTracker, SkillTrackerUpdate};
+use agent::skill_tracker::{AsyncSkillTracker, SkillTrackerUpdate, report_skill_ratings};
 pub use agent::transfer_learn::{TeacherConfig, TransferLearnConfig};
 use base::{Memory, TerminalState};
 pub use burn;
@@ -259,10 +259,7 @@ fn scroll_tui(tui_notifier: Option<&TuiNotifier>, command: TuiScrollCommand) {
 
 fn apply_skill_update_to_report(report: &mut Report, update: &SkillTrackerUpdate) {
     report.remove_keys_with_prefix("Rating/");
-    for (mode, &rating) in &update.cur_ratings.data {
-        let key = format!("Rating/{mode}");
-        report[key.as_str()] = rating.into();
-    }
+    report_skill_ratings(report, &update.cur_ratings, update.nexto_mmr);
     report["Timing/skill tracker"] = update.elapsed_secs.into();
 }
 
@@ -504,9 +501,12 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// training against them (self-play).
     pub self_play: SelfPlayConfig,
 
-    /// Elo-based skill rating system that periodically evaluates the
-    /// current policy against old versions.  Reports `"Rating/1v1"`,
-    /// `"Rating/2v2"`, etc.
+    /// Elo rating system that periodically evaluates the current policy
+    /// against previous policy versions and, optionally, the fixed Nexto
+    /// bot. Reports `"Rating/{mode}"` and `"Rating/Nexto"` when Nexto is
+    /// enabled. Set `enabled` to `false` to disable all skill tracking. Set
+    /// `nexto_mmr` to `None` to disable only Nexto (no Nexto model is loaded);
+    /// tracking against previous versions still runs when versions exist.
     pub skill_tracker: SkillTrackerConfig,
 
     /// Project name for wandb (requires the `wandb` feature).
@@ -762,7 +762,14 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
 
         let (skill_metric_tx, skill_metric_rx) = channel();
 
-        let skill_tracker = if self.skill_tracker.enabled {
+        // Construct the skill tracker when Nexto is enabled or when policy
+        // versions are saved for historical comparisons.
+        let skill_tracking_enabled = self.skill_tracker.enabled
+            && (self.skill_tracker.nexto_mmr.is_some()
+                || self.self_play.save_policy_versions
+                || self.self_play.train_against_old_versions);
+
+        let skill_tracker = if skill_tracking_enabled {
             let create_env_skill = create_env.clone();
             let create_arena = move |game_idx: usize| {
                 let env = (create_env_skill)(Some(game_idx));
@@ -801,7 +808,8 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         );
 
         let mut self_play_config = self.self_play;
-        if self_play_config.train_against_old_versions || self.skill_tracker.enabled {
+        // Self-play and the skill tracker both need historical opponents.
+        if self_play_config.train_against_old_versions || skill_tracking_enabled {
             self_play_config.save_policy_versions = true;
         }
 
@@ -1299,9 +1307,10 @@ where
              Enable the 'wandb' feature in Cargo.toml to use Weights & Biases logging."
         );
 
-        // Transfer learning doesn't use the skill tracker (it evaluates the
-        // policy against old versions, which is meaningless mid-distillation),
-        // so shut it down before collecting any batches.
+        // Transfer learning doesn't use the skill tracker (evaluating the
+        // policy against previous versions or the optional fixed Nexto is
+        // meaningless mid-distillation), so shut it down before collecting
+        // any batches.
         if let Some(st) = self.skill_tracker.take() {
             let ratings = st.join(&mut self.version_mgr.versions);
             self.stats.skill_ratings = Some(ratings.data);
@@ -1608,6 +1617,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_update_reports_nexto_reference_rating() {
+        let mut ratings = agent::skill_tracker::SkillRating::default();
+        ratings.data.insert("1v1".to_string(), 1525.0);
+        let update = SkillTrackerUpdate {
+            eval_id: 3,
+            cur_ratings: ratings,
+            elapsed_secs: 2.5,
+            nexto_mmr: Some(1500.0),
+        };
+        let mut report = Report::default();
+        report["Rating/stale"] = 1.0.into();
+
+        apply_skill_update_to_report(&mut report, &update);
+        let metrics = report.to_flat_map();
+
+        assert_eq!(metrics.get("Rating/1v1"), Some(&1525.0));
+        assert_eq!(metrics.get("Rating/Nexto"), Some(&1500.0));
+        assert!(!metrics.contains_key("Rating/stale"));
+    }
+
+    #[test]
+    fn skill_update_omits_nexto_reference_when_disabled() {
+        let update = SkillTrackerUpdate {
+            eval_id: 3,
+            cur_ratings: Default::default(),
+            elapsed_secs: 2.5,
+            nexto_mmr: None,
+        };
+        let mut report = Report::default();
+        report["Rating/Nexto"] = 1500.0.into();
+
+        apply_skill_update_to_report(&mut report, &update);
+
+        assert!(!report.to_flat_map().contains_key("Rating/Nexto"));
+    }
 
     #[test]
     fn episode_length_counts_truncated_boundaries() {

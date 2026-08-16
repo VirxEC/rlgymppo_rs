@@ -1,4 +1,4 @@
-use rlgym::rocketsim::{BallState, GameMode};
+use rlgym::rocketsim::{BallState, CarControls, GameMode};
 use rlgym::{
     Action, Env, FullObs, GameState, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
     Truncate,
@@ -157,6 +157,22 @@ where
 
     pub fn step(&mut self, actions: &[ACT::Input]) -> StepResult {
         self.env.pre_step(&self.last_state, actions);
+        self.env.step_physics(ACT::get_tick_skip());
+        self.finish_step()
+    }
+
+    /// Apply generic `ACT` actions to every car, then overwrite the selected
+    /// cars with raw RocketSim controls (e.g. a fixed opponent policy)
+    /// before simulating the step.
+    pub fn step_mixed(
+        &mut self,
+        actions: &[ACT::Input],
+        nexto_controls: &[(usize, CarControls)],
+    ) -> StepResult {
+        self.env.pre_step(&self.last_state, actions);
+        for (car_idx, controls) in nexto_controls {
+            self.env.arena.set_car_controls(*car_idx, *controls);
+        }
         self.env.step_physics(ACT::get_tick_skip());
         self.finish_step()
     }

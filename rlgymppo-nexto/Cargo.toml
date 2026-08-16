@@ -1,0 +1,14 @@
+# Nexto (Necto) policy crate.
+
+[package]
+name = "rlgymppo-nexto"
+version = "0.1.0"
+edition = "2024"
+description = "Nexto (Necto) policy: pre-generated Burn model with variable entity counts (1v1/2v2/3v3), observation builder, and 90-action table"
+license = "MIT"
+
+[dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["std"] }
+burn-store = "0.21.0"
+rlgym = { workspace = true }
+thiserror = { workspace = true }

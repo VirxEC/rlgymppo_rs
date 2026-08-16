@@ -2,14 +2,14 @@ use std::marker::PhantomData;
 
 use burn::prelude::Backend;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
+use rlgymppo_utils::Report;
+use rlgymppo_utils::shared_info::SharedInfoReport;
 
 use super::batch_sim::{COLLECT_ENV_STEP_TIME_KEY, COLLECT_INFERENCE_TIME_KEY};
 use super::pool_collector::PoolCollector;
 use super::sim::RewardSamplingConfig;
 use crate::agent::model::Actic;
 use crate::base::Memory;
-use rlgymppo_utils::Report;
-use rlgymppo_utils::shared_info::SharedInfoReport;
 
 /// Rollout supervisor for multiple independent collectors.
 ///

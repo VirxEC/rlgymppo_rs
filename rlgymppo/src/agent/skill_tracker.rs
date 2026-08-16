@@ -9,15 +9,15 @@ use rand::Rng;
 use rlgym::rocketsim::{Arena, CarControls, consts};
 use rlgym::{Action, Env, GameState, Obs, Reward, SharedInfoProvider, Truncate};
 use rlgymppo_nexto::{NextoAction, NextoModel, NextoObs, NextoObsBuilder};
+use rlgymppo_utils::Report;
+use rlgymppo_utils::shared_info::{SharedInfoReport, SharedInfoRng};
+use rlgymppo_utils::state_setters::KickoffState;
+use rlgymppo_utils::terminal::OnGoalCondition;
 use serde::{Deserialize, Serialize};
 
 use super::model::Actic;
 use super::self_play::PolicyVersion;
 use crate::environment::sim::{GameInstance, RewardSamplingConfig};
-use rlgymppo_utils::Report;
-use rlgymppo_utils::shared_info::{SharedInfoReport, SharedInfoRng};
-use rlgymppo_utils::state_setters::KickoffState;
-use rlgymppo_utils::terminal::OnGoalCondition;
 
 /// Per-mode Elo ratings (e.g. `"1v1"`, `"2v2"`, `"3v3"`).
 ///

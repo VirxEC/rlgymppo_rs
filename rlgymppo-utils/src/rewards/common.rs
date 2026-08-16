@@ -540,7 +540,13 @@ impl StrongTouchReward {
         }
     }
 
-    fn get_reward(&self, car_idx: usize, car: &CarState, state: &GameState, prev_ball_vel: Option<Vec3A>) -> f32 {
+    fn get_reward(
+        &self,
+        car_idx: usize,
+        car: &CarState,
+        state: &GameState,
+        prev_ball_vel: Option<Vec3A>,
+    ) -> f32 {
         if car.is_demoed {
             return 0.0;
         }

@@ -6,10 +6,10 @@ use burn::prelude::*;
 use parking_lot::{Condvar, Mutex};
 use rlgym::rocketsim::consts;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
+use rlgymppo_utils::shared_info::SharedInfoReport;
 
 use super::sim::{GameInstance, RewardSamplingConfig};
 use crate::agent::model::Actic;
-use rlgymppo_utils::shared_info::SharedInfoReport;
 
 pub struct RendererControls<B: Backend> {
     pub model: Option<Actic<B>>,

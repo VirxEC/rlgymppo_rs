@@ -6,13 +6,13 @@ use burn::prelude::*;
 use burn::tensor::Transaction;
 use burn::tensor::backend::AutodiffBackend;
 use rlgymppo_model::Policy;
+use rlgymppo_utils::Report;
 
 use super::{flatten_net, l2_diff};
 use crate::NormSelection;
 use crate::agent::Ppo;
 use crate::agent::model::{Actic, Net};
 use crate::base::{Memory, get_action_masks_batch, get_states_batch_range};
-use rlgymppo_utils::Report;
 
 /// What the teacher (old, larger) policy is: its architecture and where its
 /// checkpoints live. Passed to `Learner::transfer_learn` alongside a

@@ -10,5 +10,4 @@ mod report;
 
 pub use avg_tracker::AvgTracker;
 pub use report::Report;
-
 pub use rlgym::{self, rocketsim};

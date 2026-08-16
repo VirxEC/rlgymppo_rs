@@ -3,7 +3,6 @@ use rlgym::{
     Action, Env, FullObs, GameState, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
     Truncate,
 };
-
 use rlgymppo_utils::shared_info::SharedInfoReport;
 use rlgymppo_utils::{AvgTracker, Report};
 

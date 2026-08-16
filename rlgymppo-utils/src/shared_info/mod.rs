@@ -1,5 +1,6 @@
-use crate::report::Report;
 use rand::RngExt;
+
+use crate::report::Report;
 
 /// A trait for shared information that provides access to a report.
 pub trait SharedInfoReport {

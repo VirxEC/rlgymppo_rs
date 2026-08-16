@@ -19,6 +19,7 @@ use burn::tensor::Transaction;
 use burn::tensor::backend::AutodiffBackend;
 use rand::Rng;
 use rand::seq::SliceRandom;
+use rlgymppo_utils::Report;
 
 use crate::OptimizerNetwork;
 use crate::agent::config::PpoLearnerConfig;
@@ -29,7 +30,6 @@ use crate::base::{
     get_generic_batch, get_log_probs_batch, get_states_batch, get_states_batch_range,
 };
 use crate::utils::running_stat::Stats;
-use rlgymppo_utils::Report;
 
 pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<AdamW, Net<B>, B>> {
     config: PpoLearnerConfig,

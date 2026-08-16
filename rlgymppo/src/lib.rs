@@ -259,7 +259,7 @@ fn scroll_tui(tui_notifier: Option<&TuiNotifier>, command: TuiScrollCommand) {
 
 fn apply_skill_update_to_report(report: &mut Report, update: &SkillTrackerUpdate) {
     report.remove_keys_with_prefix("Rating/");
-    report_skill_ratings(report, &update.cur_ratings, update.nexto_mmr);
+    report_skill_ratings(report, &update.cur_ratings);
     report["Timing/skill tracker"] = update.elapsed_secs.into();
 }
 
@@ -503,9 +503,9 @@ pub struct LearnerConfig<B: AutodiffBackend> {
 
     /// Elo rating system that periodically evaluates the current policy
     /// against previous policy versions and, optionally, the fixed Nexto
-    /// bot. Reports `"Rating/{mode}"` and `"Rating/Nexto"` when Nexto is
-    /// enabled. Set `enabled` to `false` to disable all skill tracking. Set
-    /// `nexto_mmr` to `None` to disable only Nexto (no Nexto model is loaded);
+    /// bot. Reports `"Rating/{mode}"` for the current policy. Set `enabled`
+    /// to `false` to disable all skill tracking. Set `nexto_mmr` to `None`
+    /// to disable only Nexto (no Nexto model is loaded);
     /// tracking against previous versions still runs when versions exist.
     pub skill_tracker: SkillTrackerConfig,
 
@@ -1619,14 +1619,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skill_update_reports_nexto_reference_rating() {
+    fn skill_update_reports_ratings() {
         let mut ratings = agent::skill_tracker::SkillRating::default();
         ratings.data.insert("1v1".to_string(), 1525.0);
         let update = SkillTrackerUpdate {
             eval_id: 3,
             cur_ratings: ratings,
             elapsed_secs: 2.5,
-            nexto_mmr: Some(1500.0),
         };
         let mut report = Report::default();
         report["Rating/stale"] = 1.0.into();
@@ -1635,24 +1634,8 @@ mod tests {
         let metrics = report.to_flat_map();
 
         assert_eq!(metrics.get("Rating/1v1"), Some(&1525.0));
-        assert_eq!(metrics.get("Rating/Nexto"), Some(&1500.0));
+        assert!(!metrics.contains_key("Rating/Nexto"));
         assert!(!metrics.contains_key("Rating/stale"));
-    }
-
-    #[test]
-    fn skill_update_omits_nexto_reference_when_disabled() {
-        let update = SkillTrackerUpdate {
-            eval_id: 3,
-            cur_ratings: Default::default(),
-            elapsed_secs: 2.5,
-            nexto_mmr: None,
-        };
-        let mut report = Report::default();
-        report["Rating/Nexto"] = 1500.0.into();
-
-        apply_skill_update_to_report(&mut report, &update);
-
-        assert!(!report.to_flat_map().contains_key("Rating/Nexto"));
     }
 
     #[test]

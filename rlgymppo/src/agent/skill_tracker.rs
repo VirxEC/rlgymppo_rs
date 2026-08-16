@@ -49,17 +49,10 @@ impl SkillRating {
     }
 }
 
-pub(crate) fn report_skill_ratings(
-    report: &mut Report,
-    ratings: &SkillRating,
-    nexto_mmr: Option<f32>,
-) {
+pub(crate) fn report_skill_ratings(report: &mut Report, ratings: &SkillRating) {
     for (mode, &rating) in &ratings.data {
         let key = format!("Rating/{mode}");
         report[key.as_str()] = rating.into();
-    }
-    if let Some(nexto_mmr) = nexto_mmr {
-        report["Rating/Nexto"] = nexto_mmr.into();
     }
 }
 
@@ -71,8 +64,7 @@ pub(crate) fn report_skill_ratings(
 /// version first, when versions exist. When `nexto_mmr` is `Some`, the
 /// evaluation then plays matches against Nexto. Each goal updates the
 /// per-mode Elo rating of the current policy and is reported as
-/// `"Rating/{mode}"`. When Nexto is enabled, its fixed rating is also
-/// reported as `"Rating/Nexto"`.
+/// `"Rating/{mode}"`.
 ///
 /// The value `nexto_mmr.unwrap_or(0.0)` seeds the current and saved-version
 /// ratings. `Some(1500.0)` puts both opponents on one scale. `None` keeps
@@ -236,7 +228,6 @@ pub(crate) struct SkillTrackerUpdate {
     pub eval_id: u64,
     pub cur_ratings: SkillRating,
     pub elapsed_secs: f64,
-    pub nexto_mmr: Option<f32>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -974,7 +965,6 @@ where
                             eval_id,
                             cur_ratings: tracker.cur_ratings.clone(),
                             elapsed_secs,
-                            nexto_mmr: tracker.config.nexto_mmr,
                         };
 
                         let _ = metric_tx.send(update.clone());
@@ -1154,7 +1144,7 @@ where
     }
 
     pub fn report_ratings(&self, report: &mut Report) {
-        report_skill_ratings(report, &self.cur_ratings, self.config.nexto_mmr);
+        report_skill_ratings(report, &self.cur_ratings);
         if let Some(elapsed_secs) = self.last_elapsed_secs {
             report["Timing/skill tracker"] = elapsed_secs.into();
         }

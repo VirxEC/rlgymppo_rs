@@ -6,6 +6,8 @@ mod environment;
 pub mod utils;
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 #[cfg(not(feature = "tui"))]
 use std::io::{Read, stdin};
 use std::path::{Path, PathBuf};
@@ -13,9 +15,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
 
 use agent::Ppo;
 pub use agent::config::{GaeEstimator, PpoLearnerConfig};
@@ -805,7 +804,12 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             let renderer_controls = renderer_controls.clone();
 
             thread::spawn(move || {
-                Renderer::new((create_env)(Some(self.render_game_id)), renderer_controls, self.render_device).run();
+                Renderer::new(
+                    (create_env)(Some(self.render_game_id)),
+                    renderer_controls,
+                    self.render_device,
+                )
+                .run();
             })
         };
 

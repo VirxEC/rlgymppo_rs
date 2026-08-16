@@ -144,17 +144,6 @@ impl PlayerTraj {
             .shrink_to(self.baseline_steps * self.action_mask_width);
     }
 
-    fn clear(&mut self) {
-        self.states.clear();
-        self.old_states.clear();
-        self.actions.clear();
-        self.log_probs.clear();
-        self.rewards.clear();
-        self.terminals.clear();
-        self.action_masks.clear();
-        self.shrink_to_baseline();
-    }
-
     fn truncate(&mut self, len: usize) {
         self.states.truncate(len * self.state_width);
         self.old_states.truncate(len * self.old_state_width);
@@ -535,8 +524,8 @@ where
     device: B::Device,
     max_episode_length: Option<usize>,
     /// When enabled, only complete trajectories are returned. Incomplete
-    /// buffers from the previous policy snapshot are discarded at
-    /// collection start.
+    /// buffers carry over and continue accumulating across collections
+    /// until their episodes complete.
     complete_trajectories: bool,
     /// Retained per-player trajectory capacity, adjusted after each
     /// collection.
@@ -741,9 +730,6 @@ where
         }
 
         if self.complete_trajectories {
-            for trajectory in &mut self.player_trajs {
-                trajectory.clear();
-            }
             self.overflow_trajs.clear();
         } else {
             for trajectory in &mut self.player_trajs {
@@ -1261,36 +1247,6 @@ mod regression_tests {
             compute_trajectory_baseline_steps(Some(2_000.0), Some(0.0), 270, Some(1800)),
             1800
         );
-    }
-
-    #[test]
-    fn regression_clear_trims_capacity_to_baseline() {
-        let baseline = 2;
-        let mut trajectory = PlayerTraj::with_width_and_baseline(2, 0, 3, baseline);
-        for _ in 0..16 {
-            trajectory.states.extend_from_slice(&[0.0, 0.0]);
-            trajectory.actions.push(0);
-            trajectory.log_probs.push(0.0);
-            trajectory.rewards.push(1.0);
-            trajectory.terminals.push(TerminalState::None);
-            trajectory
-                .action_masks
-                .extend_from_slice(&[true, false, true]);
-        }
-
-        let grown_state_capacity = trajectory.states.capacity();
-        let grown_mask_capacity = trajectory.action_masks.capacity();
-        trajectory.clear();
-
-        assert_eq!(trajectory.len(), 0);
-        assert!(trajectory.states.capacity() >= baseline * 2);
-        assert!(trajectory.states.capacity() < grown_state_capacity);
-        assert!(trajectory.action_masks.capacity() >= baseline * 3);
-        assert!(trajectory.action_masks.capacity() < grown_mask_capacity);
-        assert_eq!(trajectory.actions.capacity(), baseline);
-        assert_eq!(trajectory.log_probs.capacity(), baseline);
-        assert_eq!(trajectory.rewards.capacity(), baseline);
-        assert_eq!(trajectory.terminals.capacity(), baseline);
     }
 
     #[test]

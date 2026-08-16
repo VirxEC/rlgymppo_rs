@@ -543,6 +543,9 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// If true, one extra instance will be launched to visualize training.
     /// RocketSim's built-in renderer is used for visualization.
     pub render: bool,
+    /// Players per team in the rendered environment
+    /// Hacky implementation through pa
+    pub render_game_id: usize,
 
     /// Configuration for saving old policy versions and occasionally
     /// training against them (self-play).
@@ -589,6 +592,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             num_games_per_pool: 64,
             num_additional_iterations: None,
             render: false,
+            render_game_id: 0,
             self_play: SelfPlayConfig::default(),
             skill_tracker: SkillTrackerConfig::default(),
             wandb_project_name: None,
@@ -801,7 +805,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             let renderer_controls = renderer_controls.clone();
 
             thread::spawn(move || {
-                Renderer::new((create_env)(None), renderer_controls, self.render_device).run();
+                Renderer::new((create_env)(Some(self.render_game_id)), renderer_controls, self.render_device).run();
             })
         };
 

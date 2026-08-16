@@ -540,9 +540,8 @@ impl StrongTouchReward {
         }
     }
 
-    fn get_reward(&mut self, car_idx: usize, car: &CarState, state: &GameState) -> f32 {
+    fn get_reward(&self, car_idx: usize, car: &CarState, state: &GameState, prev_ball_vel: Option<Vec3A>) -> f32 {
         if car.is_demoed {
-            self.prev_ball_vel = Some(state.ball.vel);
             return 0.0;
         }
 
@@ -551,24 +550,16 @@ impl StrongTouchReward {
             .iter()
             .any(|event| matches!(event, ArenaEvent::CarHitBall(hit) if hit.car_idx == car_idx));
 
-        let reward = if touched {
-            if let Some(prev_vel) = self.prev_ball_vel {
-                let hit_force = (state.ball.vel - prev_vel).length();
-
-                if hit_force < self.min_rewarded_speed {
-                    0.0
-                } else {
-                    (hit_force / self.max_rewarded_speed).min(1.0)
-                }
-            } else {
+        if touched && let Some(prev_vel) = prev_ball_vel {
+            let hit_force = (state.ball.vel - prev_vel).length();
+            if hit_force < self.min_rewarded_speed {
                 0.0
+            } else {
+                (hit_force / self.max_rewarded_speed).min(1.0)
             }
         } else {
             0.0
-        };
-
-        self.prev_ball_vel = Some(state.ball.vel);
-        reward
+        }
     }
 }
 
@@ -578,10 +569,16 @@ impl<SI> Reward<SI> for StrongTouchReward {
     }
 
     fn get_rewards(&mut self, state: &GameState, _shared_info: &mut SI) -> Vec<f32> {
-        state
+        let prev_ball_vel = self.prev_ball_vel;
+
+        let rewards = state
             .cars
             .iter()
-            .map(|(info, car)| self.get_reward(info.idx, car, state))
-            .collect()
+            .map(|(info, car)| self.get_reward(info.idx, car, state, prev_ball_vel))
+            .collect();
+
+        self.prev_ball_vel = Some(state.ball.vel);
+
+        rewards
     }
 }

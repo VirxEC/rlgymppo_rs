@@ -159,7 +159,13 @@ impl<B: Backend> VersionManager<B> {
 
     fn persist_version(&self, version: &PolicyVersion<B>) {
         let path = self.save_folder.join(version.timesteps.to_string());
+
         if path.exists() {
+            // The version directory already exists. Keep the frozen model
+            // files untouched, but always refresh `stats.toml` so updated
+            // Elo ratings survive autosave and restart.
+            let stats_toml = toml::to_string_pretty(&version.ratings).unwrap();
+            fs::write(path.join("stats.toml"), stats_toml).unwrap();
             return;
         }
 

@@ -7,12 +7,13 @@ training, built on [RocketSim v3](https://github.com/ZealanL/RocketSim/tree/v3-r
 
 ### Project structure
 
-The workspace is split into eight crates:
+The workspace is split into nine crates:
 
 | Crate | Purpose |
 |---|---|
 | `rlgymppo` | Core PPO learner, multi-threaded environment runner, and training loop. |
 | `rlgymppo-model` | Backend-generic policy/model definitions and checkpoint-compatible inference loading. |
+| `rlgymppo-nexto` | Nexto model inference, observation builder, action table, and pre-generated model weights. |
 | `rlgymppo-rlbot` | RLBot v5 agent that runs trained policies with Burn Flex and RocketSim state enrichment. |
 | `rlgymppo-utils` | Reusable RLGym observation builders, action parsers, and shared-info traits, without depending on the PPO learner. |
 | `rlgymppo-tui` | Terminal-based dashboard that renders live training metrics (ratatui). |
@@ -37,7 +38,8 @@ complete training example. The core logic lives in
 - Several state setters (kickoff, random positions) weighted by probability
 - Combined rewards (air time, face ball, velocity to ball)
 - Terminal conditions (goal scored, random game end, no-touch timeout)
-- `SelfPlayConfig` & `SkillTrackerConfig` for policy versioning and Elo rating
+- `SelfPlayConfig` for policy versioning
+- `SkillTrackerConfig` for optional Elo ratings against saved previous policy versions and the fixed Nexto baseline
 
 Run with your chosen backend (replace `torch` with `cuda`, `wgpu`, `metal`, etc.):
 
@@ -73,6 +75,8 @@ let config = LearnerConfig {
     },
     skill_tracker: SkillTrackerConfig {
         enabled: true,
+        // Some(mmr) enables Nexto evals. None disables only Nexto.
+        nexto_mmr: Some(1500.0),
         ..Default::default()
     },
     device: LibTorchDevice::Cuda(0),
@@ -86,6 +90,28 @@ let mut learner = config.init(create_env);
 learner.load();    // resume from checkpoint if one exists
 learner.learn();   // train forever (or until num_additional_iterations)
 ```
+
+### Skill tracking
+
+`SkillTrackerConfig::default()` is disabled and sets `nexto_mmr` to
+`Some(1500.0)`. Set `enabled` to `true` to run evaluations. When enabled,
+periodic evaluations run the current policy against a randomly selected saved
+previous policy version and against Nexto when `nexto_mmr` is `Some`.
+
+Old-version matches use two-sided Elo. Both sides update their ratings. Each
+saved policy version keeps its own rating. Nexto is the only fixed bot; its
+MMR stays at `nexto_mmr`. Set `skill_tracker.nexto_mmr` to `Some(value)` to
+change it.
+
+Set `nexto_mmr` to `None` to disable Nexto. The Nexto model is not loaded.
+Old-version comparisons still run when `enabled` is `true`. They require policy
+version saving (`SelfPlayConfig.save_policy_versions`) and can continue when it
+is enabled. Set `enabled` to `false` to disable all evaluations.
+
+The `rlgymppo-nexto` crate contains the Rust observation and action functions
+and a pre-generated Burn model. The generated model source and BurnPack
+weights are committed in `rlgymppo-nexto/nexto/`. Normal builds do not run
+model conversion or code generation and do not need the original model files.
 
 ### Training controls
 
@@ -106,7 +132,9 @@ terminal dashboard. Without `tui`, you type the letter and press enter.
 **Weights & Biases** — Enable the `wandb` feature and set a project name in
 `LearnerConfig`. The embedded Python interpreter calls `wandb.init()` and
 `wandb.log()` directly. You'll also need the `_WANDB_CORE_PATH` environment
-variable — see [wandb integration](#wandb-integration) below.
+variable — see [wandb integration](#wandb-integration) below. Skill ratings use
+`Rating/{mode}` for the current policy. `Rating/Nexto` is a fixed reference
+when Nexto is enabled. All metrics use `Cumulative/steps` as the chart axis.
 
 **Terminal dashboard** — Enable the `tui` feature for a live-updating ratatui
 dashboard that organizes metrics into groups (Collect, GAE, Loss, Update,

@@ -14,6 +14,7 @@ rand = { workspace = true }
 rayon = { workspace = true }
 rlgym = { workspace = true }
 rlgymppo-model = { path = "../rlgymppo-model" }
+rlgymppo-nexto = { path = "../rlgymppo-nexto" }
 rlgymppo-tui = { path = "../rlgymppo-tui", optional = true }
 rlgymppo-utils = { path = "../rlgymppo-utils" }
 rlgymppo-wandb = { path = "../rlgymppo-wandb", optional = true }

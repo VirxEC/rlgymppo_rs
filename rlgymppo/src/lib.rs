@@ -2,7 +2,6 @@
 mod agent;
 mod base;
 mod environment;
-mod metrics_jsonl;
 
 pub mod utils;
 
@@ -14,6 +13,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 
 use agent::Ppo;
 pub use agent::config::{GaeEstimator, PpoLearnerConfig};
@@ -276,6 +278,30 @@ fn calculate_episode_length(memory: &Memory) -> f64 {
     }
 }
 
+/// Appends one JSON object per metric report to a local `.jsonl` file.
+pub struct MetricsJsonlSink {
+    writer: Mutex<BufWriter<std::fs::File>>,
+}
+
+impl MetricsJsonlSink {
+    pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())?;
+        Ok(Self {
+            writer: Mutex::new(BufWriter::new(file)),
+        })
+    }
+
+    pub fn write_line(&self, flat: &HashMap<String, f64>) -> std::io::Result<()> {
+        let mut writer = self.writer.lock();
+        serde_json::to_writer(&mut *writer, flat)?;
+        writer.write_all(b"\n")?;
+        writer.flush()
+    }
+}
+
 fn spawn_metrics_actor(
     metric_rx: Receiver<MetricEvent>,
     skill_rx: Receiver<SkillTrackerUpdate>,
@@ -296,7 +322,7 @@ fn spawn_metrics_actor(
         }
 
         let jsonl_sink = match metrics_jsonl_path {
-            Some(path) => match metrics_jsonl::MetricsJsonlSink::open(&path) {
+            Some(path) => match MetricsJsonlSink::open(&path) {
                 Ok(sink) => Some(sink),
                 Err(e) => {
                     eprintln!("Warning: Failed to open metrics jsonl file {path:?}: {e}");
@@ -539,7 +565,7 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub wandb_run_name: Option<String>,
     /// Optional path to a local `.jsonl` file where per-iteration metrics are appended.
     /// Disabled by default and when `None`.
-    pub metrics_jsonl_path: Option<PathBuf>,
+    pub metrics_jsonl: Option<PathBuf>,
 }
 
 impl<B: AutodiffBackend> Default for LearnerConfig<B> {
@@ -568,7 +594,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             wandb_project_name: None,
             wandb_group_name: None,
             wandb_run_name: None,
-            metrics_jsonl_path: None,
+            metrics_jsonl: None,
         }
     }
 }
@@ -858,7 +884,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             wandb_project_name: self.wandb_project_name,
             wandb_group_name: self.wandb_group_name,
             wandb_run_name: self.wandb_run_name,
-            metrics_jsonl_path: self.metrics_jsonl_path,
+            metrics_jsonl_path: self.metrics_jsonl,
             checkpoints_folder: self.checkpoints_folder,
             checkpoints_limit: self.checkpoints_limit,
             timesteps_per_save: self.timesteps_per_save,

@@ -4,7 +4,7 @@ use rand::RngExt;
 use rlgym::StateSetter;
 use rlgym::rocketsim::{Arena, BallState, CarState, Mat3A, Vec3A};
 
-use crate::utils::shared_info::SharedInfoRng;
+use crate::shared_info::SharedInfoRng;
 
 /// Returns a uniformly distributed random unit vector (rejection-sampled on the unit cube).
 fn rand_norm_vec(rng: &mut impl RngExt) -> Vec3A {

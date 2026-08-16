@@ -7,18 +7,18 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng, rng};
 use rlgymppo::rlgym::{Env, GameState, SharedInfoProvider};
 use rlgymppo::rocketsim::{Arena, ArenaEvent, CarBodyConfig, GameMode, Team, init_from_default};
-use rlgymppo::utils::actions::DefaultAction;
-use rlgymppo::utils::obs::DefaultObs;
-use rlgymppo::utils::shared_info::{SharedInfoReport, SharedInfoRng};
-use rlgymppo::utils::state_setters::{KickoffState, RandomState, WeightedState};
-use rlgymppo::utils::terminal::{
-    AnyTerminal, NoTouchCondition, OnGoalCondition, RandomGameEndedCondition,
-};
-use rlgymppo::utils::{AvgTracker, Report, rewards};
 use rlgymppo::{
     GaeEstimator, LearnerConfig, PpoLearnerConfig, SelfPlayConfig, SkillTrackerConfig,
     any_terminal, combined_rewards, default_adamw_optimizer, weighted_state,
 };
+use rlgymppo_utils::actions::DefaultAction;
+use rlgymppo_utils::obs::DefaultObs;
+use rlgymppo_utils::shared_info::{SharedInfoReport, SharedInfoRng};
+use rlgymppo_utils::state_setters::{KickoffState, RandomState, WeightedState};
+use rlgymppo_utils::terminal::{
+    AnyTerminal, NoTouchCondition, OnGoalCondition, RandomGameEndedCondition,
+};
+use rlgymppo_utils::{AvgTracker, Report, rewards};
 
 pub struct SharedInfo {
     rng: SmallRng,
@@ -169,6 +169,7 @@ pub fn default_config<B: AutodiffBackend>(
             learning_rate: lr,
             entropy_scale: 0.024,
             gae_estimator: GaeEstimator::TerminationTime,
+            max_episode_length: None,
             ..Default::default()
         },
         self_play: SelfPlayConfig {

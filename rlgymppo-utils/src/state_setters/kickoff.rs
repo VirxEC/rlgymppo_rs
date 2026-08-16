@@ -2,7 +2,7 @@ use rand::RngExt;
 use rlgym::StateSetter;
 use rlgym::rocketsim::Arena;
 
-use crate::utils::shared_info::SharedInfoRng;
+use crate::shared_info::SharedInfoRng;
 
 /// Sets the arena to a random kickoff state.
 #[derive(Default)]

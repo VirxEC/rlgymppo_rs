@@ -3,7 +3,7 @@ use std::ops::{AddAssign, Index, IndexMut};
 
 use rustc_hash::FxHashMap;
 
-use crate::utils::AvgTracker;
+use crate::avg_tracker::AvgTracker;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Reportable {

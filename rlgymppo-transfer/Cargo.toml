@@ -12,6 +12,7 @@ required-features = ["backend"]
 burn = { version = "0.21.0", features = ["autodiff"] }
 rlgymppo = { path = "../rlgymppo", default-features = false }
 rlgymppo-trainer = { path = "../rlgymppo-trainer", default-features = false }
+rlgymppo-utils = {path = "../rlgymppo-utils"}
 
 [features]
 default = ["torch"]

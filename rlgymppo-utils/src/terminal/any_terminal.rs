@@ -48,7 +48,7 @@ impl<SI> Terminal<SI> for AnyTerminal<SI> {
 #[macro_export]
 macro_rules! any_terminal {
     ($($terminal:ty),+ $(,)?) => {
-        $crate::utils::terminal::AnyTerminal::new(vec![
+        $crate::terminal::AnyTerminal::new(vec![
             $(Box::<$terminal>::default(),)+
         ])
     };

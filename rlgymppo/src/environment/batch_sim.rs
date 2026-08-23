@@ -8,12 +8,12 @@ use rayon::ThreadPool;
 use rlgym::{
     Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
 };
+use rlgymppo_utils::shared_info::SharedInfoReport;
+use rlgymppo_utils::{AvgTracker, Report};
 
 use super::sim::{GameInstance, RewardSamplingConfig};
 use crate::agent::model::Actic;
 use crate::base::{Memory, TerminalState};
-use crate::utils::shared_info::SharedInfoReport;
-use crate::utils::{AvgTracker, Report};
 
 const EPISODE_LENGTH_EMA_ALPHA: f64 = 0.1;
 const MIN_TRAJECTORY_BASELINE_STEPS: usize = 32;
@@ -1381,15 +1381,15 @@ mod phase3_tests {
     use rand::rngs::SmallRng;
     use rlgym::GameState;
     use rlgym::rocketsim::{Arena, ArenaConfig, CarBodyConfig, GameMode, Team};
+    use rlgymppo_utils::actions::DefaultAction;
+    use rlgymppo_utils::obs::DefaultObs;
+    use rlgymppo_utils::rewards::FaceBallReward;
+    use rlgymppo_utils::shared_info::SharedInfoRng;
+    use rlgymppo_utils::state_setters::RandomState;
+    use rlgymppo_utils::terminal::{NoTouchCondition, OnGoalCondition};
 
     use super::*;
     use crate::environment::sim::StepResult;
-    use crate::utils::actions::DefaultAction;
-    use crate::utils::obs::DefaultObs;
-    use crate::utils::rewards::FaceBallReward;
-    use crate::utils::shared_info::SharedInfoRng;
-    use crate::utils::state_setters::RandomState;
-    use crate::utils::terminal::{NoTouchCondition, OnGoalCondition};
 
     struct TestSharedInfo {
         rng: SmallRng,

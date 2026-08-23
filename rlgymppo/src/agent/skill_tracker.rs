@@ -49,17 +49,10 @@ impl SkillRating {
     }
 }
 
-pub(crate) fn report_skill_ratings(
-    report: &mut Report,
-    ratings: &SkillRating,
-    nexto_mmr: Option<f32>,
-) {
+pub(crate) fn report_skill_ratings(report: &mut Report, ratings: &SkillRating) {
     for (mode, &rating) in &ratings.data {
         let key = format!("Rating/{mode}");
         report[key.as_str()] = rating.into();
-    }
-    if let Some(nexto_mmr) = nexto_mmr {
-        report["Rating/Nexto"] = nexto_mmr.into();
     }
 }
 
@@ -71,13 +64,13 @@ pub(crate) fn report_skill_ratings(
 /// version first, when versions exist. When `nexto_mmr` is `Some`, the
 /// evaluation then plays matches against Nexto. Each goal updates the
 /// per-mode Elo rating of the current policy and is reported as
-/// `"Rating/{mode}"`. When Nexto is enabled, its fixed rating is also
-/// reported as `"Rating/Nexto"`.
+/// `"Rating/{mode}"`.
 ///
-/// The value `nexto_mmr.unwrap_or(0.0)` seeds the current and saved-version
-/// ratings. `Some(1500.0)` puts both opponents on one scale. `None` keeps
-/// the historical 0.0 scale. `None` also means the tracker never loads
-/// Nexto, never builds Nexto observations, and never plays Nexto matches.
+/// New current-policy and saved-version ratings start at `0.0`.
+/// `nexto_mmr` is the fixed rating used only for Nexto matches. `None` keeps
+/// the historical 0.0 scale for evaluations against saved versions. `None`
+/// also means the tracker never loads Nexto, never builds Nexto observations,
+/// and never plays Nexto matches.
 #[derive(Clone, Debug)]
 pub struct SkillTrackerConfig {
     /// Master switch for all skill-tracker evaluations. When false, the
@@ -85,9 +78,10 @@ pub struct SkillTrackerConfig {
     pub enabled: bool,
     /// Nexto rating and Nexto switch. `Some(mmr)` enables Nexto
     /// evaluation matches with the fixed rating `mmr`. The same value seeds
-    /// the current and saved-version ratings when they are first created.
-    /// `None` disables Nexto entirely (no model, no observations, no
-    /// matches) while keeping saved-version evaluation available.
+    /// The current policy starts at `0.0` when a mode has no rating. Nexto
+    /// keeps this fixed rating and does not change. `None` disables Nexto
+    /// entirely (no model, no observations, no matches) while keeping
+    /// saved-version evaluation available.
     pub nexto_mmr: Option<f32>,
     /// Number of parallel evaluation arenas.
     pub num_arenas: usize,
@@ -236,7 +230,6 @@ pub(crate) struct SkillTrackerUpdate {
     pub eval_id: u64,
     pub cur_ratings: SkillRating,
     pub elapsed_secs: f64,
-    pub nexto_mmr: Option<f32>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -602,7 +595,8 @@ where
     ) {
         let num_arenas = self.config.num_arenas;
         let nexto_mmr = self.config.nexto_mmr;
-        let rating_default = nexto_mmr.unwrap_or(0.0);
+        let rating_default = 0.0;
+        let nexto_rating = nexto_mmr.unwrap_or(0.0);
 
         // Phases run in order: the Previous phase (when a saved version is
         // available) and then the Nexto phase (when `nexto_mmr` is set).
@@ -658,7 +652,7 @@ where
                 SkillOpponentId::Nexto => println!(
                     " > Running skill matches vs Nexto (sim_time={:.1}s, new_team={}, \
                      nexto_mmr={:.1})...",
-                    self.config.sim_time_secs, new_team, rating_default,
+                    self.config.sim_time_secs, new_team, nexto_rating,
                 ),
             }
 
@@ -809,7 +803,7 @@ where
                                     self.cur_ratings.get_for_teams(&goal.teams, rating_default);
                                 *cur += nexto_rating_delta(
                                     *cur,
-                                    rating_default,
+                                    nexto_rating,
                                     self.config.rating_inc,
                                     scorer_was_new,
                                 );
@@ -974,7 +968,6 @@ where
                             eval_id,
                             cur_ratings: tracker.cur_ratings.clone(),
                             elapsed_secs,
-                            nexto_mmr: tracker.config.nexto_mmr,
                         };
 
                         let _ = metric_tx.send(update.clone());
@@ -1154,7 +1147,7 @@ where
     }
 
     pub fn report_ratings(&self, report: &mut Report) {
-        report_skill_ratings(report, &self.cur_ratings, self.config.nexto_mmr);
+        report_skill_ratings(report, &self.cur_ratings);
         if let Some(elapsed_secs) = self.last_elapsed_secs {
             report["Timing/skill tracker"] = elapsed_secs.into();
         }
@@ -1211,18 +1204,18 @@ mod tests {
     }
 
     #[test]
-    fn first_rating_for_a_mode_uses_nexto_mmr() {
+    fn first_rating_for_a_mode_starts_current_model_at_zero() {
         let mut ratings = SkillRating::default();
-        assert_eq!(*ratings.get_or_default("1v1", 1500.0), 1500.0);
-        assert_eq!(ratings.data.get("1v1"), Some(&1500.0));
+        assert_eq!(*ratings.get_or_default("1v1", 0.0), 0.0);
+        assert_eq!(ratings.data.get("1v1"), Some(&0.0));
     }
 
     #[test]
-    fn nexto_rating_delta_uses_fixed_opponent_rating() {
-        let win_delta = nexto_rating_delta(1500.0, 1500.0, 5.0, true);
-        let loss_delta = nexto_rating_delta(1500.0, 1500.0, 5.0, false);
-        assert!((win_delta - 2.5).abs() < f32::EPSILON);
-        assert!((loss_delta + 2.5).abs() < f32::EPSILON);
+    fn nexto_rating_stays_at_1500_while_current_starts_at_zero() {
+        let win_delta = nexto_rating_delta(0.0, 1500.0, 5.0, true);
+        let loss_delta = nexto_rating_delta(0.0, 1500.0, 5.0, false);
+        assert!(win_delta > 4.9);
+        assert!(loss_delta > -0.01);
     }
 
     #[test]

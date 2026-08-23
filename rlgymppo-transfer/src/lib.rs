@@ -49,7 +49,7 @@ pub fn create_env(
 ) -> Env<
     WeightedState<rlgymppo_trainer::SharedInfo>,
     DefaultObs<1>,
-    DefaultAction<6, 8, 1>,
+    DefaultAction<6, 8, 0>,
     rewards::CombinedRewards<rlgymppo_trainer::SharedInfo>,
     AnyTerminal<rlgymppo_trainer::SharedInfo>,
     NoTouchCondition<MAX_NO_TOUCH_DURATION>,

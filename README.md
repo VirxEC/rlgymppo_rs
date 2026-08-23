@@ -133,8 +133,8 @@ terminal dashboard. Without `tui`, you type the letter and press enter.
 `LearnerConfig`. The embedded Python interpreter calls `wandb.init()` and
 `wandb.log()` directly. You'll also need the `_WANDB_CORE_PATH` environment
 variable — see [wandb integration](#wandb-integration) below. Skill ratings use
-`Rating/{mode}` for the current policy. `Rating/Nexto` is a fixed reference
-when Nexto is enabled. All metrics use `Cumulative/steps` as the chart axis.
+`Rating/{mode}` for the current policy. All metrics use `Cumulative/steps` as
+the chart axis.
 
 **Terminal dashboard** — Enable the `tui` feature for a live-updating ratatui
 dashboard that organizes metrics into groups (Collect, GAE, Loss, Update,

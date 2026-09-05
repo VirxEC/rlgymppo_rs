@@ -35,8 +35,12 @@ pub struct PpoLearnerConfig {
     pub standardize_advantages: bool,
     pub max_returns_per_stats_increment: usize,
     pub clip_grad: Option<GradientClippingConfig>,
-    /// Learning rate for the optimizer.
+    /// Default learning rate for the optimizers.
     pub learning_rate: f32,
+    /// Optional learning rate override for the actor (policy) optimizer.
+    pub actor_learning_rate: Option<f32>,
+    /// Optional learning rate override for the critic (value) optimizer.
+    pub critic_learning_rate: Option<f32>,
     /// Number of epochs to train for with the same rollout.
     pub epochs: usize,
     /// Number of environment timesteps to collect before each training iteration.
@@ -100,6 +104,8 @@ impl Default for PpoLearnerConfig {
             standardize_advantages: true,
             max_returns_per_stats_increment: 150,
             learning_rate: 3e-4,
+            actor_learning_rate: None,
+            critic_learning_rate: None,
             epochs: 3,
             timesteps_per_iteration: 60_000,
             batch_size: 60_000,

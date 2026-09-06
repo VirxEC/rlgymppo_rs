@@ -566,16 +566,27 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         mut critic_gradients: GradientsAccumulator<Net<B>>,
         mut shared_head_gradients: GradientsAccumulator<Net<B>>,
     ) {
-        let lr = self.config.learning_rate.into();
-        net.actor = self
-            .policy_optimizer
-            .step(lr, net.actor.clone(), actor_gradients.grads());
-        net.critic = self
-            .value_optimizer
-            .step(lr, net.critic.clone(), critic_gradients.grads());
+        let actor_lr = self
+            .config
+            .actor_learning_rate
+            .unwrap_or(self.config.learning_rate);
+        let critic_lr = self
+            .config
+            .critic_learning_rate
+            .unwrap_or(self.config.learning_rate);
+        let shared_head_lr = actor_lr.min(critic_lr);
+
+        net.actor =
+            self.policy_optimizer
+                .step(actor_lr.into(), net.actor.clone(), actor_gradients.grads());
+        net.critic = self.value_optimizer.step(
+            critic_lr.into(),
+            net.critic.clone(),
+            critic_gradients.grads(),
+        );
         if let Some(head) = net.shared_head.take() {
             net.shared_head = Some(self.shared_head_optimizer.step(
-                lr,
+                shared_head_lr.into(),
                 head,
                 shared_head_gradients.grads(),
             ));

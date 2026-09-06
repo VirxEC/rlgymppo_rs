@@ -75,7 +75,7 @@ fn main() {
         SOCCAR_COLLISION_MESHES
             .iter()
             .map(|mesh| mesh.to_vec())
-            .collect(),
+            .collect::<Vec<_>>(),
     )]);
     init_from_mem(collision_meshes, true)
         .expect("initialize embedded RocketSim Soccar collision meshes");

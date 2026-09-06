@@ -260,10 +260,13 @@ impl NextoObsBuilder {
             } else {
                 SMALL_PAD_BOOST
             };
+            // Nexto reads this channel as pad availability: 1.0 when the pad
+            // can be picked up. Config-supplied pads carry no state, so they
+            // are reported as available.
             row[DEMO] = if ctx.pads_from_state {
-                ctx.state.boost_pads[k].1.cooldown
+                f32::from(ctx.state.boost_pads[k].1.is_active())
             } else {
-                0.0
+                1.0
             };
         }
 
@@ -277,7 +280,7 @@ impl NextoObsBuilder {
             set_vec3(row, FW, car.phys.rot_mat.x_axis);
             set_vec3(row, UP, car.phys.rot_mat.z_axis);
             set_vec3(row, ANG_VEL, car.phys.ang_vel);
-            row[BOOST] = car.boost;
+            row[BOOST] = car.boost / consts::car::boost::MAX;
             row[DEMO] = f32::from(car.is_demoed);
             row[ON_GROUND] = f32::from(car.is_on_ground);
             row[HAS_FLIP] = f32::from(car.has_flip_or_jump());
@@ -407,6 +410,16 @@ mod tests {
     }
 
     fn car(idx: usize, team: Team, pos: Vec3A, yaw: f32) -> (CarInfo, CarState) {
+        car_with_boost(idx, team, pos, yaw, 0.0)
+    }
+
+    fn car_with_boost(
+        idx: usize,
+        team: Team,
+        pos: Vec3A,
+        yaw: f32,
+        boost: f32,
+    ) -> (CarInfo, CarState) {
         let info = CarInfo {
             idx,
             team,
@@ -419,6 +432,7 @@ mod tests {
                 vel: Vec3A::ZERO,
                 ang_vel: Vec3A::ZERO,
             },
+            boost,
             ..CarState::DEFAULT
         };
         (info, state)
@@ -655,15 +669,51 @@ mod tests {
     }
 
     #[test]
-    fn pad_cooldown_uses_state_seconds() {
+    fn pad_demo_channel_reports_availability() {
+        // Nexto reads this channel as `1.0` when the pad can be picked up,
+        // matching `state.boost_pads` in the upstream Python builder.
         let cars = vec![car(0, Team::Blue, Vec3A::new(0.0, 0.0, 17.0), 0.0)];
         let mut state = state_with(cars, Vec3A::new(0.0, 0.0, 92.0));
         state.boost_pads[0].1 = BoostPadState { cooldown: 10.0 };
+        state.boost_pads[1].1 = BoostPadState { cooldown: 0.0 };
 
         let builder = NextoObsBuilder::default();
         let obs = builder.build(&state, &[NextoAction::ZERO; 1]);
 
-        let boost = &obs[0].kv[2];
-        assert_approx(boost[DEMO], 10.0);
+        // Boost entities start at index 2 (one player, then the ball).
+        assert_eq!(obs[0].kv[2][DEMO], 0.0);
+        assert_eq!(obs[0].kv[3][DEMO], 1.0);
+    }
+
+    #[test]
+    fn config_supplied_pads_are_reported_as_available() {
+        let cars = vec![car(0, Team::Blue, Vec3A::new(0.0, 0.0, 17.0), 0.0)];
+        let state = state_with(cars, Vec3A::new(0.0, 0.0, 92.0));
+
+        let config = NextoObsConfig {
+            boost_pads: Some(soccar_pads()),
+            ..NextoObsConfig::default()
+        };
+        let obs = NextoObsBuilder::new(config).build(&state, &[NextoAction::ZERO; 1]);
+
+        assert!(obs[0].kv[2..].iter().all(|row| row[DEMO] == 1.0));
+    }
+
+    #[test]
+    fn player_boost_is_a_fraction_of_the_maximum() {
+        // RocketSim stores boost as 0..=100; Nexto was trained on 0..=1.
+        let cars = vec![
+            car_with_boost(0, Team::Blue, Vec3A::new(0.0, 0.0, 17.0), 0.0, 100.0),
+            car_with_boost(1, Team::Blue, Vec3A::new(0.0, 0.0, 17.0), 0.0, 33.0),
+        ];
+        let state = state_with(cars, Vec3A::new(0.0, 0.0, 92.0));
+
+        let builder = NextoObsBuilder::default();
+        let obs = builder.build(&state, &[NextoAction::ZERO; 2]);
+
+        assert_approx(obs[0].kv[0][BOOST], 1.0);
+        assert_approx(obs[0].kv[1][BOOST], 0.33);
+        // The query carries the same value as the self entity.
+        assert_approx(obs[0].q[BOOST], 1.0);
     }
 }

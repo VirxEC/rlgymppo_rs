@@ -6,6 +6,8 @@ mod environment;
 pub mod utils;
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 #[cfg(not(feature = "tui"))]
 use std::io::{Read, stdin};
 use std::path::{Path, PathBuf};
@@ -275,6 +277,30 @@ fn calculate_episode_length(memory: &Memory) -> f64 {
     }
 }
 
+/// Appends one JSON object per metric report to a local `.jsonl` file.
+pub struct MetricsJsonlSink {
+    writer: Mutex<BufWriter<std::fs::File>>,
+}
+
+impl MetricsJsonlSink {
+    pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())?;
+        Ok(Self {
+            writer: Mutex::new(BufWriter::new(file)),
+        })
+    }
+
+    pub fn write_line(&self, flat: &HashMap<String, f64>) -> std::io::Result<()> {
+        let mut writer = self.writer.lock();
+        serde_json::to_writer(&mut *writer, flat)?;
+        writer.write_all(b"\n")?;
+        writer.flush()
+    }
+}
+
 fn spawn_metrics_actor(
     metric_rx: Receiver<MetricEvent>,
     skill_rx: Receiver<SkillTrackerUpdate>,
@@ -284,6 +310,7 @@ fn spawn_metrics_actor(
     >,
     #[cfg(feature = "wandb")] wandb_handle: Option<thread::JoinHandle<()>>,
     #[cfg(all(feature = "tui", feature = "wandb"))] wandb_run_id: Option<String>,
+    metrics_jsonl_path: Option<PathBuf>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         #[cfg(all(feature = "tui", feature = "wandb"))]
@@ -292,6 +319,17 @@ fn spawn_metrics_actor(
         {
             let _ = tui.notify(format!("Wandb run started: {id}"));
         }
+
+        let jsonl_sink = match metrics_jsonl_path {
+            Some(path) => match MetricsJsonlSink::open(&path) {
+                Ok(sink) => Some(sink),
+                Err(e) => {
+                    eprintln!("Warning: Failed to open metrics jsonl file {path:?}: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
 
         let mut pending_reports: VecDeque<PendingMetricReport> = VecDeque::new();
         let mut completed_skill_updates: HashMap<u64, SkillTrackerUpdate> = HashMap::new();
@@ -336,6 +374,13 @@ fn spawn_metrics_actor(
                     let flat = metrics.report.to_flat_map();
                     if let Err(e) = tui.update_with_fresh_rating(flat, fresh_rating) {
                         eprintln!("Warning: TUI display update failed: {e}");
+                    }
+                }
+
+                if let Some(ref sink) = jsonl_sink {
+                    let flat = metrics.report.to_flat_map();
+                    if let Err(e) = sink.write_line(&flat) {
+                        eprintln!("Warning: JSONL metrics write failed: {e}");
                     }
                 }
 
@@ -517,6 +562,9 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub wandb_group_name: Option<String>,
     /// Run name for wandb (default: `"rlgymppo-run"`).
     pub wandb_run_name: Option<String>,
+    /// Optional path to a local `.jsonl` file where per-iteration metrics are appended.
+    /// Disabled by default and when `None`.
+    pub metrics_jsonl: Option<PathBuf>,
 }
 
 impl<B: AutodiffBackend> Default for LearnerConfig<B> {
@@ -545,6 +593,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             wandb_project_name: None,
             wandb_group_name: None,
             wandb_run_name: None,
+            metrics_jsonl: None,
         }
     }
 }
@@ -834,6 +883,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             wandb_project_name: self.wandb_project_name,
             wandb_group_name: self.wandb_group_name,
             wandb_run_name: self.wandb_run_name,
+            metrics_jsonl_path: self.metrics_jsonl,
             checkpoints_folder: self.checkpoints_folder,
             checkpoints_limit: self.checkpoints_limit,
             timesteps_per_save: self.timesteps_per_save,
@@ -881,6 +931,7 @@ where
     wandb_group_name: Option<String>,
     #[cfg_attr(not(feature = "wandb"), allow(dead_code))]
     wandb_run_name: Option<String>,
+    metrics_jsonl_path: Option<PathBuf>,
     checkpoints_folder: PathBuf,
     checkpoints_limit: Option<usize>,
     timesteps_per_save: u64,
@@ -1095,6 +1146,7 @@ where
             wandb_handle,
             #[cfg(all(feature = "tui", feature = "wandb"))]
             wandb_run_id,
+            self.metrics_jsonl_path.clone(),
         );
 
         let (s, r) = channel();
@@ -1433,6 +1485,7 @@ where
             wandb_handle,
             #[cfg(all(feature = "tui", feature = "wandb"))]
             wandb_run_id,
+            self.metrics_jsonl_path.clone(),
         );
 
         let (s, r) = channel();

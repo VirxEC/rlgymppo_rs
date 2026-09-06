@@ -6,6 +6,7 @@ use rlgym::{FullObs, GameState, Obs};
 
 use crate::shared_info::SharedInfoRng;
 
+#[derive(Default)]
 pub struct AdvancedObs<const MAX_PLAYERS_PER_TEAM: usize>;
 
 impl<const MAX_TEAM_PLAYERS: usize> AdvancedObs<MAX_TEAM_PLAYERS> {

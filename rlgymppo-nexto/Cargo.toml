@@ -12,3 +12,6 @@ burn = { version = "0.21.0", default-features = false, features = ["std"] }
 burn-store = "0.21.0"
 rlgym = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["flex", "std"] }

@@ -109,16 +109,16 @@ impl<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8, const ACTION_DELAY: u8>
                 ground_mask[i] = true;
             }
 
-            if i > num_ground_actions && !action.jump {
+            if i >= num_ground_actions && !action.jump {
                 air_mask[i] = true;
             }
 
             // Ground actions that are also valid in the air
-            if i < num_ground_actions {
-                let boost_f = if action.boost { 1.0 } else { 0.0 };
-                if action.throttle == boost_f && (action.yaw != 0.0) == action.handbrake {
-                    air_mask[i] = true;
-                }
+            if i < num_ground_actions
+                && action.throttle == f32::from(action.boost)
+                && (action.yaw != 0.0) == action.handbrake
+            {
+                air_mask[i] = true;
             }
         }
 

@@ -41,6 +41,7 @@ where
 {
     game: GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
     last_obs: Vec<Vec<f32>>,
+    last_masks: Vec<Vec<bool>>,
     controller: Arc<(Mutex<RendererControls<B>>, Condvar)>,
     device: B::Device,
 }
@@ -70,11 +71,12 @@ where
                 ..Default::default()
             },
         );
-        let (last_obs, _old_obs, _last_masks) = game.reset();
+        let (last_obs, _old_obs, last_masks) = game.reset();
 
         Self {
             controller,
             last_obs,
+            last_masks,
             game,
             device,
         }
@@ -137,9 +139,11 @@ where
 
             let actions = (!paused).then(|| {
                 if deterministic {
-                    model.react_deterministic(&self.last_obs, &[], &self.device)
+                    model.react_deterministic(&self.last_obs, &self.last_masks, &self.device)
                 } else {
-                    model.react(&self.last_obs, &[], &self.device).0
+                    model
+                        .react(&self.last_obs, &self.last_masks, &self.device)
+                        .0
                 }
             });
 
@@ -166,11 +170,14 @@ where
             };
             let result = self.game.step(&actions);
 
-            self.last_obs = if result.is_terminal || result.truncated {
-                self.game.reset().0
+            if result.is_terminal || result.truncated {
+                let (obs, _old_obs, masks) = self.game.reset();
+                self.last_obs = obs;
+                self.last_masks = masks;
             } else {
-                result.obs
-            };
+                self.last_obs = result.obs;
+                self.last_masks = result.action_masks;
+            }
         }
     }
 }

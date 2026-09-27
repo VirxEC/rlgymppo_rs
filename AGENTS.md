@@ -139,9 +139,6 @@ cargo run -p rlgymppo-transfer --example transfer_learn --features torch
 ### Gotchas
 
 - `Cargo.lock` is **gitignored** (not tracked) — do not try to commit it.
-- `rlgym` comes from a git branch (`native-rust`), and RocketSim is patched via
-  `[patch."https://github.com/ZealanL/RocketSim.git"]` to the
-  `fix-jump` branch — keep the patch table intact.
 - `SkillTrackerConfig::default()` has `enabled: false` and
   `nexto_mmr: Some(1500.0)`. Set `enabled` to `true` to run evaluations.
   Enabled evaluations use randomly selected saved previous policy versions and

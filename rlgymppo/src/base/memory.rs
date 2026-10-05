@@ -31,47 +31,6 @@ pub fn get_states_batch_range<B: Backend>(
     )
 }
 
-/// Upload rows `[start, end)` of a `[N, 1]` column with one `memcpy`.
-pub fn get_log_probs_batch_range<B: Backend>(
-    data: &[f32],
-    start: usize,
-    end: usize,
-    device: &B::Device,
-) -> Tensor<B, 2> {
-    Tensor::from_data(
-        TensorData::new(data[start..end].to_vec(), [end - start, 1]),
-        device,
-    )
-}
-
-/// Upload action rows `[start, end)` with one pass and no per-row indexing.
-pub fn get_action_batch_range<B: Backend>(
-    data: &[usize],
-    start: usize,
-    end: usize,
-    device: &B::Device,
-) -> Tensor<B, 2, Int> {
-    let states = data[start..end]
-        .iter()
-        .map(|&action| action as u32)
-        .collect::<Vec<_>>();
-
-    Tensor::from_data(TensorData::new(states, [end - start, 1]), device)
-}
-
-/// Upload rows `[start, end)` of a `[N, 1]` column with one `memcpy`.
-pub fn get_generic_batch_range<B: Backend>(
-    data: &[f32],
-    start: usize,
-    end: usize,
-    device: &B::Device,
-) -> Tensor<B, 2> {
-    Tensor::from_data(
-        TensorData::new(data[start..end].to_vec(), [end - start, 1]),
-        device,
-    )
-}
-
 /// Convert mask rows `[start, end)` to `f32` with one pass and no per-row
 /// indexing.
 pub fn get_action_masks_batch_range<B: Backend>(

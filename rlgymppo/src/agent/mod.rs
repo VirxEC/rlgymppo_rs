@@ -25,10 +25,7 @@ use crate::OptimizerNetwork;
 use crate::agent::config::PpoLearnerConfig;
 use crate::agent::gae::{GAEOutput, get_gae};
 use crate::agent::model::{Actic, Net, PPOOutput};
-use crate::base::{
-    Memory, TerminalState, get_action_batch_range, get_action_masks_batch_range, get_batch_1d,
-    get_generic_batch_range, get_log_probs_batch_range, get_states_batch_range,
-};
+use crate::base::{Memory, TerminalState, get_batch_1d, get_states_batch_range};
 use crate::utils::running_stat::Stats;
 
 pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<AdamW, Net<B>, B>> {
@@ -319,31 +316,48 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let mut batch_staging_time = Duration::ZERO;
         let mut batch_training_time = Duration::ZERO;
 
-        // Upload the rollout once, in order, with contiguous copies
-        let staging_start = Instant::now();
-        let rollout = GpuBatch::from_memory_range(
-            memory,
-            &advantages,
-            &target_vals,
-            0,
-            rollout_size,
-            &self.device,
+        // Shuffle the full rollout up front so the RNG stream matches the
+        // serial implementation exactly.
+        let mut epoch_batches: Vec<Vec<usize>> = Vec::with_capacity(
+            rollout_size.div_ceil(self.config.batch_size) * self.config.epochs.max(1),
         );
-        batch_staging_time += staging_start.elapsed();
-
-        let mut rollout_order: Vec<usize> = (0..rollout_size).collect();
         for _ in 0..self.config.epochs {
+            let mut rollout_order: Vec<usize> = (0..rollout_size).collect();
             rollout_order.shuffle(rng);
-
             for batch_indices in rollout_order.chunks(self.config.batch_size) {
+                epoch_batches.push(batch_indices.to_vec());
+            }
+        }
+
+        // Double-buffered pipeline: a staging thread fills CPU batch buffers
+        // while the learner thread uploads and trains. Only one batch lives
+        // on the GPU at a time, so VRAM stays bounded by the batch size
+        // instead of the rollout size.
+        let num_batches = epoch_batches.len();
+        std::thread::scope(|scope| {
+            let (staged_tx, staged_rx) = std::sync::mpsc::channel::<StagedBatch>();
+
+            scope.spawn(move || {
+                for batch_indices in &epoch_batches {
+                    let staged =
+                        StagedBatch::stage(memory, &advantages, &target_vals, batch_indices);
+                    if staged_tx.send(staged).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            for _ in 0..num_batches {
+                let staged = staged_rx.recv().expect("staging thread is live");
+                batch_staging_time += Duration::from_secs_f64(staged.staged_secs);
+                // Upload and training both run on the learner thread, so both
+                // count as training time. Staging work overlaps with them.
                 let training_start = Instant::now();
-                // One index build plus upload per batch, shared by all six
-                // tensors; mini-batches below are contiguous slices.
-                let batch = rollout.select_batch(batch_indices, &self.device);
+                let batch = GpuBatch::from_staged(staged, &self.device);
                 self.train_gpu_batch(&mut net, &batch, &mut metric_totals);
                 batch_training_time += training_start.elapsed();
             }
-        }
+        });
 
         metrics["PPO/training time"] = training_start.elapsed().as_secs_f64().into();
         metrics["PPO/batch staging time"] = batch_staging_time.as_secs_f64().into();
@@ -576,56 +590,102 @@ struct GpuBatch<B: Backend> {
     action_masks: Option<Tensor<B, 2>>,
 }
 
-impl<B: Backend> GpuBatch<B> {
-    /// Upload rows `[start, end)` in order with contiguous copies.
-    /// Shuffling happens on the GPU afterwards via [`GpuBatch::select_batch`].
-    fn from_memory_range(
-        memory: &Memory,
-        advantages: &[f32],
-        target_vals: &[f32],
-        start: usize,
-        end: usize,
-        device: &B::Device,
-    ) -> Self {
+/// One batch of rollout rows gathered on the CPU staging thread, ready to
+/// upload. Every buffer is allocated once at exact size: the `Vec`s move
+/// straight into `TensorData` on upload, so there are no growth reallocs.
+struct StagedBatch {
+    rows: usize,
+    state_width: usize,
+    mask_width: usize,
+    /// CPU fill time, attributed to batch staging time by the learner thread.
+    staged_secs: f64,
+    states: Vec<f32>,
+    actions: Vec<u32>,
+    log_probs: Vec<f32>,
+    advantages: Vec<f32>,
+    target_vals: Vec<f32>,
+    /// `f32` masks (1.0 = valid). Converted from the stored `u8` here so the
+    /// learner thread never converts. Empty when the env provides no masks.
+    masks: Vec<f32>,
+}
+
+impl StagedBatch {
+    fn stage(memory: &Memory, advantages: &[f32], target_vals: &[f32], indices: &[usize]) -> Self {
+        let fill_start = Instant::now();
+        let rows = indices.len();
+        let state_width = memory.state_width();
+        let mask_width = memory.action_mask_width();
+        let states = memory.states();
+        let actions = memory.actions();
+        let log_probs = memory.log_probs();
+        let stored_masks = memory.action_masks();
+
+        let mut batch_states = Vec::with_capacity(rows * state_width);
+        for &index in indices {
+            let start = index * state_width;
+            batch_states.extend_from_slice(&states[start..start + state_width]);
+        }
+
+        let mut batch_actions = Vec::with_capacity(rows);
+        batch_actions.extend(indices.iter().map(|&index| actions[index] as u32));
+
+        let mut batch_log_probs = Vec::with_capacity(rows);
+        batch_log_probs.extend(indices.iter().map(|&index| log_probs[index]));
+
+        let mut batch_advantages = Vec::with_capacity(rows);
+        batch_advantages.extend(indices.iter().map(|&index| advantages[index]));
+
+        let mut batch_target_vals = Vec::with_capacity(rows);
+        batch_target_vals.extend(indices.iter().map(|&index| target_vals[index]));
+
+        let mut batch_masks = Vec::new();
+        if !stored_masks.is_empty() {
+            batch_masks.reserve(rows * mask_width);
+            for &index in indices {
+                let start = index * mask_width;
+                batch_masks.extend(
+                    stored_masks[start..start + mask_width]
+                        .iter()
+                        .map(|&valid| valid as f32),
+                );
+            }
+        }
+
         Self {
-            states: get_states_batch_range(
-                memory.states(),
-                memory.state_width(),
-                start,
-                end,
+            rows,
+            state_width,
+            mask_width,
+            staged_secs: fill_start.elapsed().as_secs_f64(),
+            states: batch_states,
+            actions: batch_actions,
+            log_probs: batch_log_probs,
+            advantages: batch_advantages,
+            target_vals: batch_target_vals,
+            masks: batch_masks,
+        }
+    }
+}
+
+impl<B: Backend> GpuBatch<B> {
+    /// Upload one staged batch. The staging `Vec`s move into `TensorData`
+    /// with no further copy on the host.
+    fn from_staged(staged: StagedBatch, device: &B::Device) -> Self {
+        let rows = staged.rows;
+        Self {
+            states: Tensor::from_data(
+                TensorData::new(staged.states, [rows, staged.state_width]),
                 device,
             ),
-            actions: get_action_batch_range(memory.actions(), start, end, device),
-            old_log_probs: get_log_probs_batch_range(memory.log_probs(), start, end, device),
-            advantages: get_generic_batch_range(advantages, start, end, device),
-            target_vals: get_generic_batch_range(target_vals, start, end, device),
-            action_masks: (!memory.action_masks().is_empty()).then(|| {
-                get_action_masks_batch_range(
-                    memory.action_masks(),
-                    memory.action_mask_width(),
-                    start,
-                    end,
+            actions: Tensor::from_data(TensorData::new(staged.actions, [rows, 1]), device),
+            old_log_probs: Tensor::from_data(TensorData::new(staged.log_probs, [rows, 1]), device),
+            advantages: Tensor::from_data(TensorData::new(staged.advantages, [rows, 1]), device),
+            target_vals: Tensor::from_data(TensorData::new(staged.target_vals, [rows, 1]), device),
+            action_masks: (!staged.masks.is_empty()).then(|| {
+                Tensor::from_data(
+                    TensorData::new(staged.masks, [rows, staged.mask_width]),
                     device,
                 )
             }),
-        }
-    }
-
-    /// Gather one shuffled batch on the GPU. Builds and uploads a single
-    /// index tensor shared by all six fields.
-    fn select_batch(&self, indices: &[usize], device: &B::Device) -> Self {
-        let indices = indices_tensor::<B>(indices, device);
-
-        Self {
-            states: self.states.clone().select(0, indices.clone()),
-            actions: self.actions.clone().select(0, indices.clone()),
-            old_log_probs: self.old_log_probs.clone().select(0, indices.clone()),
-            advantages: self.advantages.clone().select(0, indices.clone()),
-            target_vals: self.target_vals.clone().select(0, indices.clone()),
-            action_masks: self
-                .action_masks
-                .as_ref()
-                .map(|masks| masks.clone().select(0, indices.clone())),
         }
     }
 
@@ -647,22 +707,6 @@ impl<B: Backend> GpuBatch<B> {
     fn len(&self) -> usize {
         self.states.shape().dims::<2>()[0]
     }
-}
-
-/// Build one `Int` index tensor with a single `usize` to `i64` pass.
-/// Callers share the returned tensor across all gathered fields instead of
-/// rebuilding it per field or per mini-batch.
-fn indices_tensor<B: Backend>(indices: &[usize], device: &B::Device) -> Tensor<B, 1, Int> {
-    Tensor::<B, 1, Int>::from_data(
-        TensorData::new(
-            indices
-                .iter()
-                .map(|&index| index as i64)
-                .collect::<Vec<_>>(),
-            [indices.len()],
-        ),
-        device,
-    )
 }
 
 struct MetricTotals<B: Backend> {

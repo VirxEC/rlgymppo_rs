@@ -19,6 +19,7 @@ use burn::tensor::Transaction;
 use burn::tensor::backend::AutodiffBackend;
 use rand::Rng;
 use rand::seq::SliceRandom;
+use rayon::prelude::*;
 use rlgymppo_utils::Report;
 
 use crate::OptimizerNetwork;
@@ -171,11 +172,15 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let memory_indices = (0..rollout_size).collect::<Vec<_>>();
 
         // Snapshot parameters before training for update-magnitude computation.
+        // This downloads all weights to the CPU, so it is timed separately.
+        let snapshot_start = Instant::now();
         let actor_params_before = flatten_net(&net.actor);
         let critic_params_before = flatten_net(&net.critic);
+        metrics["PPO/param snapshot time"] = snapshot_start.elapsed().as_secs_f64().into();
 
         // Compute old critic values for GAE in mini-batches using a
         // non-autodiff model clone so no gradient graph accumulates.
+        let value_inference_start = Instant::now();
         let old_values = {
             let nodiff_net = net.valid();
             let mb = self.config.gpu_timestep_buffer_size;
@@ -253,6 +258,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         memory
             .validate()
             .unwrap_or_else(|error| panic!("Invalid learner memory: {error}"));
+        metrics["PPO/value inference time"] = value_inference_start.elapsed().as_secs_f64().into();
 
         let gae_start = Instant::now();
         let GAEOutput {
@@ -347,16 +353,28 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 }
             });
 
+            let mut upload_time = Duration::ZERO;
+            let mut primed = false;
             for _ in 0..num_batches {
+                let recv_start = Instant::now();
                 let staged = staged_rx.recv().expect("staging thread is live");
+                if !primed {
+                    // Time to the first staged batch: pipeline fill latency.
+                    metrics["PPO/pipeline prime time"] = recv_start.elapsed().as_secs_f64().into();
+                    primed = true;
+                }
                 batch_staging_time += Duration::from_secs_f64(staged.staged_secs);
                 // Upload and training both run on the learner thread, so both
                 // count as training time. Staging work overlaps with them.
+                // Upload is timed separately for attribution.
                 let training_start = Instant::now();
+                let upload_start = Instant::now();
                 let batch = GpuBatch::from_staged(staged, &self.device);
+                upload_time += upload_start.elapsed();
                 self.train_gpu_batch(&mut net, &batch, &mut metric_totals);
                 batch_training_time += training_start.elapsed();
             }
+            metrics["PPO/upload time"] = upload_time.as_secs_f64().into();
         });
 
         metrics["PPO/training time"] = training_start.elapsed().as_secs_f64().into();
@@ -610,6 +628,9 @@ struct StagedBatch {
 }
 
 impl StagedBatch {
+    /// Gather one shuffled batch across all CPU cores. Row copies run as
+    /// parallel chunk writes; scalar columns use parallel collect. All
+    /// reads are disjoint, so no synchronization is needed.
     fn stage(memory: &Memory, advantages: &[f32], target_vals: &[f32], indices: &[usize]) -> Self {
         let fill_start = Instant::now();
         let rows = indices.len();
@@ -620,35 +641,48 @@ impl StagedBatch {
         let log_probs = memory.log_probs();
         let stored_masks = memory.action_masks();
 
-        let mut batch_states = Vec::with_capacity(rows * state_width);
-        for &index in indices {
-            let start = index * state_width;
-            batch_states.extend_from_slice(&states[start..start + state_width]);
-        }
+        let mut batch_states = vec![0.0; rows * state_width];
+        batch_states
+            .par_chunks_mut(state_width)
+            .enumerate()
+            .for_each(|(out_row, out)| {
+                let start = indices[out_row] * state_width;
+                out.copy_from_slice(&states[start..start + state_width]);
+            });
 
-        let mut batch_actions = Vec::with_capacity(rows);
-        batch_actions.extend(indices.iter().map(|&index| actions[index] as u32));
+        let batch_actions = indices
+            .par_iter()
+            .map(|&index| actions[index] as u32)
+            .collect::<Vec<_>>();
 
-        let mut batch_log_probs = Vec::with_capacity(rows);
-        batch_log_probs.extend(indices.iter().map(|&index| log_probs[index]));
+        let batch_log_probs = indices
+            .par_iter()
+            .map(|&index| log_probs[index])
+            .collect::<Vec<_>>();
 
-        let mut batch_advantages = Vec::with_capacity(rows);
-        batch_advantages.extend(indices.iter().map(|&index| advantages[index]));
+        let batch_advantages = indices
+            .par_iter()
+            .map(|&index| advantages[index])
+            .collect::<Vec<_>>();
 
-        let mut batch_target_vals = Vec::with_capacity(rows);
-        batch_target_vals.extend(indices.iter().map(|&index| target_vals[index]));
+        let batch_target_vals = indices
+            .par_iter()
+            .map(|&index| target_vals[index])
+            .collect::<Vec<_>>();
 
         let mut batch_masks = Vec::new();
         if !stored_masks.is_empty() {
-            batch_masks.reserve(rows * mask_width);
-            for &index in indices {
-                let start = index * mask_width;
-                batch_masks.extend(
-                    stored_masks[start..start + mask_width]
-                        .iter()
-                        .map(|&valid| valid as f32),
-                );
-            }
+            batch_masks = vec![0.0; rows * mask_width];
+            batch_masks
+                .par_chunks_mut(mask_width)
+                .enumerate()
+                .for_each(|(out_row, out)| {
+                    let start = indices[out_row] * mask_width;
+                    let row = &stored_masks[start..start + mask_width];
+                    for (dst, &valid) in out.iter_mut().zip(row.iter()) {
+                        *dst = valid as f32;
+                    }
+                });
         }
 
         Self {

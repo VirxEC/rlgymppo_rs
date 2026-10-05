@@ -455,7 +455,7 @@ fn can_partition_heights(heights: &[u16], k: usize) -> bool {
 
     let mut sums = vec![0_u32; 1 << n];
     for mask in 1_usize..(1_usize << n) {
-        let lsb = mask & mask.wrapping_neg();
+        let lsb = mask.isolate_lowest_one();
         sums[mask] = sums[mask ^ lsb] + heights[lsb.trailing_zeros() as usize] as u32;
     }
     // 0 = unknown, 1 = partitionable, 2 = not.
@@ -474,7 +474,7 @@ fn can_partition_heights(heights: &[u16], k: usize) -> bool {
             return false;
         }
         // The group containing the lowest set bit must sum to `target`.
-        let first = mask & mask.wrapping_neg();
+        let first = mask.isolate_lowest_one();
         let rest = mask ^ first;
         let mut sub = rest;
         loop {

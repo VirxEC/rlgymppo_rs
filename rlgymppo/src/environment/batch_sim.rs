@@ -238,7 +238,7 @@ fn claim_overbatch_steps(
     };
 
     remaining_steps
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
             (remaining > 0).then(|| remaining.saturating_sub(claim(remaining)))
         })
         .map(claim)
@@ -248,7 +248,7 @@ fn claim_overbatch_steps(
 /// Claim up to `steps` without overbatching.
 fn claim_available_steps(remaining_steps: &AtomicUsize, steps: usize) -> usize {
     remaining_steps
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
             Some(remaining.saturating_sub(steps))
         })
         .map(|remaining| remaining.min(steps))
@@ -263,7 +263,7 @@ fn claim_complete_steps(
     allow_final_overrun: bool,
 ) -> usize {
     let claimed = remaining_steps
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
             (remaining > 0).then_some(remaining.saturating_sub(steps))
         })
         .is_ok();

@@ -52,7 +52,9 @@ pub struct PpoLearnerConfig {
     /// Number of GPU-resident samples used per forward and backward pass.
     /// This must divide `batch_size`.
     pub mini_batch_size: usize,
-    /// Maximum number of rollout timesteps retained on the GPU at once during training.
+    /// Chunk size for critic-only inference passes (old values, truncation
+    /// bootstraps). Larger chunks mean fewer launches and can usually exceed
+    /// `mini_batch_size` because they hold no gradients.
     /// This must be at least `batch_size` and divide `timesteps_per_iteration`.
     pub gpu_timestep_buffer_size: usize,
     /// Number of truncation next-state observations evaluated by the critic at once

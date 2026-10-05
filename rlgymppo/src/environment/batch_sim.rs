@@ -60,8 +60,10 @@ struct PlayerTraj {
     log_probs: Vec<f32>,
     rewards: Vec<f32>,
     terminals: Vec<TerminalState>,
-    /// Per-step action masks stored row-major.
-    action_masks: Vec<bool>,
+    /// Per-step action masks stored row-major as one byte per entry
+    /// (1 = valid, 0 = invalid). Converted from the `bool` action API once
+    /// during collection so learner staging never converts on its thread.
+    action_masks: Vec<u8>,
     action_mask_width: usize,
     /// Retained row capacity after a trajectory is cleared. This keeps a small
     /// reusable baseline without retaining an entire unusually long episode.
@@ -394,8 +396,11 @@ fn step_game<SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         if config.tracked[p] {
             traj.states
                 .extend_from_slice(&next_obs[p * config.state_width..(p + 1) * config.state_width]);
-            traj.action_masks
-                .extend_from_slice(&next_masks[p * config.mask_width..(p + 1) * config.mask_width]);
+            traj.action_masks.extend(
+                next_masks[p * config.mask_width..(p + 1) * config.mask_width]
+                    .iter()
+                    .map(|&valid| valid as u8),
+            );
             traj.old_states.extend_from_slice(
                 &next_old_obs[p * config.old_state_width..(p + 1) * config.old_state_width],
             );
@@ -1223,7 +1228,7 @@ mod regression_tests {
             log_probs: vec![0.0; len],
             rewards: vec![1.0; len],
             terminals,
-            action_masks: vec![true; len],
+            action_masks: vec![1u8; len],
             action_mask_width: 1,
             baseline_steps: 0,
         }
@@ -1257,7 +1262,7 @@ mod regression_tests {
         trajectory.log_probs.push(0.0);
         trajectory.rewards.push(1.0);
         trajectory.terminals.push(TerminalState::Normal);
-        trajectory.action_masks.push(true);
+        trajectory.action_masks.push(1);
 
         let _completed = trajectory.take();
         trajectory.states.extend_from_slice(&[3.0, 4.0]);
@@ -1265,12 +1270,12 @@ mod regression_tests {
         trajectory.log_probs.push(0.0);
         trajectory.rewards.push(1.0);
         trajectory.terminals.push(TerminalState::Normal);
-        trajectory.action_masks.push(false);
+        trajectory.action_masks.push(0);
         trajectory.truncate(1);
 
         assert_eq!(trajectory.states, &[3.0, 4.0]);
         assert_eq!(trajectory.actions, &[1]);
-        assert_eq!(trajectory.action_masks, &[false]);
+        assert_eq!(trajectory.action_masks, &[0u8]);
     }
 
     #[test]
@@ -1730,7 +1735,7 @@ mod phase3_tests {
                 traj.rewards.push(1.0);
                 traj.terminals.push(TerminalState::None);
                 traj.action_masks
-                    .extend(repeat_n(true, traj.action_mask_width));
+                    .extend(repeat_n(1u8, traj.action_mask_width));
             }
         }
 
@@ -1742,7 +1747,7 @@ mod phase3_tests {
             traj.rewards.push(1.0);
             traj.terminals.push(terminal);
             traj.action_masks
-                .extend(repeat_n(true, traj.action_mask_width));
+                .extend(repeat_n(1u8, traj.action_mask_width));
         }
 
         fn flushed_episode(
@@ -1804,7 +1809,11 @@ mod phase3_tests {
             for i in 0..3 {
                 let traj = &serial_sim.player_trajs[i];
                 assert_eq!(traj.states, &pre_obs[i * 53..(i + 1) * 53]);
-                assert_eq!(traj.action_masks, &pre_masks[i * 90..(i + 1) * 90]);
+                let expected_masks = pre_masks[i * 90..(i + 1) * 90]
+                    .iter()
+                    .map(|&valid| valid as u8)
+                    .collect::<Vec<_>>();
+                assert_eq!(traj.action_masks, expected_masks);
                 assert_eq!(traj.actions, [i]);
                 assert_eq!(traj.log_probs, [0.5]);
                 assert_eq!(traj.terminals, [TerminalState::None]);

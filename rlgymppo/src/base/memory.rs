@@ -13,21 +13,6 @@ pub fn get_batch_1d<T: Copy>(data: &[T], indices: &[usize]) -> Vec<T> {
     indices.iter().map(|i| data[*i]).collect::<Vec<_>>()
 }
 
-pub fn get_states_batch<B: Backend>(
-    data: &[f32],
-    width: usize,
-    indices: &[usize],
-    device: &B::Device,
-) -> Tensor<B, 2> {
-    let mut states = Vec::with_capacity(indices.len() * width);
-    for &index in indices {
-        let start = index * width;
-        states.extend_from_slice(&data[start..start + width]);
-    }
-
-    Tensor::from_data(TensorData::new(states, [indices.len(), width]), device)
-}
-
 pub fn get_states_batch_range<B: Backend>(
     data: &[f32],
     width: usize,
@@ -46,64 +31,65 @@ pub fn get_states_batch_range<B: Backend>(
     )
 }
 
-pub fn get_log_probs_batch<B: Backend>(
+/// Upload rows `[start, end)` of a `[N, 1]` column with one `memcpy`.
+pub fn get_log_probs_batch_range<B: Backend>(
     data: &[f32],
-    indices: &[usize],
+    start: usize,
+    end: usize,
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let mut states: Vec<f32> = Vec::with_capacity(indices.len());
-    for &i in indices {
-        states.push(data[i]);
-    }
-
-    Tensor::from_data(TensorData::new(states, [indices.len(), 1]), device)
+    Tensor::from_data(
+        TensorData::new(data[start..end].to_vec(), [end - start, 1]),
+        device,
+    )
 }
 
-pub fn get_action_batch<B: Backend>(
+/// Upload action rows `[start, end)` with one pass and no per-row indexing.
+pub fn get_action_batch_range<B: Backend>(
     data: &[usize],
-    indices: &[usize],
+    start: usize,
+    end: usize,
     device: &B::Device,
 ) -> Tensor<B, 2, Int> {
-    let shape = [indices.len(), 1];
-    let mut states: Vec<u32> = Vec::with_capacity(shape[0]);
-    for &i in indices {
-        states.push(data[i] as u32);
-    }
+    let states = data[start..end]
+        .iter()
+        .map(|&action| action as u32)
+        .collect::<Vec<_>>();
 
-    Tensor::from_data(TensorData::new(states, shape), device)
+    Tensor::from_data(TensorData::new(states, [end - start, 1]), device)
 }
 
-pub fn get_generic_batch<B: Backend>(
+/// Upload rows `[start, end)` of a `[N, 1]` column with one `memcpy`.
+pub fn get_generic_batch_range<B: Backend>(
     data: &[f32],
-    indices: &[usize],
+    start: usize,
+    end: usize,
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let mut states: Vec<f32> = Vec::with_capacity(indices.len());
-    for &i in indices {
-        states.push(data[i]);
-    }
-
-    Tensor::from_data(TensorData::new(states, [indices.len(), 1]), device)
+    Tensor::from_data(
+        TensorData::new(data[start..end].to_vec(), [end - start, 1]),
+        device,
+    )
 }
 
-/// Flatten per-player action masks into a [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
-pub fn get_action_masks_batch<B: Backend>(
-    data: &[bool],
+/// Convert mask rows `[start, end)` to `f32` with one pass and no per-row
+/// indexing.
+pub fn get_action_masks_batch_range<B: Backend>(
+    data: &[u8],
     width: usize,
-    indices: &[usize],
+    start: usize,
+    end: usize,
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let mut masks = Vec::with_capacity(indices.len() * width);
-    for &index in indices {
-        let start = index * width;
-        masks.extend(
-            data[start..start + width]
-                .iter()
-                .map(|&valid| valid as u8 as f32),
-        );
-    }
+    let rows = end - start;
+    let mut masks = Vec::with_capacity(rows * width);
+    masks.extend(
+        data[start * width..end * width]
+            .iter()
+            .map(|&valid| valid as f32),
+    );
 
-    Tensor::from_data(TensorData::new(masks, [indices.len(), width]), device)
+    Tensor::from_data(TensorData::new(masks, [rows, width]), device)
 }
 
 #[derive(Clone)]
@@ -121,7 +107,9 @@ pub struct Memory {
     /// `terminals`.
     trunc_next_states: Vec<f32>,
     /// Action-validity masks stored row-major as `[step * action_mask_width..]`.
-    action_masks: Vec<bool>,
+    /// One byte per entry (1 = valid, 0 = invalid): same RAM as `bool`,
+    /// but staging converts to `f32` with a single vectorized pass.
+    action_masks: Vec<u8>,
     action_mask_width: usize,
     /// Per-step observations from the old (teacher) obs builder, stored
     /// row-major as `[step * old_state_width..]`. Empty when no old obs
@@ -192,7 +180,7 @@ impl Memory {
         log_probs: Vec<f32>,
         rewards: Vec<f32>,
         terminals: Vec<TerminalState>,
-        action_masks: Vec<bool>,
+        action_masks: Vec<u8>,
         action_mask_width: usize,
         old_states: Vec<f32>,
         old_state_width: usize,
@@ -401,7 +389,7 @@ impl Memory {
             .unwrap_or(0)
     }
 
-    pub fn action_masks(&self) -> &[bool] {
+    pub fn action_masks(&self) -> &[u8] {
         &self.action_masks
     }
 
@@ -468,7 +456,7 @@ mod regression_tests {
             vec![0.0; count],
             vec![1.0; count],
             terminals,
-            vec![true; count],
+            vec![1u8; count],
             1,
             Vec::new(),
             0,
@@ -539,7 +527,7 @@ mod regression_tests {
             vec![0.0, 0.0],
             vec![1.0, 1.0],
             vec![TerminalState::None, TerminalState::Normal],
-            vec![true, false, false, true],
+            vec![1u8, 0, 0, 1],
             2,
             Vec::new(),
             0,
@@ -549,7 +537,7 @@ mod regression_tests {
         assert_eq!(memory.states(), &[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(memory.state_width(), 2);
         assert!(memory.states.capacity() >= 2 * memory.state_width());
-        assert_eq!(memory.action_masks(), &[true, false, false, true]);
+        assert_eq!(memory.action_masks(), &[1u8, 0, 0, 1]);
         assert_eq!(memory.action_mask_width(), 2);
         assert!(memory.action_masks.capacity() >= 2 * memory.action_mask_width());
     }

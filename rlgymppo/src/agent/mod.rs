@@ -26,8 +26,8 @@ use crate::agent::config::PpoLearnerConfig;
 use crate::agent::gae::{GAEOutput, get_gae};
 use crate::agent::model::{Actic, Net, PPOOutput};
 use crate::base::{
-    Memory, TerminalState, get_action_batch, get_action_masks_batch, get_batch_1d,
-    get_generic_batch, get_log_probs_batch, get_states_batch, get_states_batch_range,
+    Memory, TerminalState, get_action_batch_range, get_action_masks_batch_range, get_batch_1d,
+    get_generic_batch_range, get_log_probs_batch_range, get_states_batch_range,
 };
 use crate::utils::running_stat::Stats;
 
@@ -319,59 +319,29 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let mut batch_staging_time = Duration::ZERO;
         let mut batch_training_time = Duration::ZERO;
 
-        if rollout_size <= self.config.gpu_timestep_buffer_size {
-            // Keep the entire rollout on the GPU and only reorder it once per epoch.
-            let staging_start = Instant::now();
-            let rollout = GpuBatch::from_memory(
-                memory,
-                &memory_indices,
-                &advantages,
-                &target_vals,
-                &self.device,
-            );
-            batch_staging_time += staging_start.elapsed();
-            let mut rollout_order = memory_indices;
-            for _ in 0..self.config.epochs {
-                rollout_order.shuffle(rng);
+        // Upload the rollout once, in order, with contiguous copies
+        let staging_start = Instant::now();
+        let rollout = GpuBatch::from_memory_range(
+            memory,
+            &advantages,
+            &target_vals,
+            0,
+            rollout_size,
+            &self.device,
+        );
+        batch_staging_time += staging_start.elapsed();
 
-                for batch_indices in rollout_order.chunks(self.config.batch_size) {
-                    let training_start = Instant::now();
-                    self.train_gpu_batch_indices(
-                        &mut net,
-                        &rollout,
-                        batch_indices,
-                        &mut metric_totals,
-                    );
-                    batch_training_time += training_start.elapsed();
-                }
-            }
-        } else {
-            let mut rollout_order = memory_indices;
-            for _ in 0..self.config.epochs {
-                rollout_order.shuffle(rng);
+        let mut rollout_order: Vec<usize> = (0..rollout_size).collect();
+        for _ in 0..self.config.epochs {
+            rollout_order.shuffle(rng);
 
-                for batch_indices in rollout_order.chunks(self.config.batch_size) {
-                    // Upload the selected samples once, then gather only one mini-batch at a time.
-                    let staging_start = Instant::now();
-                    let batch = GpuBatch::from_memory(
-                        memory,
-                        batch_indices,
-                        &advantages,
-                        &target_vals,
-                        &self.device,
-                    );
-                    batch_staging_time += staging_start.elapsed();
-
-                    let batch_order = (0..batch.len()).collect::<Vec<_>>();
-                    let training_start = Instant::now();
-                    self.train_gpu_batch_indices(
-                        &mut net,
-                        &batch,
-                        &batch_order,
-                        &mut metric_totals,
-                    );
-                    batch_training_time += training_start.elapsed();
-                }
+            for batch_indices in rollout_order.chunks(self.config.batch_size) {
+                let training_start = Instant::now();
+                // One index build plus upload per batch, shared by all six
+                // tensors; mini-batches below are contiguous slices.
+                let batch = rollout.select_batch(batch_indices, &self.device);
+                self.train_gpu_batch(&mut net, &batch, &mut metric_totals);
+                batch_training_time += training_start.elapsed();
             }
         }
 
@@ -435,20 +405,23 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         (net, rollout_size)
     }
 
-    fn train_gpu_batch_indices(
+    /// Train one GPU-resident batch, sliced into contiguous mini-batches.
+    /// The batch already holds shuffled rows, so each mini-batch is a
+    /// zero-copy `narrow` view: no index build, no upload, no gather.
+    fn train_gpu_batch(
         &mut self,
         net: &mut Actic<B>,
         batch: &GpuBatch<B>,
-        indices: &[usize],
         metric_totals: &mut MetricTotals<B>,
     ) {
         let mut actor_gradients = GradientsAccumulator::new();
         let mut critic_gradients = GradientsAccumulator::new();
         let mut shared_head_gradients = GradientsAccumulator::new();
+        let batch_len = batch.len();
 
-        for mini_batch_indices in indices.chunks(self.config.mini_batch_size) {
-            let mini_batch = batch.select(mini_batch_indices, &self.device);
-            let mini_batch_len = mini_batch.len();
+        for offset in (0..batch_len).step_by(self.config.mini_batch_size) {
+            let mini_batch_len = (offset + self.config.mini_batch_size).min(batch_len) - offset;
+            let mini_batch = batch.slice(offset, mini_batch_len);
 
             let state_batch = mini_batch.states;
             let action_batch = mini_batch.actions;
@@ -465,7 +438,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 advantage_batch,
                 target_vals_batch,
                 mask_batch,
-                mini_batch_len as f32 / indices.len() as f32,
+                mini_batch_len as f32 / batch_len as f32,
                 &mut actor_gradients,
                 &mut critic_gradients,
                 &mut shared_head_gradients,
@@ -604,41 +577,44 @@ struct GpuBatch<B: Backend> {
 }
 
 impl<B: Backend> GpuBatch<B> {
-    fn from_memory(
+    /// Upload rows `[start, end)` in order with contiguous copies.
+    /// Shuffling happens on the GPU afterwards via [`GpuBatch::select_batch`].
+    fn from_memory_range(
         memory: &Memory,
-        indices: &[usize],
         advantages: &[f32],
         target_vals: &[f32],
+        start: usize,
+        end: usize,
         device: &B::Device,
     ) -> Self {
         Self {
-            states: get_states_batch(memory.states(), memory.state_width(), indices, device),
-            actions: get_action_batch(memory.actions(), indices, device),
-            old_log_probs: get_log_probs_batch(memory.log_probs(), indices, device),
-            advantages: get_generic_batch(advantages, indices, device),
-            target_vals: get_generic_batch(target_vals, indices, device),
+            states: get_states_batch_range(
+                memory.states(),
+                memory.state_width(),
+                start,
+                end,
+                device,
+            ),
+            actions: get_action_batch_range(memory.actions(), start, end, device),
+            old_log_probs: get_log_probs_batch_range(memory.log_probs(), start, end, device),
+            advantages: get_generic_batch_range(advantages, start, end, device),
+            target_vals: get_generic_batch_range(target_vals, start, end, device),
             action_masks: (!memory.action_masks().is_empty()).then(|| {
-                get_action_masks_batch(
+                get_action_masks_batch_range(
                     memory.action_masks(),
                     memory.action_mask_width(),
-                    indices,
+                    start,
+                    end,
                     device,
                 )
             }),
         }
     }
 
-    fn select(&self, indices: &[usize], device: &B::Device) -> Self {
-        let indices = Tensor::<B, 1, Int>::from_data(
-            TensorData::new(
-                indices
-                    .iter()
-                    .map(|&index| index as i64)
-                    .collect::<Vec<_>>(),
-                [indices.len()],
-            ),
-            device,
-        );
+    /// Gather one shuffled batch on the GPU. Builds and uploads a single
+    /// index tensor shared by all six fields.
+    fn select_batch(&self, indices: &[usize], device: &B::Device) -> Self {
+        let indices = indices_tensor::<B>(indices, device);
 
         Self {
             states: self.states.clone().select(0, indices.clone()),
@@ -649,13 +625,44 @@ impl<B: Backend> GpuBatch<B> {
             action_masks: self
                 .action_masks
                 .as_ref()
-                .map(|masks| masks.clone().select(0, indices)),
+                .map(|masks| masks.clone().select(0, indices.clone())),
+        }
+    }
+
+    /// Contiguous view of `[offset, offset + len)`: no index tensor, no copy.
+    fn slice(&self, offset: usize, len: usize) -> Self {
+        Self {
+            states: self.states.clone().narrow(0, offset, len),
+            actions: self.actions.clone().narrow(0, offset, len),
+            old_log_probs: self.old_log_probs.clone().narrow(0, offset, len),
+            advantages: self.advantages.clone().narrow(0, offset, len),
+            target_vals: self.target_vals.clone().narrow(0, offset, len),
+            action_masks: self
+                .action_masks
+                .as_ref()
+                .map(|masks| masks.clone().narrow(0, offset, len)),
         }
     }
 
     fn len(&self) -> usize {
         self.states.shape().dims::<2>()[0]
     }
+}
+
+/// Build one `Int` index tensor with a single `usize` to `i64` pass.
+/// Callers share the returned tensor across all gathered fields instead of
+/// rebuilding it per field or per mini-batch.
+fn indices_tensor<B: Backend>(indices: &[usize], device: &B::Device) -> Tensor<B, 1, Int> {
+    Tensor::<B, 1, Int>::from_data(
+        TensorData::new(
+            indices
+                .iter()
+                .map(|&index| index as i64)
+                .collect::<Vec<_>>(),
+            [indices.len()],
+        ),
+        device,
+    )
 }
 
 struct MetricTotals<B: Backend> {

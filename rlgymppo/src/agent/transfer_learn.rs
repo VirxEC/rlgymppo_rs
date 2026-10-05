@@ -12,7 +12,7 @@ use super::{flatten_net, l2_diff};
 use crate::NormSelection;
 use crate::agent::Ppo;
 use crate::agent::model::{Actic, Net};
-use crate::base::{Memory, get_action_masks_batch, get_states_batch_range};
+use crate::base::{Memory, get_action_masks_batch_range, get_states_batch_range};
 
 /// What the teacher (old, larger) policy is: its architecture and where its
 /// checkpoints live. Passed to `Learner::transfer_learn` alongside a
@@ -164,7 +164,6 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             let end = (start + mb).min(n);
             let chunk_len = end - start;
             let weight = chunk_len as f64 / n as f64;
-            let indices = (start..end).collect::<Vec<_>>();
             let states = get_states_batch_range::<B::InnerBackend>(
                 teacher_states,
                 teacher_width,
@@ -172,10 +171,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 end,
                 &self.device,
             );
-            let masks = get_action_masks_batch::<B::InnerBackend>(
+            let masks = get_action_masks_batch_range::<B::InnerBackend>(
                 memory.action_masks(),
                 memory.action_mask_width(),
-                &indices,
+                start,
+                end,
                 &self.device,
             );
             let probs = teacher.infer(states, Some(masks));
@@ -202,7 +202,6 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 let end = (start + mb).min(n);
                 let chunk_len = end - start;
                 let weight = chunk_len as f32 / n as f32;
-                let indices = (start..end).collect::<Vec<_>>();
 
                 let states = get_states_batch_range::<B>(
                     memory.states(),
@@ -211,10 +210,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     end,
                     &self.device,
                 );
-                let masks = get_action_masks_batch::<B>(
+                let masks = get_action_masks_batch_range::<B>(
                     memory.action_masks(),
                     memory.action_mask_width(),
-                    &indices,
+                    start,
+                    end,
                     &self.device,
                 );
 
@@ -324,7 +324,7 @@ mod tests {
             vec![0.0; n],
             vec![0.0; n],
             terminals,
-            vec![true; n * n_actions],
+            vec![1u8; n * n_actions],
             n_actions,
             old_states,
             old_width,

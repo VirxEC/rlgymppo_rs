@@ -398,6 +398,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             });
 
             let mut upload_time = Duration::ZERO;
+            let mut optim_time = Duration::ZERO;
             let mut primed = false;
             for batch_indices in &epoch_batches {
                 let recv_start = Instant::now();
@@ -425,10 +426,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 let states = resident_b.clone().select(0, index).cast(DType::F32);
                 let batch = GpuBatch::from_staged(states, staged, &self.device);
                 upload_time += upload_start.elapsed();
-                self.train_gpu_batch(&mut net, &batch, &mut metric_totals);
+                self.train_gpu_batch(&mut net, &batch, &mut metric_totals, &mut optim_time);
                 batch_training_time += training_start.elapsed();
             }
             metrics["PPO/upload time"] = upload_time.as_secs_f64().into();
+            metrics["PPO/optimizer step time"] = optim_time.as_secs_f64().into();
         });
 
         metrics["PPO/training time"] = training_start.elapsed().as_secs_f64().into();
@@ -499,6 +501,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         net: &mut Actic<B>,
         batch: &GpuBatch<B>,
         metric_totals: &mut MetricTotals<B>,
+        optim_time: &mut Duration,
     ) {
         let mut actor_gradients = GradientsAccumulator::new();
         let mut critic_gradients = GradientsAccumulator::new();
@@ -532,12 +535,14 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             );
         }
 
+        let optim_start = Instant::now();
         self.step_optimizers(
             net,
             actor_gradients,
             critic_gradients,
             shared_head_gradients,
         );
+        *optim_time += optim_start.elapsed();
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -214,7 +214,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             let nodiff_net = net.valid();
             let mb = self.config.gpu_timestep_buffer_size;
             let n = rollout_size;
-            let mut values = Vec::with_capacity(n);
+            // Queue every chunk forward, then a single transaction
+            // readback: one CPU/GPU sync for the whole rollout instead of
+            // one per chunk, with no concat kernel. Chunk activations stay
+            // bounded (handles drop each iteration) while forwards pipeline.
+            let mut transaction = Transaction::default();
             for start in (0..n).step_by(mb) {
                 let end = (start + mb).min(n);
                 let states = resident_states
@@ -222,9 +226,14 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     .narrow(0, start, end - start)
                     .cast(DType::F32);
                 let features = nodiff_net.apply_shared_head(states);
-                let batch_vals = nodiff_net.critic.forward(features);
-                values.extend_from_slice(batch_vals.into_data().as_slice().unwrap());
+                transaction = transaction.register(nodiff_net.critic.forward(features));
             }
+
+            let mut values = Vec::with_capacity(n);
+            for data in transaction.execute() {
+                values.extend_from_slice(data.as_slice().unwrap());
+            }
+
             values
         };
         metrics["PPO/value inference time"] = value_inference_start.elapsed().as_secs_f64().into();
@@ -239,8 +248,6 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
         // Run the critic on truncation next-state observations for the
         // bootstrap in configurable batches on a non-autodiff model clone.
-        // This is the only critic inference left in the learner: per-step
-        // values arrive stored from collection.
         let trunc_start = Instant::now();
         let trunc_val_preds = {
             // Only truncated rows inside the training window receive a
@@ -261,7 +268,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 let width = memory.state_width();
                 let states = &memory.trunc_next_states()[..window_truncations * width];
 
-                let mut values = Vec::with_capacity(window_truncations);
+                // Same single-sync shape as value inference above.
+                let mut transaction = Transaction::default();
                 for start in (0..window_truncations).step_by(mb) {
                     let end = (start + mb).min(window_truncations);
                     let batch = get_states_batch_range::<B::InnerBackend>(
@@ -274,14 +282,14 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     .cast(DType::F32);
 
                     let features = nodiff_net.apply_shared_head(batch);
-                    let batch_vals = nodiff_net
-                        .critic
-                        .forward(features)
-                        .into_data()
-                        .into_vec::<f32>()
-                        .unwrap();
-                    values.extend(batch_vals);
+                    transaction = transaction.register(nodiff_net.critic.forward(features));
                 }
+
+                let mut values = Vec::with_capacity(window_truncations);
+                for data in transaction.execute() {
+                    values.extend_from_slice(data.as_slice().unwrap());
+                }
+
                 values
             }
         };

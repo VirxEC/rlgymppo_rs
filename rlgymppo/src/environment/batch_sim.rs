@@ -13,7 +13,7 @@ use rlgymppo_utils::{AvgTracker, Report};
 
 use super::sim::{GameInstance, RewardSamplingConfig};
 use crate::agent::model::Actic;
-use crate::base::{Memory, TerminalState};
+use crate::base::{ClaimTarget, Memory, MemoryShard, TerminalState};
 
 const EPISODE_LENGTH_EMA_ALPHA: f64 = 0.1;
 const MIN_TRAJECTORY_BASELINE_STEPS: usize = 32;
@@ -285,17 +285,17 @@ fn claim_complete_steps(
     }
 }
 
-/// Push a claimed trajectory into the memory.
-fn push_claimed_trajectory(memory: &mut Memory, claimed: Option<ClaimedTrajectory>) {
+/// Push a claimed trajectory into the target (owned memory or shard).
+fn push_claimed_trajectory(target: &mut impl ClaimTarget, claimed: Option<ClaimedTrajectory>) {
     if let Some(claimed) = claimed {
-        push_traj_prefix(memory, claimed.trajectory, claimed.len, claimed.next_state);
+        push_traj_prefix(target, claimed.trajectory, claimed.len, claimed.next_state);
     }
 }
 
-/// Push a trajectory prefix into the memory. A cut boundary row gets a
+/// Push a trajectory prefix into the target. A cut boundary row gets a
 /// truncated terminal state.
 fn push_traj_prefix(
-    memory: &mut Memory,
+    target: &mut impl ClaimTarget,
     mut traj: PlayerTraj,
     len: usize,
     trunc_next_state: Option<Vec<f32>>,
@@ -308,7 +308,7 @@ fn push_traj_prefix(
         *terminal = TerminalState::Truncated;
     }
 
-    memory.push_player(
+    target.push_player(
         traj.states,
         traj.state_width,
         traj.actions,
@@ -727,6 +727,74 @@ where
         TERM: Send,
         TRUNC: Send,
     {
+        let mut memory = Memory::with_capacity(memory_capacity_hint);
+        memory.reserve_rollout(memory_capacity_hint, self.state_width, self.mask_width);
+        let report = self.run_inner(
+            model,
+            remaining_steps,
+            rollout_budget,
+            self_play,
+            overbatching,
+            pool,
+            &mut memory,
+        );
+        (memory, report)
+    }
+
+    /// Like [`Self::run_with_budget`], but claims straight into an exclusive
+    /// row range of a shared memory instead of a fresh owned one. The caller
+    /// asserts at the join that every share filled exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_into_shard(
+        &mut self,
+        model: &Actic<B>,
+        remaining_steps: &AtomicUsize,
+        rollout_budget: usize,
+        self_play: Option<(&Actic<B>, usize)>,
+        overbatching: bool,
+        pool: Option<&ThreadPool>,
+        shard: &mut MemoryShard,
+    ) -> Report
+    where
+        SS: Send,
+        SI: Send,
+        OBS: Send,
+        ACT: Send,
+        REW: Send,
+        TERM: Send,
+        TRUNC: Send,
+    {
+        self.run_inner(
+            model,
+            remaining_steps,
+            rollout_budget,
+            self_play,
+            overbatching,
+            pool,
+            shard,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_inner(
+        &mut self,
+        model: &Actic<B>,
+        remaining_steps: &AtomicUsize,
+        rollout_budget: usize,
+        self_play: Option<(&Actic<B>, usize)>,
+        overbatching: bool,
+        pool: Option<&ThreadPool>,
+        target: &mut impl ClaimTarget,
+    ) -> Report
+    where
+        SS: Send,
+        SI: Send,
+        OBS: Send,
+        ACT: Send,
+        REW: Send,
+        TERM: Send,
+        TRUNC: Send,
+    {
         let (old_model, old_team) = self_play.unzip();
 
         let mut total_bookkeeping_time = 0.0_f64;
@@ -760,8 +828,6 @@ where
             vec![true; self.player_teams.len()]
         };
 
-        let mut memory = Memory::with_capacity(memory_capacity_hint);
-        memory.reserve_rollout(memory_capacity_hint, self.state_width, self.mask_width);
         let mut completed_for_update = false;
 
         while remaining_steps.load(Ordering::Relaxed) > 0 {
@@ -771,7 +837,7 @@ where
             if overbatching {
                 let claimed = claim_overbatch_steps(remaining_steps, traj.len(), rollout_budget);
                 let partition = partition_claimed_trajectory(traj, trunc_next_state, claimed, true);
-                push_claimed_trajectory(&mut memory, partition.claimed);
+                push_claimed_trajectory(target, partition.claimed);
                 if let Some(overflow) = partition.overflow {
                     self.overflow_trajs.push_front(overflow);
                 }
@@ -781,7 +847,7 @@ where
             } else {
                 let claimed = claim_available_steps(remaining_steps, traj.len());
                 let partition = partition_claimed_trajectory(traj, trunc_next_state, claimed, true);
-                push_claimed_trajectory(&mut memory, partition.claimed);
+                push_claimed_trajectory(target, partition.claimed);
                 if let Some(overflow) = partition.overflow {
                     self.overflow_trajs.push_front(overflow);
                 }
@@ -915,7 +981,7 @@ where
             self.step_games_phase(pool, &actions, &log_probs, &player_is_tracked);
 
             let (episode_steps, episode_squared_steps, episode_count) = self.claim_game_outcomes(
-                &mut memory,
+                target,
                 remaining_steps,
                 rollout_budget,
                 overbatching,
@@ -981,7 +1047,7 @@ where
         report[COLLECT_WAIT_TIME_KEY] = total_wait_time.into();
         report[COLLECT_BOOKKEEPING_TIME_KEY] = total_bookkeeping_time.into();
 
-        (memory, report)
+        report
     }
 
     /// Advance every game through the delayed portion of the decision
@@ -1161,10 +1227,10 @@ where
 
     /// Consume the flush outputs in game order and claim the budget for
     /// each flushed trajectory. It is the only place that mutates
-    /// `memory`, the shared budget, and `overflow_trajs`.
+    /// the claim target, the shared budget, and `overflow_trajs`.
     fn claim_game_outcomes(
         &mut self,
-        memory: &mut Memory,
+        target: &mut impl ClaimTarget,
         remaining_steps: &AtomicUsize,
         rollout_budget: usize,
         overbatching: bool,
@@ -1190,7 +1256,7 @@ where
                     if claimed == len {
                         *completed_for_update = true;
                         push_claimed_trajectory(
-                            memory,
+                            target,
                             Some(ClaimedTrajectory {
                                 trajectory,
                                 len,
@@ -1206,7 +1272,7 @@ where
                         claimed,
                         self.retain_overflow_episodes,
                     );
-                    push_claimed_trajectory(memory, partition.claimed);
+                    push_claimed_trajectory(target, partition.claimed);
                     if let Some(overflow) = partition.overflow {
                         self.overflow_trajs.push_back(overflow);
                     }
@@ -1218,7 +1284,7 @@ where
                         claimed,
                         self.retain_overflow_episodes,
                     );
-                    push_claimed_trajectory(memory, partition.claimed);
+                    push_claimed_trajectory(target, partition.claimed);
                     if let Some(overflow) = partition.overflow {
                         self.overflow_trajs.push_back(overflow);
                     }

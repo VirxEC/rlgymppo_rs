@@ -42,6 +42,8 @@ where
     memory: Memory,
     metrics: Report,
     rollout_budget: usize,
+    overbatching: bool,
+    complete_trajectories: bool,
     _marker: PhantomData<fn(SS, OBS, ACT, REW, TERM, TRUNC, SI)>,
 }
 
@@ -109,6 +111,8 @@ where
             memory: Memory::with_capacity(rollout_budget),
             metrics: Report::default(),
             rollout_budget,
+            overbatching,
+            complete_trajectories,
             _marker: PhantomData,
         }
     }
@@ -152,8 +156,58 @@ where
         let self_play = self_play.as_ref().map(|(model, team)| (model, *team));
         let model = &model;
 
+        // Exact-budget path: every pool fills exactly its share (no
+        // overbatching, no complete-trajectories overrun), so pools claim
+        // straight into exclusive row ranges of the shared memory. No
+        // per-pool memories, no merge copy. Needs widths, which the first
+        // (legacy) run establishes.
+        let exact_shares =
+            !self.overbatching && !self.complete_trajectories && self.memory.state_width() > 0;
         let mut pool_max_wall = 0.0f64;
-        if self.num_pools == 1 {
+        if exact_shares {
+            self.memory.resize_full(budget);
+            let mut shards = self.memory.shard_mut(&shares);
+            let reports = std::thread::scope(|scope| {
+                let handles: Vec<_> = self
+                    .collectors
+                    .iter_mut()
+                    .zip(&shares)
+                    .zip(shards.iter_mut())
+                    .map(|((collector, &share), shard)| {
+                        scope.spawn(move || {
+                            let pool_start = Instant::now();
+                            let report = collector.run_into_shard(model, self_play, share, shard);
+                            (report, pool_start.elapsed().as_secs_f64())
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let merge_start = Instant::now();
+            // Collect truncation tails first: `shards` borrows the memory,
+            // so the memory cannot be touched until they are dropped.
+            let mut trunc_tails = Vec::with_capacity(shards.len());
+            for ((shard, &share), (report, pool_secs)) in
+                shards.iter_mut().zip(&shares).zip(reports)
+            {
+                assert_eq!(
+                    shard.rows_written(),
+                    share,
+                    "shard path needs exact shares; gate the caller"
+                );
+                pool_max_wall = pool_max_wall.max(pool_secs);
+                trunc_tails.push(shard.take_trunc_next_states());
+                self.metrics += report;
+            }
+            drop(shards);
+            for tail in trunc_tails {
+                self.memory.append_trunc_next_states(tail);
+            }
+            self.metrics[COLLECT_MERGE_TIME_KEY] = merge_start.elapsed().as_secs_f64().into();
+        } else if self.num_pools == 1 {
             let pool_start = Instant::now();
             let (memory, metrics) = self.collectors[0].run(model, self_play, shares[0]);
             pool_max_wall = pool_start.elapsed().as_secs_f64();

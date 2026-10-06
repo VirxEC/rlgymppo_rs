@@ -10,7 +10,7 @@ use rlgymppo_utils::shared_info::SharedInfoReport;
 use super::batch_sim::BatchSim;
 use super::sim::RewardSamplingConfig;
 use crate::agent::model::Actic;
-use crate::base::Memory;
+use crate::base::{Memory, MemoryShard};
 
 /// One independent rollout collector: a [`BatchSim`], its rayon pool, and
 /// its budget share. Pool jobs never touch the GPU or call `wait()`.
@@ -107,6 +107,28 @@ where
             self_play,
             self.overbatching,
             Some(&self.pool),
+        )
+    }
+
+    /// Like [`Self::run`], but claims straight into an exclusive row range
+    /// of the shared memory. The shard must fill exactly: the caller
+    /// asserts full shares at the join.
+    pub(crate) fn run_into_shard(
+        &mut self,
+        model: &Actic<B>,
+        self_play: Option<(&Actic<B>, usize)>,
+        share: usize,
+        shard: &mut MemoryShard,
+    ) -> Report {
+        self.remaining_steps.store(share, Ordering::Release);
+        self.batch_sim.run_into_shard(
+            model,
+            &self.remaining_steps,
+            share,
+            self_play,
+            self.overbatching,
+            Some(&self.pool),
+            shard,
         )
     }
 }

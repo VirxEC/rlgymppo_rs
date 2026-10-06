@@ -93,6 +93,137 @@ impl Default for Memory {
     }
 }
 
+/// Destination for claimed trajectory rows.
+///
+/// `Memory` appends (legacy path); [`MemoryShard`] writes positionally
+/// into an exclusive row range of a shared memory (exact-budget path).
+/// Both funnel through [`Memory::push_player`]'s argument list so the
+/// claim code is identical for either destination.
+#[allow(clippy::too_many_arguments)]
+pub trait ClaimTarget {
+    fn push_player(
+        &mut self,
+        states: Vec<f32>,
+        state_width: usize,
+        actions: Vec<usize>,
+        log_probs: Vec<f32>,
+        rewards: Vec<f32>,
+        terminals: Vec<TerminalState>,
+        action_masks: Vec<u8>,
+        action_mask_width: usize,
+        old_states: Vec<f32>,
+        old_state_width: usize,
+        trunc_next_state: Option<Vec<f32>>,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+impl ClaimTarget for Memory {
+    fn push_player(
+        &mut self,
+        states: Vec<f32>,
+        state_width: usize,
+        actions: Vec<usize>,
+        log_probs: Vec<f32>,
+        rewards: Vec<f32>,
+        terminals: Vec<TerminalState>,
+        action_masks: Vec<u8>,
+        action_mask_width: usize,
+        old_states: Vec<f32>,
+        old_state_width: usize,
+        trunc_next_state: Option<Vec<f32>>,
+    ) {
+        Memory::push_player(
+            self,
+            states,
+            state_width,
+            actions,
+            log_probs,
+            rewards,
+            terminals,
+            action_masks,
+            action_mask_width,
+            old_states,
+            old_state_width,
+            trunc_next_state,
+        );
+    }
+}
+
+/// Exclusive row range of a shared [`Memory`] that one pool fills directly.
+/// Per-row buffers are disjoint slices (no synchronization needed); the
+/// sparse truncation tail is kept aside and concatenated in pool order at
+/// the join, exactly like [`Memory::merge`] does today.
+#[allow(clippy::too_many_arguments)]
+pub struct MemoryShard<'a> {
+    states: &'a mut [f32],
+    actions: &'a mut [usize],
+    log_probs: &'a mut [f32],
+    rewards: &'a mut [f32],
+    terminals: &'a mut [TerminalState],
+    action_masks: &'a mut [u8],
+    old_states: &'a mut [f32],
+    trunc_next_states: Vec<f32>,
+    state_width: usize,
+    action_mask_width: usize,
+    old_state_width: usize,
+    rows_written: usize,
+    capacity_rows: usize,
+}
+
+impl<'a> MemoryShard<'a> {
+    /// Rows written so far. The join asserts this equals the share.
+    pub fn rows_written(&self) -> usize {
+        self.rows_written
+    }
+
+    /// Take the shard's truncation tail for pool-order concatenation.
+    pub fn take_trunc_next_states(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.trunc_next_states)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+impl ClaimTarget for MemoryShard<'_> {
+    fn push_player(
+        &mut self,
+        states: Vec<f32>,
+        state_width: usize,
+        actions: Vec<usize>,
+        log_probs: Vec<f32>,
+        rewards: Vec<f32>,
+        terminals: Vec<TerminalState>,
+        action_masks: Vec<u8>,
+        action_mask_width: usize,
+        old_states: Vec<f32>,
+        old_state_width: usize,
+        trunc_next_state: Option<Vec<f32>>,
+    ) {
+        let n = actions.len();
+        debug_assert_eq!(states.len(), n * state_width);
+        debug_assert_eq!(state_width, self.state_width);
+        debug_assert_eq!(action_mask_width, self.action_mask_width);
+        debug_assert_eq!(old_state_width, self.old_state_width);
+        debug_assert!(self.rows_written + n <= self.capacity_rows);
+        let start = self.rows_written;
+        let end = start + n;
+        self.states[start * state_width..end * state_width].copy_from_slice(&states);
+        self.actions[start..end].copy_from_slice(&actions);
+        self.log_probs[start..end].copy_from_slice(&log_probs);
+        self.rewards[start..end].copy_from_slice(&rewards);
+        self.terminals[start..end].copy_from_slice(&terminals);
+        self.action_masks[start * action_mask_width..end * action_mask_width]
+            .copy_from_slice(&action_masks);
+        self.old_states[start * old_state_width..end * old_state_width]
+            .copy_from_slice(&old_states);
+        if let Some(ns) = trunc_next_state {
+            debug_assert_eq!(ns.len(), state_width);
+            self.trunc_next_states.extend(ns);
+        }
+        self.rows_written = end;
+    }
+}
+
 impl Memory {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -392,6 +523,74 @@ impl Memory {
         self.actions.is_empty()
     }
 
+    /// Append one pool's truncation tail, preserving pool order at the join.
+    pub fn append_trunc_next_states(&mut self, states: Vec<f32>) {
+        self.trunc_next_states.extend(states);
+    }
+
+    /// Length all per-row buffers to exactly `rows`, filling with defaults.
+    /// Call after reserving: no realloc happens, only the fill writes.
+    /// Widths must already be set (they persist across [`Memory::clear`]).
+    pub fn resize_full(&mut self, rows: usize) {
+        self.states.resize(rows * self.state_width, 0.0);
+        self.actions.resize(rows, 0);
+        self.log_probs.resize(rows, 0.0);
+        self.rewards.resize(rows, 0.0);
+        self.terminals.resize(rows, TerminalState::None);
+        self.action_masks.resize(rows * self.action_mask_width, 0);
+        self.old_states.resize(rows * self.old_state_width, 0.0);
+    }
+
+    /// Split exclusive row ranges for `shares` (prefix sums, pool order).
+    /// The memory must already hold full length (see [`Memory::resize_full`])
+    /// with widths set. The sparse truncation tail is not split: each
+    /// shard keeps its own and the join concatenates them in pool order.
+    pub fn shard_mut(&mut self, shares: &[usize]) -> Vec<MemoryShard<'_>> {
+        let state_width = self.state_width;
+        let mask_width = self.action_mask_width;
+        let old_width = self.old_state_width;
+        let mut states = self.states.as_mut_slice();
+        let mut actions = self.actions.as_mut_slice();
+        let mut log_probs = self.log_probs.as_mut_slice();
+        let mut rewards = self.rewards.as_mut_slice();
+        let mut terminals = self.terminals.as_mut_slice();
+        let mut masks = self.action_masks.as_mut_slice();
+        let mut old = self.old_states.as_mut_slice();
+        let mut shards = Vec::with_capacity(shares.len());
+        for &share in shares {
+            let (s_head, s_tail) = states.split_at_mut(share * state_width);
+            states = s_tail;
+            let (a_head, a_tail) = actions.split_at_mut(share);
+            actions = a_tail;
+            let (l_head, l_tail) = log_probs.split_at_mut(share);
+            log_probs = l_tail;
+            let (r_head, r_tail) = rewards.split_at_mut(share);
+            rewards = r_tail;
+            let (t_head, t_tail) = terminals.split_at_mut(share);
+            terminals = t_tail;
+            let (m_head, m_tail) = masks.split_at_mut(share * mask_width);
+            masks = m_tail;
+            let (o_head, o_tail) = old.split_at_mut(share * old_width);
+            old = o_tail;
+            shards.push(MemoryShard {
+                states: s_head,
+                actions: a_head,
+                log_probs: l_head,
+                rewards: r_head,
+                terminals: t_head,
+                action_masks: m_head,
+                old_states: o_head,
+                trunc_next_states: Vec::new(),
+                state_width,
+                action_mask_width: mask_width,
+                old_state_width: old_width,
+                rows_written: 0,
+                capacity_rows: share,
+            });
+        }
+        shards
+    }
+
     /// Reserve steady-state capacity for a `steps`-row rollout. Call once
     /// per collection, after creation or `clear`: growth reallocs on
     /// 800MB state buffers cost more than the reservation wastes. Widths
@@ -512,6 +711,77 @@ mod regression_tests {
             let back: Vec<f32> = masks.into_data().to_vec::<f32>().unwrap();
             assert_eq!(back, vec![1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]);
         }
+    }
+
+    #[test]
+    fn shard_mut_writes_exclusive_row_ranges_in_order() {
+        // Two pools claim into one pre-sized memory: rows must land in
+        // positional order with no gaps, and truncation tails must stay
+        // separable for pool-order concatenation at the join.
+        let mut memory = Memory::with_capacity(4);
+        memory.push_player(
+            vec![0.0],
+            1,
+            vec![0],
+            vec![0.0],
+            vec![0.0],
+            vec![TerminalState::None],
+            vec![1u8],
+            1,
+            Vec::new(),
+            0,
+            None,
+        );
+        memory.clear();
+        memory.reserve_rollout(4, 1, 1);
+        memory.resize_full(4);
+
+        let mut shards = memory.shard_mut(&[1, 3]);
+        shards[1].push_player(
+            vec![10.0, 20.0, 30.0],
+            1,
+            vec![1, 2, 3],
+            vec![0.0; 3],
+            vec![0.0; 3],
+            vec![TerminalState::None; 3],
+            vec![0u8; 3],
+            1,
+            Vec::new(),
+            0,
+            Some(vec![99.0]),
+        );
+        shards[0].push_player(
+            vec![7.0],
+            1,
+            vec![0],
+            vec![0.0],
+            vec![0.0],
+            vec![TerminalState::Normal],
+            vec![1u8],
+            1,
+            Vec::new(),
+            0,
+            None,
+        );
+        assert_eq!(shards[0].rows_written(), 1);
+        assert_eq!(shards[1].rows_written(), 3);
+        let tail = shards[1].take_trunc_next_states();
+        drop(shards);
+
+        assert_eq!(memory.states(), &[7.0, 10.0, 20.0, 30.0]);
+        assert_eq!(memory.actions(), &[0, 1, 2, 3]);
+        assert_eq!(
+            memory.terminals(),
+            &[
+                TerminalState::Normal,
+                TerminalState::None,
+                TerminalState::None,
+                TerminalState::None
+            ]
+        );
+        assert_eq!(tail, vec![99.0]);
+        memory.append_trunc_next_states(tail);
+        assert_eq!(memory.trunc_next_states(), &[99.0]);
     }
 
     #[test]

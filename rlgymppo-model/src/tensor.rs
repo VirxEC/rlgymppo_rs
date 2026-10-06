@@ -141,6 +141,29 @@ pub(crate) fn sampled_actions_to_vec<B: Backend>(
     )
 }
 
+/// Like [`sampled_actions_to_vec`], but also downloads critic values computed
+/// from the same shared features. The collector stores these for GAE so the
+/// learner never recomputes them.
+pub(crate) fn sampled_actions_with_values_to_vec<B: Backend>(
+    sampled: SampledActions<B>,
+    values: Tensor<B, 2>,
+) -> (Vec<usize>, Vec<f32>, Vec<f32>) {
+    let transaction = Transaction::default()
+        .register(sampled.log_probs)
+        .register(sampled.actions)
+        .register(values)
+        .execute();
+
+    (
+        transaction[1]
+            .iter::<B::IntElem>()
+            .map(|value| value.to_usize())
+            .collect(),
+        transaction[0].to_vec().unwrap(),
+        transaction[2].to_vec().unwrap(),
+    )
+}
+
 pub(crate) fn sample_actions_from_logits<B: Backend>(
     logits: Tensor<B, 2>,
     device: &B::Device,

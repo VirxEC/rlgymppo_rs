@@ -5,9 +5,10 @@ use burn::tensor::activation::{log_softmax, relu, softmax};
 
 use crate::tensor::{
     SampledActions, argmax_actions, sample_actions_from_logits, sample_actions_from_logits_tensor,
-    sampled_actions_to_vec, to_mask_tensor_2d, to_mask_tensor_2d_flat, to_mask_tensor_2d_indexed,
-    to_mask_tensor_2d_indexed_flat, to_state_tensor_2d, to_state_tensor_2d_flat,
-    to_state_tensor_2d_indexed, to_state_tensor_2d_indexed_flat,
+    sampled_actions_to_vec, sampled_actions_with_values_to_vec, to_mask_tensor_2d,
+    to_mask_tensor_2d_flat, to_mask_tensor_2d_indexed, to_mask_tensor_2d_indexed_flat,
+    to_state_tensor_2d, to_state_tensor_2d_flat, to_state_tensor_2d_indexed,
+    to_state_tensor_2d_indexed_flat,
 };
 
 pub struct PPOOutput<B: Backend> {
@@ -218,6 +219,20 @@ impl<B: Backend> PendingActions<B> {
     }
 }
 
+/// Device-resident actor output plus critic values computed from the same
+/// shared features. The collector stores the values for GAE so the learner
+/// never runs the shared head and critic a second time for them.
+pub struct PendingActionsWithValues<B: Backend> {
+    sampled: SampledActions<B>,
+    values: Tensor<B, 2>,
+}
+
+impl<B: Backend> PendingActionsWithValues<B> {
+    pub fn wait(self) -> (Vec<usize>, Vec<f32>, Vec<f32>) {
+        sampled_actions_with_values_to_vec(self.sampled, self.values)
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct Actic<B: Backend> {
     /// Optional feature extractor shared between the actor and critic.
@@ -392,6 +407,71 @@ impl<B: Backend> Actic<B> {
         }
     }
 
+    /// Like [`Self::submit_react_flat`], but also runs the critic on the same
+    /// shared features and retains the values. The collector stores them for
+    /// GAE so the learner never recomputes them.
+    pub fn submit_react_flat_with_values(
+        &self,
+        state: &[f32],
+        rows: usize,
+        state_width: usize,
+        masks: &[bool],
+        mask_width: usize,
+        device: &B::Device,
+    ) -> PendingActionsWithValues<B> {
+        let input = to_state_tensor_2d_flat(state, rows, state_width, device);
+        let features = self.apply_shared_head(input);
+        let values = self.critic.forward(features.clone());
+        let mask_tensor =
+            (mask_width > 0).then(|| to_mask_tensor_2d_flat(masks, rows, mask_width, device));
+        PendingActionsWithValues {
+            sampled: sample_actions_from_logits_tensor(
+                self.actor.masked_logits(features, mask_tensor),
+                device,
+            ),
+            values,
+        }
+    }
+
+    /// Like [`Self::submit_react_indexed_flat`], but also runs the critic on
+    /// the same shared features and retains the values.
+    pub fn submit_react_indexed_flat_with_values(
+        &self,
+        state: &[f32],
+        state_width: usize,
+        masks: &[bool],
+        mask_width: usize,
+        indices: &[usize],
+        device: &B::Device,
+    ) -> PendingActionsWithValues<B> {
+        let input = to_state_tensor_2d_indexed_flat(state, state_width, indices, device);
+        let features = self.apply_shared_head(input);
+        let values = self.critic.forward(features.clone());
+        let mask_tensor = (mask_width > 0)
+            .then(|| to_mask_tensor_2d_indexed_flat(masks, mask_width, indices, device));
+        PendingActionsWithValues {
+            sampled: sample_actions_from_logits_tensor(
+                self.actor.masked_logits(features, mask_tensor),
+                device,
+            ),
+            values,
+        }
+    }
+
+    /// Synchronous stochastic inference plus critic values for a flat batch.
+    pub fn react_flat_with_values(
+        &self,
+        state: &[f32],
+        rows: usize,
+        state_width: usize,
+        masks: &[bool],
+        mask_width: usize,
+        device: &B::Device,
+    ) -> (Vec<usize>, Vec<f32>, Vec<f32>) {
+        self.submit_react_flat_with_values(state, rows, state_width, masks, mask_width, device)
+            .wait()
+    }
+
     /// Synchronous stochastic inference for a flat, pre-sized obs batch.
     pub fn react_flat(
         &self,
@@ -430,5 +510,44 @@ impl<B: Backend> Actic<B> {
         let mask_tensor =
             (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
         argmax_actions(self.actor.masked_logits(features, mask_tensor))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::backend::Flex;
+
+    use super::*;
+    use crate::tensor::to_state_tensor_2d_flat;
+
+    /// Values returned alongside sampled actions must equal a direct critic
+    /// forward over the same weights: the collector stores these for GAE, so
+    /// any divergence would silently bias advantages.
+    #[test]
+    fn react_flat_with_values_matches_direct_critic() {
+        let device = Default::default();
+        let obs = 8;
+        let n_actions = 5;
+        let rows = 32;
+        let net = Actic::<Flex>::new(obs, n_actions, vec![16], vec![16], &[16], &device, None);
+
+        let states: Vec<f32> = (0..rows * obs)
+            .map(|i| ((i % 7) as f32) / 7.0 - 0.5)
+            .collect();
+        let masks = vec![true; rows * n_actions];
+        let (_, _, values) =
+            net.react_flat_with_values(&states, rows, obs, &masks, n_actions, &device);
+
+        let input = to_state_tensor_2d_flat(&states, rows, obs, &device);
+        let features = net.apply_shared_head(input);
+        let expected = net
+            .critic
+            .forward(features)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        assert_eq!(values.len(), rows);
+        assert_eq!(values, expected);
     }
 }

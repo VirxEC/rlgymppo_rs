@@ -1,10 +1,10 @@
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use burn::optim::{GradientsAccumulator, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{DType, Transaction};
+use burn::tensor::{DType, FloatDType, Transaction};
 use rlgymppo_model::Policy;
 use rlgymppo_utils::Report;
 
@@ -12,7 +12,7 @@ use super::{flatten_net, l2_diff};
 use crate::NormSelection;
 use crate::agent::Ppo;
 use crate::agent::model::{Actic, Net};
-use crate::base::{Memory, get_action_masks_batch_range, get_states_batch_range};
+use crate::base::{Memory, get_states_batch_range};
 
 /// What the teacher (old, larger) policy is: its architecture and where its
 /// checkpoints live. Passed to `Learner::transfer_learn` alongside a
@@ -94,7 +94,7 @@ impl Default for TransferLearnConfig {
             lr: 3e-4,
             batch_size: 50_000,
             mini_batch_size: 10_000,
-            epochs: 5,
+            epochs: 2,
             use_kl_div: false,
             loss_scale: 500.0,
             loss_exponent: 1.0,
@@ -132,6 +132,12 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     /// the student's actor and shared head to match them. The critic and its
     /// optimizer are untouched.
     ///
+    /// States upload once as `f16` and stay resident on the GPU (same as PPO
+    /// training): teacher inference and every distillation epoch slice them
+    /// with `narrow` and upcast on the device. Masks upload once as `u8` and
+    /// upcast per slice. Chunks are contiguous, so no index build, no
+    /// `select` gather, and no re-upload per epoch.
+    ///
     /// Returns the updated network and the number of timesteps consumed.
     pub fn transfer_learn(
         &mut self,
@@ -144,7 +150,15 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let n = memory.len();
         assert!(n > 0, "Cannot distill from an empty memory");
         tl.validate();
+        memory
+            .validate()
+            .unwrap_or_else(|error| panic!("Invalid learner memory: {error}"));
         let mb = tl.mini_batch_size;
+
+        // Snapshot parameters before training for update-magnitude computation.
+        let snapshot_start = Instant::now();
+        let actor_params_before = flatten_net(&net.actor);
+        metrics["Transfer/param snapshot time"] = snapshot_start.elapsed().as_secs_f64().into();
 
         // Teacher observations: the old (teacher) obs builder's states when one
         // is configured (different observation space), otherwise the student's
@@ -155,47 +169,97 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             (memory.states(), memory.state_width())
         };
 
-        // ── Teacher probabilities (no gradients) ──────────────────────
-        // Computed once per batch and reused across all epochs.
-        let teacher_start = Instant::now();
-        let mut teacher_chunks = Vec::with_capacity(n.div_ceil(mb));
-        let mut teacher_entropy_sum = 0.0f64;
-        for start in (0..n).step_by(mb) {
-            let end = (start + mb).min(n);
-            let chunk_len = end - start;
-            let weight = chunk_len as f64 / n as f64;
-            let states = get_states_batch_range::<B::InnerBackend>(
-                teacher_states,
-                teacher_width,
-                start,
-                end,
+        // ── Resident upload (timed as staging) ────────────────────────
+        // One `f32` to `f16` conversion plus one upload per state buffer, one
+        // `u8` upload for the masks. Everything below slices these with
+        // `narrow`: no per-chunk and no per-epoch re-upload.
+        let resident_start = Instant::now();
+        let resident_teacher = get_states_batch_range::<B::InnerBackend>(
+            teacher_states,
+            teacher_width,
+            0,
+            n,
+            &self.device,
+        );
+        // Same obs space: share the teacher storage for the student (no copy,
+        // half the VRAM). Different spaces: upload the student buffer too.
+        let resident_student_inner = if memory.old_state_width() > 0 {
+            get_states_batch_range::<B::InnerBackend>(
+                memory.states(),
+                memory.state_width(),
+                0,
+                n,
                 &self.device,
             )
-            .cast(DType::F32);
-            let masks = get_action_masks_batch_range::<B::InnerBackend>(
-                memory.action_masks(),
-                memory.action_mask_width(),
-                start,
-                end,
+        } else {
+            resident_teacher.clone()
+        };
+        let mask_width = memory.action_mask_width();
+        let resident_masks_inner = if memory.action_masks().is_empty() {
+            None
+        } else {
+            let masks: Vec<u8> = memory.action_masks().to_vec();
+            Some(Tensor::<B::InnerBackend, 2, Int>::from_data(
+                TensorData::new(masks, [n, mask_width]),
                 &self.device,
-            );
-            let probs = teacher.infer(states, Some(masks));
+            ))
+        };
+        // Wrap once for the autodiff backend (no copy: the training graph
+        // references the same device storage). Chunks narrow these views.
+        let resident_student = Tensor::<B, 2>::from_inner(resident_student_inner);
+        let resident_masks = resident_masks_inner
+            .as_ref()
+            .map(|masks| Tensor::<B, 2, Int>::from_inner(masks.clone()));
+        metrics["Transfer/batch staging time"] = resident_start.elapsed().as_secs_f64().into();
+
+        // ── Teacher probabilities (no gradients) ──────────────────────
+        // Computed once per batch and reused across all epochs. Entropy
+        // accumulates on the GPU with one readback for the whole rollout
+        // instead of one sync per chunk.
+        let teacher_start = Instant::now();
+        let mut teacher_chunks = Vec::with_capacity(n.div_ceil(mb));
+        let mut teacher_entropy: Option<Tensor<B::InnerBackend, 1>> = None;
+        for start in (0..n).step_by(mb) {
+            let chunk_len = (start + mb).min(n) - start;
+            let weight = chunk_len as f32 / n as f32;
+            let states = resident_teacher
+                .clone()
+                .narrow(0, start, chunk_len)
+                .cast(DType::F32);
+            let masks = resident_masks_inner.as_ref().map(|masks| {
+                masks
+                    .clone()
+                    .narrow(0, start, chunk_len)
+                    .cast(FloatDType::F32)
+            });
+            let probs = teacher.infer(states, masks);
             let chunk_entropy = -(probs.clone() * probs.clone().log()).sum_dim(1).mean();
-            teacher_entropy_sum +=
-                chunk_entropy.into_data().to_vec::<f32>().unwrap()[0] as f64 * weight;
+            let weighted = chunk_entropy * weight;
+            teacher_entropy = Some(match teacher_entropy {
+                None => weighted,
+                Some(sum) => sum + weighted,
+            });
             teacher_chunks.push(probs);
         }
+        let teacher_entropy_sum = teacher_entropy.map_or(0.0, |entropy| {
+            Transaction::default().register(entropy).execute()[0]
+                .to_vec::<f32>()
+                .unwrap()[0] as f64
+        });
         metrics["Timing/teacher inference"] = teacher_start.elapsed().as_secs_f64().into();
         metrics["Transfer/teacher entropy"] = teacher_entropy_sum.into();
 
-        let actor_params_before = flatten_net(&net.actor);
         let mut actor_gradients = GradientsAccumulator::new();
         let mut head_gradients = GradientsAccumulator::new();
 
-        let mut loss_sum = 0.0f64;
-        let mut accuracy_sum = 0.0f64;
-        let mut entropy_sum = 0.0f64;
+        // First-epoch metrics accumulate on the GPU: one readback at the end
+        // instead of one sync per chunk.
+        let mut loss_acc: Option<Tensor<B, 1>> = None;
+        let mut accuracy_acc: Option<Tensor<B, 1>> = None;
+        let mut entropy_acc: Option<Tensor<B, 1>> = None;
 
+        let mut upload_time = Duration::ZERO;
+        let mut optim_time = Duration::ZERO;
         let training_start = Instant::now();
         for epoch in 0..tl.epochs {
             for (chunk_idx, teacher_chunk) in teacher_chunks.iter().enumerate() {
@@ -204,35 +268,37 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 let chunk_len = end - start;
                 let weight = chunk_len as f32 / n as f32;
 
-                let states = get_states_batch_range::<B>(
-                    memory.states(),
-                    memory.state_width(),
-                    start,
-                    end,
-                    &self.device,
-                )
-                .cast(DType::F32);
-                let masks = get_action_masks_batch_range::<B>(
-                    memory.action_masks(),
-                    memory.action_mask_width(),
-                    start,
-                    end,
-                    &self.device,
-                );
+                let upload_start = Instant::now();
+                let states = resident_student
+                    .clone()
+                    .narrow(0, start, chunk_len)
+                    .cast(DType::F32);
+                let masks = resident_masks.as_ref().map(|masks| {
+                    masks
+                        .clone()
+                        .narrow(0, start, chunk_len)
+                        .cast(FloatDType::F32)
+                });
+                upload_time += upload_start.elapsed();
 
                 let features = net.apply_shared_head(states);
-                let student_probs = net.actor.infer(features, Some(masks));
+                let student_probs = net.actor.infer(features, masks);
                 let teacher_probs = Tensor::<B, 2>::from_inner(teacher_chunk.clone());
 
                 // Match GigaLearn's distillation loss:
                 //   abs-diff or forward KL, per-sample, then mean * loss_scale.
-                let loss = if tl.use_kl_div {
+                // An exponent of 1 is a no-op, so skip the extra pow kernel.
+                let per_sample = if tl.use_kl_div {
                     (teacher_probs.clone() * (teacher_probs.clone() / student_probs.clone()).log())
                         .abs()
                 } else {
                     (teacher_probs.clone() - student_probs.clone()).abs()
                 };
-                let loss = loss.powf_scalar(tl.loss_exponent).mean() * tl.loss_scale;
+                let loss = if tl.loss_exponent == 1.0 {
+                    per_sample.mean() * tl.loss_scale
+                } else {
+                    per_sample.powf_scalar(tl.loss_exponent).mean() * tl.loss_scale
+                };
 
                 if epoch == 0 {
                     // First-epoch metrics, matching GigaLearn's reporting.
@@ -246,16 +312,21 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     let entropy = -(student_probs.clone() * student_probs.clone().log())
                         .sum_dim(1)
                         .mean();
-                    let [loss_data, acc_data, entropy_data] = Transaction::default()
-                        .register(loss.clone().detach())
-                        .register(matches)
-                        .register(entropy)
-                        .execute()
-                        .try_into()
-                        .expect("Correct amount of tensor data");
-                    loss_sum += loss_data.to_vec::<f32>().unwrap()[0] as f64 * weight as f64;
-                    accuracy_sum += acc_data.to_vec::<f32>().unwrap()[0] as f64 * weight as f64;
-                    entropy_sum += entropy_data.to_vec::<f32>().unwrap()[0] as f64 * weight as f64;
+                    let weighted_loss = loss.clone().detach() * weight;
+                    let weighted_acc = matches * weight;
+                    let weighted_entropy = entropy * weight;
+                    loss_acc = Some(match loss_acc {
+                        None => weighted_loss,
+                        Some(sum) => sum + weighted_loss,
+                    });
+                    accuracy_acc = Some(match accuracy_acc {
+                        None => weighted_acc,
+                        Some(sum) => sum + weighted_acc,
+                    });
+                    entropy_acc = Some(match entropy_acc {
+                        None => weighted_entropy,
+                        Some(sum) => sum + weighted_entropy,
+                    });
                 }
 
                 let mut grads = (loss * weight).backward();
@@ -269,6 +340,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             }
 
             // One optimizer step per epoch over the whole batch.
+            let optim_start = Instant::now();
             let lr: f64 = tl.lr.into();
             net.actor = self
                 .policy_optimizer
@@ -280,9 +352,27 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     head_gradients.grads(),
                 ));
             }
+            optim_time += optim_start.elapsed();
         }
 
+        // Single readback for all first-epoch metrics.
+        let [loss_sum, accuracy_sum, entropy_sum] = match (loss_acc, accuracy_acc, entropy_acc) {
+            (Some(loss), Some(acc), Some(entropy)) => Transaction::default()
+                .register(loss)
+                .register(acc)
+                .register(entropy)
+                .execute()
+                .try_into()
+                .expect("Correct amount of tensor data"),
+            _ => unreachable!("epochs > 0 always fills the metric accumulators"),
+        };
+        let loss_sum = loss_sum.to_vec::<f32>().unwrap()[0] as f64;
+        let accuracy_sum = accuracy_sum.to_vec::<f32>().unwrap()[0] as f64;
+        let entropy_sum = entropy_sum.to_vec::<f32>().unwrap()[0] as f64;
+
         metrics["Timing/distillation"] = training_start.elapsed().as_secs_f64().into();
+        metrics["Transfer/upload time"] = upload_time.as_secs_f64().into();
+        metrics["Transfer/optimizer step time"] = optim_time.as_secs_f64().into();
         metrics["Transfer/loss"] = loss_sum.into();
         metrics["Transfer/accuracy"] = accuracy_sum.into();
         metrics["Transfer/entropy"] = entropy_sum.into();

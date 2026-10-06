@@ -1,5 +1,5 @@
 use burn::prelude::*;
-use burn::tensor::{DType, FloatDType, f16};
+use burn::tensor::{DType, f16};
 use rayon::prelude::*;
 
 /// Terminal-state encoding.
@@ -40,22 +40,6 @@ pub fn get_states_batch_range<B: Backend>(
     let rows = end - start;
     let half = convert_states_to_f16(&data[start * width..end * width]);
     Tensor::from_data(TensorData::new(half, [rows, width]), (device, DType::F16))
-}
-
-/// Upload mask rows `[start, end)` as `u8` and upcast on the device: a
-/// quarter of the bytes cross the bus. Values are exactly 0/1, so the
-/// upcast is bit-exact.
-pub fn get_action_masks_batch_range<B: Backend>(
-    data: &[u8],
-    width: usize,
-    start: usize,
-    end: usize,
-    device: &B::Device,
-) -> Tensor<B, 2> {
-    let rows = end - start;
-    let masks: Vec<u8> = data[start * width..end * width].to_vec();
-    Tensor::<B, 2, Int>::from_data(TensorData::new(masks, [rows, width]), device)
-        .cast(FloatDType::F32)
 }
 
 #[derive(Clone)]
@@ -657,6 +641,7 @@ mod regression_tests {
     #[cfg(all(test, feature = "flex"))]
     mod flex_gated {
         use burn::backend::Flex;
+        use burn::tensor::FloatDType;
 
         use super::*;
 
@@ -681,12 +666,15 @@ mod regression_tests {
         }
 
         #[test]
-        fn u8_mask_upload_cast_is_exact() {
-            // Masks upload as `u8` and upcast on the device. Values are
-            // exactly 0/1, so the readback must match bit-exactly.
+        fn u8_mask_upload_narrow_cast_is_exact() {
+            // Masks upload as `u8` once and slices upcast on the device.
+            // Values are exactly 0/1, so the readback must match bit-exactly.
+            // Mirrors the transfer-learning resident mask plumbing.
             let device = Default::default();
             let data: Vec<u8> = vec![1, 0, 1, 1, 0, 0, 1, 0];
-            let masks = get_action_masks_batch_range::<Flex>(&data, 4, 0, 2, &device);
+            let masks = Tensor::<Flex, 2, Int>::from_data(TensorData::new(data, [2, 4]), &device)
+                .narrow(0, 0, 2)
+                .cast(FloatDType::F32);
             let back: Vec<f32> = masks.into_data().to_vec::<f32>().unwrap();
             assert_eq!(back, vec![1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]);
         }

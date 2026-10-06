@@ -1,4 +1,6 @@
 use burn::prelude::*;
+use burn::tensor::{DType, f16};
+use rayon::prelude::*;
 
 /// Terminal-state encoding.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -13,6 +15,21 @@ pub fn get_batch_1d<T: Copy>(data: &[T], indices: &[usize]) -> Vec<T> {
     indices.iter().map(|i| data[*i]).collect::<Vec<_>>()
 }
 
+/// Convert one state row range from `f32` to `f16`. Runs on all CPU cores.
+/// Values round to nearest; inputs are normalized observations that fit
+/// easily (magnitude far below 65504, precision around 3 decimal digits).
+fn convert_states_to_f16(data: &[f32]) -> Vec<f16> {
+    data.par_iter().map(|&x| f16::from_f32(x)).collect()
+}
+
+/// Upload state rows `[start, end)` as device `f16`: half the bytes cross
+/// the bus and half the VRAM stays resident.
+///
+/// The returned tensor holds half-precision storage despite its `Tensor<B,
+/// 2>` type. Slice it with `narrow` or `select` first, then upcast the
+/// slice with `.cast(DType::F32)` before running the model. Never feed it
+/// to the model directly: mixed-precision matmuls fail on dtype mismatch.
+/// See [`convert_states_to_f16`] for the precision bounds.
 pub fn get_states_batch_range<B: Backend>(
     data: &[f32],
     width: usize,
@@ -20,15 +37,9 @@ pub fn get_states_batch_range<B: Backend>(
     end: usize,
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let start_offset = start * width;
-    let end_offset = end * width;
-    Tensor::from_data(
-        TensorData::new(
-            data[start_offset..end_offset].to_vec(),
-            [end - start, width],
-        ),
-        device,
-    )
+    let rows = end - start;
+    let half = convert_states_to_f16(&data[start * width..end * width]);
+    Tensor::from_data(TensorData::new(half, [rows, width]), (device, DType::F16))
 }
 
 /// Convert mask rows `[start, end)` to `f32` with one pass and no per-row
@@ -432,6 +443,53 @@ mod regression_tests {
             0,
             (terminal == TerminalState::Truncated).then(|| vec![(start + count) as f32]),
         );
+    }
+
+    #[test]
+    fn f16_conversion_stays_within_half_ulp_bounds() {
+        // Normalized-obs magnitudes: exact for small integers, tiny relative
+        // error elsewhere. Guards against a wrong conversion routine.
+        let values = [
+            0.0, 1.0, -1.0, 0.5, 0.12, 100.0, -5120.0, 2044.0, 0.001, 123.456,
+        ];
+        let half = convert_states_to_f16(&values);
+        assert_eq!(half.len(), values.len());
+        for (&original, &converted) in values.iter().zip(half.iter()) {
+            let back = converted.to_f32();
+            if original == 0.0 {
+                assert_eq!(back, 0.0);
+            } else {
+                let rel_err = ((back - original) / original).abs();
+                assert!(rel_err < 0.001, "{original} -> {back}");
+            }
+        }
+    }
+
+    #[cfg(all(test, feature = "flex"))]
+    mod flex_gated {
+        use burn::backend::Flex;
+
+        use super::*;
+
+        #[test]
+        fn f16_upload_narrow_cast_roundtrip() {
+            // Exercises the learner's exact plumbing: `f16` device storage,
+            // `narrow` a slice, upcast, read back. Values must match within
+            // half precision.
+            let device = Default::default();
+            let data: Vec<f32> = (0..32).map(|i| i as f32 * 0.5).collect();
+            let states = get_states_batch_range::<Flex>(&data, 8, 0, 4, &device);
+            let back: Vec<f32> = states
+                .narrow(0, 1, 2)
+                .cast(DType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert_eq!(back.len(), 16);
+            for (actual, expected) in back.iter().zip(data[8..24].iter()) {
+                assert!((actual - expected).abs() < 0.01, "{actual} vs {expected}");
+            }
+        }
     }
 
     #[test]

@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use burn::optim::{GradientsAccumulator, GradientsParams, Optimizer};
 use burn::prelude::*;
-use burn::tensor::Transaction;
 use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::{DType, Transaction};
 use rlgymppo_model::Policy;
 use rlgymppo_utils::Report;
 
@@ -170,7 +170,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 start,
                 end,
                 &self.device,
-            );
+            )
+            .cast(DType::F32);
             let masks = get_action_masks_batch_range::<B::InnerBackend>(
                 memory.action_masks(),
                 memory.action_mask_width(),
@@ -209,7 +210,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     start,
                     end,
                     &self.device,
-                );
+                )
+                .cast(DType::F32);
                 let masks = get_action_masks_batch_range::<B>(
                     memory.action_masks(),
                     memory.action_mask_width(),

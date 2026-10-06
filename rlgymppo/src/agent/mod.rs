@@ -15,8 +15,8 @@ use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamW, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError};
-use burn::tensor::Transaction;
 use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::{DType, Transaction};
 use rand::Rng;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
@@ -190,10 +190,12 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let critic_params_before = flatten_net(&net.critic);
         metrics["PPO/param snapshot time"] = snapshot_start.elapsed().as_secs_f64().into();
 
-        // Upload ordered states once and keep them resident on the GPU.
-        // Value inference slices them with `narrow`, training gathers
-        // batches with `select`. States cross the bus a single time instead
-        // of once per phase. Timed as staging work.
+        // Upload ordered states once as `f16` and keep them resident on the
+        // GPU. Value inference slices them with `narrow`, training gathers
+        // batches with `select`; each slice is upcast to `f32` on the GPU
+        // before running the model. States cross the bus a single time
+        // instead of once per phase, at half the bytes. Timed as staging
+        // work (including the parallel `f32` to `f16` conversion).
         let resident_start = Instant::now();
         let resident_states = get_states_batch_range::<B::InnerBackend>(
             memory.states(),
@@ -215,7 +217,10 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             let mut values = Vec::with_capacity(n);
             for start in (0..n).step_by(mb) {
                 let end = (start + mb).min(n);
-                let states = resident_states.clone().narrow(0, start, end - start);
+                let states = resident_states
+                    .clone()
+                    .narrow(0, start, end - start)
+                    .cast(DType::F32);
                 let features = nodiff_net.apply_shared_head(states);
                 let batch_vals = nodiff_net.critic.forward(features);
                 values.extend_from_slice(batch_vals.into_data().as_slice().unwrap());
@@ -265,7 +270,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                         start,
                         end,
                         &self.device,
-                    );
+                    )
+                    .cast(DType::F32);
 
                     let features = nodiff_net.apply_shared_head(batch);
                     let batch_vals = nodiff_net
@@ -408,7 +414,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     ),
                     &self.device,
                 );
-                let states = resident_b.clone().select(0, index);
+                let states = resident_b.clone().select(0, index).cast(DType::F32);
                 let batch = GpuBatch::from_staged(states, staged, &self.device);
                 upload_time += upload_start.elapsed();
                 self.train_gpu_batch(&mut net, &batch, &mut metric_totals);

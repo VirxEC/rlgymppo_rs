@@ -1,19 +1,7 @@
 use burn::prelude::*;
 use burn::tensor::activation::log_softmax;
 use burn::tensor::cast::ToElement;
-use burn::tensor::{Distribution, FloatDType, Transaction};
-
-/// Upload a mask buffer as `u8` and upcast on the device: a quarter of the
-/// bytes cross the bus. Values are exactly 0/1, so the upcast is bit-exact.
-fn mask_tensor_from_u8<B: Backend>(
-    data: Vec<u8>,
-    rows: usize,
-    columns: usize,
-    device: &B::Device,
-) -> Tensor<B, 2> {
-    Tensor::<B, 2, Int>::from_data(TensorData::new(data, [rows, columns]), device)
-        .cast(FloatDType::F32)
-}
+use burn::tensor::{Distribution, Transaction};
 
 pub(crate) fn to_mask_tensor_2d<B: Backend>(
     masks: &[Vec<bool>],
@@ -83,8 +71,11 @@ pub(crate) fn to_mask_tensor_2d_flat<B: Backend>(
     columns: usize,
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let data: Vec<u8> = masks.iter().map(|&value| u8::from(value)).collect();
-    mask_tensor_from_u8(data, rows, columns, device)
+    // NOTE: stays `f32` on purpose. The `u8` + device-cast variant saves
+    // 64KB per submit but adds a kernel launch on this launch-bound path
+    // (measured net negative). The learner-side batch uploads stay `u8`.
+    let data: Vec<f32> = masks.iter().map(|&value| f32::from(value)).collect();
+    Tensor::from_data(TensorData::new(data, [rows, columns]), device)
 }
 
 pub(crate) fn to_state_tensor_2d_indexed_flat<B: Backend>(
@@ -106,15 +97,15 @@ pub(crate) fn to_mask_tensor_2d_indexed_flat<B: Backend>(
     indices: &[usize],
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let mut data: Vec<u8> = Vec::with_capacity(indices.len() * columns);
+    let mut data: Vec<f32> = Vec::with_capacity(indices.len() * columns);
     for &index in indices {
         data.extend(
             masks[index * columns..(index + 1) * columns]
                 .iter()
-                .map(|&value| u8::from(value)),
+                .map(|&value| f32::from(value)),
         );
     }
-    mask_tensor_from_u8(data, indices.len(), columns, device)
+    Tensor::from_data(TensorData::new(data, [indices.len(), columns]), device)
 }
 
 pub(crate) struct SampledActions<B: Backend> {

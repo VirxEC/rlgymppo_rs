@@ -183,11 +183,14 @@ impl Memory {
     }
 
     pub fn merge(&mut self, other: Memory) {
+        // No `..` catch-all: listing every field forces a compile error when
+        // a field is added, so merges can never silently drop a buffer again.
         let Memory {
             states,
             state_width,
             actions,
             log_probs,
+            values,
             rewards,
             terminals,
             trunc_next_states,
@@ -195,7 +198,7 @@ impl Memory {
             action_mask_width,
             old_states,
             old_state_width,
-            ..
+            baseline_steps: _,
         } = other;
 
         if !actions.is_empty() {
@@ -204,6 +207,7 @@ impl Memory {
         self.states.extend(states);
         self.actions.extend(actions);
         self.log_probs.extend(log_probs);
+        self.values.extend(values);
         self.rewards.extend(rewards);
         self.terminals.extend(terminals);
         self.trunc_next_states.extend(trunc_next_states);
@@ -237,7 +241,7 @@ impl Memory {
             action_mask_width,
             old_states,
             old_state_width,
-            ..
+            baseline_steps: _,
         } = other;
         let mut terminals = terminals;
         let truncations = terminals
@@ -464,6 +468,53 @@ mod regression_tests {
 
         assert_eq!(memory.len(), 5);
         assert_eq!(memory.actions(), &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn regression_merge_preserves_every_buffer() {
+        // Guards the multi-pool path: `ThreadSim` merges one memory per pool,
+        // and a dropped buffer (e.g. via a `..` catch-all) surfaces only at
+        // learner validation time. Distinct values per row catch silent drops.
+        let mut first = Memory::with_capacity(2);
+        first.push_player(
+            vec![1.0, 2.0],
+            1,
+            vec![0, 1],
+            vec![0.1, 0.2],
+            vec![10.0, 20.0],
+            vec![1.0, 2.0],
+            vec![TerminalState::None, TerminalState::Normal],
+            vec![1u8, 1u8],
+            1,
+            Vec::new(),
+            0,
+            None,
+        );
+        let mut second = Memory::with_capacity(2);
+        second.push_player(
+            vec![3.0],
+            1,
+            vec![2],
+            vec![0.3],
+            vec![30.0],
+            vec![3.0],
+            vec![TerminalState::Normal],
+            vec![1u8],
+            1,
+            Vec::new(),
+            0,
+            None,
+        );
+
+        first.merge(second);
+
+        assert!(first.validate().is_ok());
+        assert_eq!(first.len(), 3);
+        assert_eq!(first.states(), &[1.0, 2.0, 3.0]);
+        assert_eq!(first.actions(), &[0, 1, 2]);
+        assert_eq!(first.log_probs(), &[0.1, 0.2, 0.3]);
+        assert_eq!(first.values(), &[10.0, 20.0, 30.0]);
+        assert_eq!(first.rewards(), &[1.0, 2.0, 3.0]);
     }
 
     #[test]

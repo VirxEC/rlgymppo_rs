@@ -761,6 +761,7 @@ where
         };
 
         let mut memory = Memory::with_capacity(memory_capacity_hint);
+        memory.reserve_rollout(memory_capacity_hint, self.state_width, self.mask_width);
         let mut completed_for_update = false;
 
         while remaining_steps.load(Ordering::Relaxed) > 0 {

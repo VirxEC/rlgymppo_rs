@@ -140,6 +140,12 @@ where
         budget: usize,
     ) -> (&Memory, Report) {
         self.memory.clear();
+        // Re-reserve the steady-state rollout capacity that `clear` shrinks
+        // away: without this the merge regrows 0 to 3.2GB every iteration.
+        // Widths persist across `clear` (zero on the first run: no-op).
+        let state_width = self.memory.state_width();
+        let mask_width = self.memory.action_mask_width();
+        self.memory.reserve_rollout(budget, state_width, mask_width);
         self.metrics.clear();
 
         let shares = split_budget(budget, self.num_pools);

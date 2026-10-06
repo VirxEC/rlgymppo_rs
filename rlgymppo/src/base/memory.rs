@@ -528,21 +528,15 @@ impl Memory {
         self.trunc_next_states.extend(states);
     }
 
-    /// Length all per-row buffers to exactly `rows`, filling with defaults.
-    /// Call after reserving: no realloc happens, only the fill writes.
-    /// Widths must already be set (they persist across [`Memory::clear`]).
-    pub fn resize_full(&mut self, rows: usize) {
-        self.states.resize(rows * self.state_width, 0.0);
-        self.actions.resize(rows, 0);
-        self.log_probs.resize(rows, 0.0);
-        self.rewards.resize(rows, 0.0);
-        self.terminals.resize(rows, TerminalState::None);
-        self.action_masks.resize(rows * self.action_mask_width, 0);
-        self.old_states.resize(rows * self.old_state_width, 0.0);
+    /// Reset the sparse truncation tail, retaining capacity. The per-row
+    /// buffers are left at full length: the exact-budget path overwrites
+    /// every row in place (asserted full at the join).
+    pub fn clear_trunc_next_states(&mut self) {
+        self.trunc_next_states.clear();
     }
 
     /// Split exclusive row ranges for `shares` (prefix sums, pool order).
-    /// The memory must already hold full length (see [`Memory::resize_full`])
+    /// The memory must already hold full length at the sum of `shares`
     /// with widths set. The sparse truncation tail is not split: each
     /// shard keeps its own and the join concatenates them in pool order.
     pub fn shard_mut(&mut self, shares: &[usize]) -> Vec<MemoryShard<'_>> {
@@ -718,23 +712,22 @@ mod regression_tests {
         // Two pools claim into one pre-sized memory: rows must land in
         // positional order with no gaps, and truncation tails must stay
         // separable for pool-order concatenation at the join.
+        // Steady state: full-length buffers, widths set, no clear.
         let mut memory = Memory::with_capacity(4);
         memory.push_player(
-            vec![0.0],
+            vec![0.0; 4],
             1,
-            vec![0],
-            vec![0.0],
-            vec![0.0],
-            vec![TerminalState::None],
-            vec![1u8],
+            vec![0; 4],
+            vec![0.0; 4],
+            vec![0.0; 4],
+            vec![TerminalState::None; 4],
+            vec![1u8; 4],
             1,
             Vec::new(),
             0,
             None,
         );
-        memory.clear();
-        memory.reserve_rollout(4, 1, 1);
-        memory.resize_full(4);
+        assert_eq!(memory.len(), 4);
 
         let mut shards = memory.shard_mut(&[1, 3]);
         shards[1].push_player(

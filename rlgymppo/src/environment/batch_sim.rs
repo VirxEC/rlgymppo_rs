@@ -729,6 +729,7 @@ where
     {
         let mut memory = Memory::with_capacity(memory_capacity_hint);
         memory.reserve_rollout(memory_capacity_hint, self.state_width, self.mask_width);
+        self.prologue();
         let report = self.run_inner(
             model,
             remaining_steps,
@@ -764,6 +765,7 @@ where
         TERM: Send,
         TRUNC: Send,
     {
+        self.prologue();
         self.run_inner(
             model,
             remaining_steps,
@@ -773,6 +775,31 @@ where
             pool,
             shard,
         )
+    }
+
+    /// Recompute trajectory baselines and shrink retired buffers.
+    fn prologue(&mut self) {
+        let baseline_steps = compute_trajectory_baseline_steps(
+            self.episode_length_ema,
+            self.episode_length_std_ema(),
+            self.trajectory_baseline_steps,
+            self.max_episode_length,
+        );
+        self.trajectory_baseline_steps = baseline_steps;
+        for trajectory in &mut self.player_trajs {
+            trajectory.set_baseline_steps(baseline_steps);
+        }
+        for (trajectory, _) in &mut self.overflow_trajs {
+            trajectory.set_baseline_steps(baseline_steps);
+        }
+
+        if self.complete_trajectories {
+            self.overflow_trajs.clear();
+        } else {
+            for trajectory in &mut self.player_trajs {
+                trajectory.shrink_to_baseline();
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -799,28 +826,6 @@ where
 
         let mut total_bookkeeping_time = 0.0_f64;
         let pre_start = Instant::now();
-
-        let baseline_steps = compute_trajectory_baseline_steps(
-            self.episode_length_ema,
-            self.episode_length_std_ema(),
-            self.trajectory_baseline_steps,
-            self.max_episode_length,
-        );
-        self.trajectory_baseline_steps = baseline_steps;
-        for trajectory in &mut self.player_trajs {
-            trajectory.set_baseline_steps(baseline_steps);
-        }
-        for (trajectory, _) in &mut self.overflow_trajs {
-            trajectory.set_baseline_steps(baseline_steps);
-        }
-
-        if self.complete_trajectories {
-            self.overflow_trajs.clear();
-        } else {
-            for trajectory in &mut self.player_trajs {
-                trajectory.shrink_to_baseline();
-            }
-        }
 
         let player_is_tracked: Vec<bool> = if let Some(ot) = old_team {
             self.player_teams.iter().map(|&t| t != ot).collect()

@@ -143,13 +143,30 @@ where
         self_play: Option<(Actic<B>, usize)>,
         budget: usize,
     ) -> (&Memory, Report) {
-        self.memory.clear();
-        // Re-reserve the steady-state rollout capacity that `clear` shrinks
-        // away: without this the merge regrows 0 to 3.2GB every iteration.
-        // Widths persist across `clear` (zero on the first run: no-op).
-        let state_width = self.memory.state_width();
-        let mask_width = self.memory.action_mask_width();
-        self.memory.reserve_rollout(budget, state_width, mask_width);
+        // Exact-budget path: every pool fills exactly its share (no
+        // overbatching, no complete-trajectories overrun), the widths are
+        // known, and the memory already holds full length from the
+        // previous run — so every row is overwritten in place. No clear,
+        // no reserve, no memset: pages stay mapped and hot. Only the
+        // sparse truncation tail is reset (it appends fresh each run).
+        // Anything else (first run, budget change, exotic modes) takes
+        // the legacy merge path, which establishes full length.
+        let exact_shares = !self.overbatching
+            && !self.complete_trajectories
+            && self.memory.state_width() > 0
+            && self.memory.len() == budget;
+        if !exact_shares {
+            self.memory.clear();
+            // Re-reserve the steady-state rollout capacity that `clear`
+            // shrinks away: without this the merge regrows 0 to 3.2GB
+            // every iteration. Widths persist across `clear` (zero on the
+            // first run: no-op).
+            let state_width = self.memory.state_width();
+            let mask_width = self.memory.action_mask_width();
+            self.memory.reserve_rollout(budget, state_width, mask_width);
+        } else {
+            self.memory.clear_trunc_next_states();
+        }
         self.metrics.clear();
 
         let shares = split_budget(budget, self.num_pools);
@@ -165,7 +182,6 @@ where
             !self.overbatching && !self.complete_trajectories && self.memory.state_width() > 0;
         let mut pool_max_wall = 0.0f64;
         if exact_shares {
-            self.memory.resize_full(budget);
             let mut shards = self.memory.shard_mut(&shares);
             let reports = std::thread::scope(|scope| {
                 let handles: Vec<_> = self

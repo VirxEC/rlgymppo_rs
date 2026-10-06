@@ -72,10 +72,6 @@ pub struct PpoLearnerConfig {
     /// Sample reward metrics once every N steps (1 = every step).
     /// Set to 0 to disable sampling (track every step).
     pub reward_sample_interval: usize,
-    /// Maximum number of random reward-component samples to include
-    /// per metric report step (unused in the current Rust impl, kept
-    /// for API compatibility with GigaLearn).
-    pub max_reward_samples: usize,
 
     /// Maximum number of steps per episode before the trajectory is
     /// force-truncated (None = no limit).  When a player's trajectory
@@ -118,7 +114,6 @@ impl Default for PpoLearnerConfig {
             clip_grad: Some(GradientClippingConfig::Norm(0.5)),
             add_rewards_to_metrics: true,
             reward_sample_interval: 8,
-            max_reward_samples: 50,
             max_episode_length: Some(1800),
             retain_overflow_episodes: false,
         }

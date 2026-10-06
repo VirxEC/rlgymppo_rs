@@ -27,11 +27,6 @@ pub struct RewardSamplingConfig {
     /// Sample reward metrics once every N steps (1 = every step).
     /// 0 means always sample (every step).
     pub reward_sample_interval: usize,
-    /// Maximum number of random reward-component samples to include
-    /// per metric report step (unused in the current Rust impl, kept
-    /// for API compatibility with GigaLearn).
-    #[allow(dead_code)]
-    pub max_reward_samples: usize,
 }
 
 impl Default for RewardSamplingConfig {
@@ -39,7 +34,6 @@ impl Default for RewardSamplingConfig {
         Self {
             add_rewards_to_metrics: true,
             reward_sample_interval: 8,
-            max_reward_samples: 50,
         }
     }
 }

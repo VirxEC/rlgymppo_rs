@@ -807,7 +807,6 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         let reward_sampling = RewardSamplingConfig {
             add_rewards_to_metrics: self.ppo.add_rewards_to_metrics,
             reward_sample_interval: self.ppo.reward_sample_interval,
-            max_reward_samples: self.ppo.max_reward_samples,
         };
 
         let (skill_metric_tx, skill_metric_rx) = channel();

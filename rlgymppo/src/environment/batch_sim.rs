@@ -28,6 +28,9 @@ pub(crate) const COLLECT_SUBMIT_TIME_KEY: &str = "Collect/submit time";
 pub(crate) const COLLECT_DELAYED_TIME_KEY: &str = "Collect/delayed phase time";
 /// Report key for the blocking GPU sync (the un-hidden remainder).
 pub(crate) const COLLECT_WAIT_TIME_KEY: &str = "Collect/wait time";
+/// Report key for non-step work: overflow drain, trajectory baselines,
+/// episode accounting, and metric merges around the collection loop.
+pub(crate) const COLLECT_BOOKKEEPING_TIME_KEY: &str = "Collect/bookkeeping time";
 
 fn compute_trajectory_baseline_steps(
     episode_length_ema: Option<f64>,
@@ -726,6 +729,9 @@ where
     {
         let (old_model, old_team) = self_play.unzip();
 
+        let mut total_bookkeeping_time = 0.0_f64;
+        let pre_start = Instant::now();
+
         let baseline_steps = compute_trajectory_baseline_steps(
             self.episode_length_ema,
             self.episode_length_std_ema(),
@@ -784,6 +790,7 @@ where
             }
         }
 
+        total_bookkeeping_time += pre_start.elapsed().as_secs_f64();
         let mut total_infer_time = 0.0_f64;
         let mut total_env_step_time = 0.0_f64;
         let mut total_submit_time = 0.0_f64;
@@ -925,6 +932,7 @@ where
             total_env_step_time += env_start.elapsed().as_secs_f64();
         }
 
+        let post_start = Instant::now();
         if completed_episode_count > 0 {
             let collection_average =
                 completed_episode_steps as f64 / completed_episode_count as f64;
@@ -963,12 +971,14 @@ where
             trajectory.shrink_to_baseline();
         }
 
+        total_bookkeeping_time += post_start.elapsed().as_secs_f64();
         let mut report = self.get_metrics();
         report[COLLECT_INFERENCE_TIME_KEY] = total_infer_time.into();
         report[COLLECT_ENV_STEP_TIME_KEY] = total_env_step_time.into();
         report[COLLECT_SUBMIT_TIME_KEY] = total_submit_time.into();
         report[COLLECT_DELAYED_TIME_KEY] = total_delayed_time.into();
         report[COLLECT_WAIT_TIME_KEY] = total_wait_time.into();
+        report[COLLECT_BOOKKEEPING_TIME_KEY] = total_bookkeeping_time.into();
 
         (memory, report)
     }

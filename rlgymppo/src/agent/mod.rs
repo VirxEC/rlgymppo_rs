@@ -16,7 +16,7 @@ use burn::optim::{AdamW, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError};
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{DType, Transaction};
+use burn::tensor::{DType, FloatDType, Transaction};
 use rand::Rng;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
@@ -668,9 +668,9 @@ struct StagedBatch {
     log_probs: Vec<f32>,
     advantages: Vec<f32>,
     target_vals: Vec<f32>,
-    /// `f32` masks (1.0 = valid). Converted from the stored `u8` here so the
-    /// learner thread never converts. Empty when the env provides no masks.
-    masks: Vec<f32>,
+    /// `u8` masks (1 = valid), uploaded as-is and upcast on the GPU.
+    /// Empty when the env provides no masks.
+    masks: Vec<u8>,
 }
 
 impl StagedBatch {
@@ -707,16 +707,13 @@ impl StagedBatch {
 
         let mut batch_masks = Vec::new();
         if !stored_masks.is_empty() {
-            batch_masks = vec![0.0; rows * mask_width];
+            batch_masks = vec![0u8; rows * mask_width];
             batch_masks
                 .par_chunks_mut(mask_width)
                 .enumerate()
                 .for_each(|(out_row, out)| {
                     let start = indices[out_row] * mask_width;
-                    let row = &stored_masks[start..start + mask_width];
-                    for (dst, &valid) in out.iter_mut().zip(row.iter()) {
-                        *dst = valid as f32;
-                    }
+                    out.copy_from_slice(&stored_masks[start..start + mask_width]);
                 });
         }
 
@@ -745,10 +742,11 @@ impl<B: Backend> GpuBatch<B> {
             advantages: Tensor::from_data(TensorData::new(staged.advantages, [rows, 1]), device),
             target_vals: Tensor::from_data(TensorData::new(staged.target_vals, [rows, 1]), device),
             action_masks: (!staged.masks.is_empty()).then(|| {
-                Tensor::from_data(
+                Tensor::<B, 2, Int>::from_data(
                     TensorData::new(staged.masks, [rows, staged.mask_width]),
                     device,
                 )
+                .cast(FloatDType::F32)
             }),
         }
     }

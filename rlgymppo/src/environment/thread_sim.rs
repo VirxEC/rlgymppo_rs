@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::time::Instant;
 
 use burn::prelude::Backend;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
@@ -6,9 +7,17 @@ use rlgymppo_utils::Report;
 use rlgymppo_utils::shared_info::SharedInfoReport;
 
 use super::batch_sim::{
-    COLLECT_DELAYED_TIME_KEY, COLLECT_ENV_STEP_TIME_KEY, COLLECT_INFERENCE_TIME_KEY,
-    COLLECT_SUBMIT_TIME_KEY, COLLECT_WAIT_TIME_KEY,
+    COLLECT_BOOKKEEPING_TIME_KEY, COLLECT_DELAYED_TIME_KEY, COLLECT_ENV_STEP_TIME_KEY,
+    COLLECT_INFERENCE_TIME_KEY, COLLECT_SUBMIT_TIME_KEY, COLLECT_WAIT_TIME_KEY,
 };
+
+/// Report key for the rollout merge after the pools join (global, not
+/// per-pool: merging moves every pool's buffers into one memory).
+const COLLECT_MERGE_TIME_KEY: &str = "Collect/merge time";
+/// Report key for the slowest pool's wall time (global). Compared against
+/// the averaged per-pool timers, it exposes straggler pools: the wall is
+/// the max, the timers report the mean.
+const COLLECT_POOL_MAX_WALL_TIME_KEY: &str = "Collect/pool max wall time";
 use super::pool_collector::PoolCollector;
 use super::sim::RewardSamplingConfig;
 use crate::agent::model::Actic;
@@ -137,10 +146,15 @@ where
         let self_play = self_play.as_ref().map(|(model, team)| (model, *team));
         let model = &model;
 
+        let mut pool_max_wall = 0.0f64;
         if self.num_pools == 1 {
+            let pool_start = Instant::now();
             let (memory, metrics) = self.collectors[0].run(model, self_play, shares[0]);
+            pool_max_wall = pool_start.elapsed().as_secs_f64();
+            let merge_start = Instant::now();
             self.memory.merge(memory);
             self.metrics += metrics;
+            self.metrics[COLLECT_MERGE_TIME_KEY] = merge_start.elapsed().as_secs_f64().into();
         } else {
             let results = std::thread::scope(|scope| {
                 let handles: Vec<_> = self
@@ -148,7 +162,11 @@ where
                     .iter_mut()
                     .zip(&shares)
                     .map(|(collector, &share)| {
-                        scope.spawn(move || collector.run(model, self_play, share))
+                        scope.spawn(move || {
+                            let pool_start = Instant::now();
+                            let out = collector.run(model, self_play, share);
+                            (out, pool_start.elapsed().as_secs_f64())
+                        })
                     })
                     .collect();
                 handles
@@ -156,10 +174,13 @@ where
                     .map(|handle| handle.join().unwrap())
                     .collect::<Vec<_>>()
             });
-            for (memory, metrics) in results {
+            let merge_start = Instant::now();
+            for ((memory, metrics), pool_secs) in results {
+                pool_max_wall = pool_max_wall.max(pool_secs);
                 self.memory.merge(memory);
                 self.metrics += metrics;
             }
+            self.metrics[COLLECT_MERGE_TIME_KEY] = merge_start.elapsed().as_secs_f64().into();
         }
 
         let num_pools = self.num_pools as f64;
@@ -168,6 +189,8 @@ where
         *self.metrics[COLLECT_SUBMIT_TIME_KEY].as_float_mut() /= num_pools;
         *self.metrics[COLLECT_DELAYED_TIME_KEY].as_float_mut() /= num_pools;
         *self.metrics[COLLECT_WAIT_TIME_KEY].as_float_mut() /= num_pools;
+        *self.metrics[COLLECT_BOOKKEEPING_TIME_KEY].as_float_mut() /= num_pools;
+        self.metrics[COLLECT_POOL_MAX_WALL_TIME_KEY] = pool_max_wall.into();
 
         (&self.memory, self.metrics.clone())
     }

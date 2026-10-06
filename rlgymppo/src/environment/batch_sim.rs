@@ -58,9 +58,6 @@ struct PlayerTraj {
     old_state_width: usize,
     actions: Vec<usize>,
     log_probs: Vec<f32>,
-    /// Critic values computed from the same shared features as the sampled
-    /// actions. Stored for GAE so the learner never recomputes them.
-    values: Vec<f32>,
     rewards: Vec<f32>,
     terminals: Vec<TerminalState>,
     /// Per-step action masks stored row-major as one byte per entry
@@ -123,7 +120,6 @@ impl PlayerTraj {
             old_state_width: self.old_state_width,
             actions: self.actions.split_off(at),
             log_probs: self.log_probs.split_off(at),
-            values: self.values.split_off(at),
             rewards: self.rewards.split_off(at),
             terminals: self.terminals.split_off(at),
             action_masks: self.action_masks.split_off(at * self.action_mask_width),
@@ -144,7 +140,6 @@ impl PlayerTraj {
             .shrink_to(self.baseline_steps * self.old_state_width);
         self.actions.shrink_to(self.baseline_steps);
         self.log_probs.shrink_to(self.baseline_steps);
-        self.values.shrink_to(self.baseline_steps);
         self.rewards.shrink_to(self.baseline_steps);
         self.terminals.shrink_to(self.baseline_steps);
         self.action_masks
@@ -156,7 +151,6 @@ impl PlayerTraj {
         self.old_states.truncate(len * self.old_state_width);
         self.actions.truncate(len);
         self.log_probs.truncate(len);
-        self.values.truncate(len);
         self.rewards.truncate(len);
         self.terminals.truncate(len);
         self.action_masks.truncate(len * self.action_mask_width);
@@ -310,7 +304,6 @@ fn push_traj_prefix(
         traj.state_width,
         traj.actions,
         traj.log_probs,
-        traj.values,
         traj.rewards,
         traj.terminals,
         traj.action_masks,
@@ -367,7 +360,6 @@ struct StepConfig<'a> {
     action_delay: u8,
     actions: &'a [usize],
     log_probs: &'a [f32],
-    values: &'a [f32],
     tracked: &'a [bool],
 }
 
@@ -444,7 +436,6 @@ fn step_game<SS, OBS, ACT, REW, TERM, TRUNC, SI>(
             traj.rewards.push(result.rewards[p]);
             traj.actions.push(config.actions[p]);
             traj.log_probs.push(config.log_probs[p]);
-            traj.values.push(config.values[p]);
             traj.terminals.push(terminal_type);
         }
     }
@@ -554,7 +545,6 @@ where
     self_play_old_indices: Vec<usize>,
     self_play_actions: Vec<usize>,
     self_play_log_probs: Vec<f32>,
-    self_play_values: Vec<f32>,
 }
 
 impl<B, SS, OBS, ACT, REW, TERM, TRUNC, SI> BatchSim<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
@@ -680,7 +670,6 @@ where
             self_play_old_indices: Vec::new(),
             self_play_actions: Vec::new(),
             self_play_log_probs: Vec::new(),
-            self_play_values: Vec::new(),
             max_episode_length,
             complete_trajectories,
             trajectory_baseline_steps: baseline_steps,
@@ -801,100 +790,95 @@ where
             let infer_start = Instant::now();
             let action_delay = ACT::get_action_delay();
 
-            let (actions, log_probs, values) =
-                if let (Some(old_model), Some(_ot)) = (old_model, old_team) {
-                    self.self_play_current_indices.clear();
-                    self.self_play_old_indices.clear();
-                    for (index, &tracked) in player_is_tracked.iter().enumerate() {
-                        if tracked {
-                            self.self_play_current_indices.push(index);
-                        } else {
-                            self.self_play_old_indices.push(index);
-                        }
+            let (actions, log_probs) = if let (Some(old_model), Some(_ot)) = (old_model, old_team) {
+                self.self_play_current_indices.clear();
+                self.self_play_old_indices.clear();
+                for (index, &tracked) in player_is_tracked.iter().enumerate() {
+                    if tracked {
+                        self.self_play_current_indices.push(index);
+                    } else {
+                        self.self_play_old_indices.push(index);
                     }
+                }
 
-                    let current_pending = (!self.self_play_current_indices.is_empty()).then(|| {
-                        model.submit_react_indexed_flat_with_values(
-                            &self.next_obs,
-                            self.state_width,
-                            &self.next_masks,
-                            self.mask_width,
-                            &self.self_play_current_indices,
-                            &self.device,
-                        )
-                    });
-                    let old_pending = (!self.self_play_old_indices.is_empty()).then(|| {
-                        old_model.submit_react_indexed_flat(
-                            &self.next_obs,
-                            self.state_width,
-                            &self.next_masks,
-                            self.mask_width,
-                            &self.self_play_old_indices,
-                            &self.device,
-                        )
-                    });
-
-                    if action_delay > 0 {
-                        total_env_step_time += self.begin_delayed_phase(pool);
-                    }
-
-                    let (current_actions, current_log_probs, current_values) = current_pending
-                        .map(|pending| pending.wait())
-                        .unwrap_or_default();
-                    let (old_actions, _) = old_pending
-                        .map(|pending| pending.wait())
-                        .unwrap_or_default();
-
-                    let player_count = self.total_players;
-                    self.self_play_actions.clear();
-                    self.self_play_actions.resize(player_count, 0);
-                    self.self_play_log_probs.clear();
-                    self.self_play_log_probs.resize(player_count, 0.0);
-                    self.self_play_values.clear();
-                    self.self_play_values.resize(player_count, 0.0);
-                    for (offset, &index) in self.self_play_current_indices.iter().enumerate() {
-                        self.self_play_actions[index] = current_actions[offset];
-                        self.self_play_log_probs[index] = current_log_probs[offset];
-                        self.self_play_values[index] = current_values[offset];
-                    }
-                    for (offset, &index) in self.self_play_old_indices.iter().enumerate() {
-                        self.self_play_actions[index] = old_actions[offset];
-                    }
-
-                    (
-                        mem::take(&mut self.self_play_actions),
-                        mem::take(&mut self.self_play_log_probs),
-                        mem::take(&mut self.self_play_values),
-                    )
-                } else if action_delay == 0 {
-                    model.react_flat_with_values(
+                let current_pending = (!self.self_play_current_indices.is_empty()).then(|| {
+                    model.submit_react_indexed_flat(
                         &self.next_obs,
-                        self.total_players,
                         self.state_width,
                         &self.next_masks,
                         self.mask_width,
+                        &self.self_play_current_indices,
                         &self.device,
                     )
-                } else {
-                    let pending = model.submit_react_flat_with_values(
+                });
+                let old_pending = (!self.self_play_old_indices.is_empty()).then(|| {
+                    old_model.submit_react_indexed_flat(
                         &self.next_obs,
-                        self.total_players,
                         self.state_width,
                         &self.next_masks,
                         self.mask_width,
+                        &self.self_play_old_indices,
                         &self.device,
-                    );
+                    )
+                });
 
+                if action_delay > 0 {
                     total_env_step_time += self.begin_delayed_phase(pool);
+                }
 
-                    pending.wait()
-                };
+                let (current_actions, current_log_probs) = current_pending
+                    .map(|pending| pending.wait())
+                    .unwrap_or_default();
+                let (old_actions, _) = old_pending
+                    .map(|pending| pending.wait())
+                    .unwrap_or_default();
+
+                let player_count = self.total_players;
+                self.self_play_actions.clear();
+                self.self_play_actions.resize(player_count, 0);
+                self.self_play_log_probs.clear();
+                self.self_play_log_probs.resize(player_count, 0.0);
+                for (offset, &index) in self.self_play_current_indices.iter().enumerate() {
+                    self.self_play_actions[index] = current_actions[offset];
+                    self.self_play_log_probs[index] = current_log_probs[offset];
+                }
+                for (offset, &index) in self.self_play_old_indices.iter().enumerate() {
+                    self.self_play_actions[index] = old_actions[offset];
+                }
+
+                (
+                    mem::take(&mut self.self_play_actions),
+                    mem::take(&mut self.self_play_log_probs),
+                )
+            } else if action_delay == 0 {
+                model.react_flat(
+                    &self.next_obs,
+                    self.total_players,
+                    self.state_width,
+                    &self.next_masks,
+                    self.mask_width,
+                    &self.device,
+                )
+            } else {
+                let pending = model.submit_react_flat(
+                    &self.next_obs,
+                    self.total_players,
+                    self.state_width,
+                    &self.next_masks,
+                    self.mask_width,
+                    &self.device,
+                );
+
+                total_env_step_time += self.begin_delayed_phase(pool);
+
+                pending.wait()
+            };
 
             total_infer_time += infer_start.elapsed().as_secs_f64();
 
             let env_start = Instant::now();
 
-            self.step_games_phase(pool, &actions, &log_probs, &values, &player_is_tracked);
+            self.step_games_phase(pool, &actions, &log_probs, &player_is_tracked);
 
             let (episode_steps, episode_squared_steps, episode_count) = self.claim_game_outcomes(
                 &mut memory,
@@ -910,7 +894,6 @@ where
             if self_play.is_some() {
                 self.self_play_actions = actions;
                 self.self_play_log_probs = log_probs;
-                self.self_play_values = values;
             }
 
             total_env_step_time += env_start.elapsed().as_secs_f64();
@@ -1012,7 +995,6 @@ where
         pool: Option<&ThreadPool>,
         actions: &[usize],
         log_probs: &[f32],
-        values: &[f32],
         player_is_tracked: &[bool],
     ) where
         SS: Send,
@@ -1080,7 +1062,6 @@ where
                         action_delay,
                         actions: &actions[player_start..player_start + n],
                         log_probs: &log_probs[player_start..player_start + n],
-                        values: &values[player_start..player_start + n],
                         tracked: &player_is_tracked[player_start..player_start + n],
                     };
 
@@ -1131,7 +1112,6 @@ where
                         action_delay,
                         actions: &actions[player_start..player_start + n],
                         log_probs: &log_probs[player_start..player_start + n],
-                        values: &values[player_start..player_start + n],
                         tracked: &player_is_tracked[player_start..player_start + n],
                     },
                 );
@@ -1246,7 +1226,6 @@ mod regression_tests {
             old_state_width: 0,
             actions: (0..len).collect(),
             log_probs: vec![0.0; len],
-            values: vec![0.0; len],
             rewards: vec![1.0; len],
             terminals,
             action_masks: vec![1u8; len],
@@ -1281,7 +1260,6 @@ mod regression_tests {
         trajectory.states.extend_from_slice(&[1.0, 2.0]);
         trajectory.actions.push(0);
         trajectory.log_probs.push(0.0);
-        trajectory.values.push(0.0);
         trajectory.rewards.push(1.0);
         trajectory.terminals.push(TerminalState::Normal);
         trajectory.action_masks.push(1);
@@ -1290,7 +1268,6 @@ mod regression_tests {
         trajectory.states.extend_from_slice(&[3.0, 4.0]);
         trajectory.actions.push(1);
         trajectory.log_probs.push(0.5);
-        trajectory.values.push(0.0);
         trajectory.rewards.push(1.0);
         trajectory.terminals.push(TerminalState::Normal);
         trajectory.action_masks.push(0);
@@ -1755,7 +1732,6 @@ mod phase3_tests {
                     .extend(repeat_n(marker as f32, traj.state_width));
                 traj.actions.push(marker);
                 traj.log_probs.push(0.5);
-                traj.values.push(0.0);
                 traj.rewards.push(1.0);
                 traj.terminals.push(TerminalState::None);
                 traj.action_masks
@@ -1768,7 +1744,6 @@ mod phase3_tests {
                 .extend(repeat_n(action as f32, traj.state_width));
             traj.actions.push(action);
             traj.log_probs.push(0.5);
-            traj.values.push(0.0);
             traj.rewards.push(1.0);
             traj.terminals.push(terminal);
             traj.action_masks
@@ -1814,11 +1789,10 @@ mod phase3_tests {
 
             let actions = [0usize, 1, 2];
             let log_probs = [0.5, 0.5, 0.5];
-            let values = [0.25, 0.25, 0.25];
             let tracked = [true, true, true];
 
-            serial_sim.step_games_phase(None, &actions, &log_probs, &values, &tracked);
-            scoped_sim.step_games_phase(Some(&pool), &actions, &log_probs, &values, &tracked);
+            serial_sim.step_games_phase(None, &actions, &log_probs, &tracked);
+            scoped_sim.step_games_phase(Some(&pool), &actions, &log_probs, &tracked);
 
             assert_eq!(serial_sim.next_obs, scoped_sim.next_obs);
             assert_eq!(serial_sim.next_masks, scoped_sim.next_masks);
@@ -1828,7 +1802,6 @@ mod phase3_tests {
                 assert_eq!(serial.states, scoped.states);
                 assert_eq!(serial.actions, scoped.actions);
                 assert_eq!(serial.log_probs, scoped.log_probs);
-                assert_eq!(serial.values, scoped.values);
                 assert_eq!(serial.rewards, scoped.rewards);
                 assert_eq!(serial.terminals, scoped.terminals);
             }
@@ -1843,7 +1816,6 @@ mod phase3_tests {
                 assert_eq!(traj.action_masks, expected_masks);
                 assert_eq!(traj.actions, [i]);
                 assert_eq!(traj.log_probs, [0.5]);
-                assert_eq!(traj.values, [0.25]);
                 assert_eq!(traj.terminals, [TerminalState::None]);
                 assert_eq!(serial_sim.held_actions[i], [i]);
                 assert!(serial_sim.action_delay_primed[i]);

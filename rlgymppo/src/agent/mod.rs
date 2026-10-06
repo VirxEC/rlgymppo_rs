@@ -204,11 +204,25 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         );
         let resident_secs = resident_start.elapsed().as_secs_f64();
 
-        // Critic values arrive stored from collection: the collector runs the
-        // critic on the same shared features as action sampling, so GAE never
-        // recomputes them. Identical weights and inputs make them bit-identical
-        // to a learner recompute.
-        let old_values = get_batch_1d(memory.values(), &memory_indices);
+        // Compute old critic values for GAE in chunks sliced from the
+        // resident states: no upload per chunk, and no second shared-head
+        // pass anywhere else. Chunking bounds forward activation memory.
+        let value_inference_start = Instant::now();
+        let old_values = {
+            let nodiff_net = net.valid();
+            let mb = self.config.gpu_timestep_buffer_size;
+            let n = rollout_size;
+            let mut values = Vec::with_capacity(n);
+            for start in (0..n).step_by(mb) {
+                let end = (start + mb).min(n);
+                let states = resident_states.clone().narrow(0, start, end - start);
+                let features = nodiff_net.apply_shared_head(states);
+                let batch_vals = nodiff_net.critic.forward(features);
+                values.extend_from_slice(batch_vals.into_data().as_slice().unwrap());
+            }
+            values
+        };
+        metrics["PPO/value inference time"] = value_inference_start.elapsed().as_secs_f64().into();
 
         let return_std = if self.config.standardize_returns {
             stats.return_stat.get_std()

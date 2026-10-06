@@ -323,7 +323,6 @@ mod tests {
             vec![0; n],
             vec![0.0; n],
             vec![0.0; n],
-            vec![0.0; n],
             terminals,
             vec![1u8; n * n_actions],
             n_actions,

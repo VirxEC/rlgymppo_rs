@@ -58,11 +58,6 @@ pub struct Memory {
     state_width: usize,
     actions: Vec<usize>,
     log_probs: Vec<f32>,
-    /// Critic values computed from the same shared features as the sampled
-    /// actions, stored during collection so GAE never recomputes them.
-    /// Bit-identical to a learner recompute: same frozen weights, same
-    /// inputs, per-row ops only.
-    values: Vec<f32>,
     rewards: Vec<f32>,
     /// Unified terminal encoding per step: TERMINAL_NONE / NORMAL / TRUNCATED.
     terminals: Vec<TerminalState>,
@@ -98,7 +93,6 @@ impl Memory {
             state_width: 0,
             actions: Vec::with_capacity(capacity),
             log_probs: Vec::with_capacity(capacity),
-            values: Vec::with_capacity(capacity),
             rewards: Vec::with_capacity(capacity),
             terminals: Vec::with_capacity(capacity),
             // Truncations are sparse relative to rollout steps, so reserving one
@@ -143,7 +137,6 @@ impl Memory {
         state_width: usize,
         actions: Vec<usize>,
         log_probs: Vec<f32>,
-        values: Vec<f32>,
         rewards: Vec<f32>,
         terminals: Vec<TerminalState>,
         action_masks: Vec<u8>,
@@ -155,7 +148,6 @@ impl Memory {
         let n = actions.len();
         debug_assert_eq!(states.len(), n * state_width);
         debug_assert_eq!(n, log_probs.len());
-        debug_assert_eq!(n, values.len());
         debug_assert_eq!(n, rewards.len());
         debug_assert_eq!(n, terminals.len());
         debug_assert_eq!(action_masks.len(), n * action_mask_width);
@@ -172,7 +164,6 @@ impl Memory {
         self.states.extend(states);
         self.actions.extend(actions);
         self.log_probs.extend(log_probs);
-        self.values.extend(values);
         self.rewards.extend(rewards);
         self.terminals.extend(terminals);
         self.action_masks.extend(action_masks);
@@ -190,7 +181,6 @@ impl Memory {
             state_width,
             actions,
             log_probs,
-            values,
             rewards,
             terminals,
             trunc_next_states,
@@ -207,7 +197,6 @@ impl Memory {
         self.states.extend(states);
         self.actions.extend(actions);
         self.log_probs.extend(log_probs);
-        self.values.extend(values);
         self.rewards.extend(rewards);
         self.terminals.extend(terminals);
         self.trunc_next_states.extend(trunc_next_states);
@@ -233,7 +222,6 @@ impl Memory {
             state_width,
             actions,
             log_probs,
-            values,
             rewards,
             terminals,
             trunc_next_states,
@@ -261,7 +249,6 @@ impl Memory {
             .extend(states.iter().copied().take(steps * state_width));
         self.actions.extend(actions.into_iter().take(steps));
         self.log_probs.extend(log_probs.into_iter().take(steps));
-        self.values.extend(values.into_iter().take(steps));
         self.rewards.extend(rewards.into_iter().take(steps));
         self.terminals.extend(terminals.into_iter().take(steps));
         self.action_masks
@@ -294,12 +281,6 @@ impl Memory {
             return Err(format!(
                 "log_probs has {} values for {rows} rows",
                 self.log_probs.len()
-            ));
-        }
-        if self.values.len() != rows {
-            return Err(format!(
-                "values has {} values for {rows} rows",
-                self.values.len()
             ));
         }
         if self.rewards.len() != rows {
@@ -359,11 +340,6 @@ impl Memory {
         &self.log_probs
     }
 
-    /// Critic values stored during collection, row-aligned with actions.
-    pub fn values(&self) -> &[f32] {
-        &self.values
-    }
-
     pub fn rewards(&self) -> &[f32] {
         &self.rewards
     }
@@ -419,8 +395,6 @@ impl Memory {
         self.actions.shrink_to(self.baseline_steps);
         self.log_probs.clear();
         self.log_probs.shrink_to(self.baseline_steps);
-        self.values.clear();
-        self.values.shrink_to(self.baseline_steps);
         self.rewards.clear();
         self.rewards.shrink_to(self.baseline_steps);
         self.terminals.clear();
@@ -450,7 +424,6 @@ mod regression_tests {
             1,
             (start..start + count).collect(),
             vec![0.0; count],
-            vec![0.0; count],
             vec![1.0; count],
             terminals,
             vec![1u8; count],
@@ -473,15 +446,14 @@ mod regression_tests {
     #[test]
     fn regression_merge_preserves_every_buffer() {
         // Guards the multi-pool path: `ThreadSim` merges one memory per pool,
-        // and a dropped buffer (e.g. via a `..` catch-all) surfaces only at
-        // learner validation time. Distinct values per row catch silent drops.
+        // and a dropped buffer surfaces only at learner validation time.
+        // Distinct values per row catch silent drops.
         let mut first = Memory::with_capacity(2);
         first.push_player(
             vec![1.0, 2.0],
             1,
             vec![0, 1],
             vec![0.1, 0.2],
-            vec![10.0, 20.0],
             vec![1.0, 2.0],
             vec![TerminalState::None, TerminalState::Normal],
             vec![1u8, 1u8],
@@ -496,7 +468,6 @@ mod regression_tests {
             1,
             vec![2],
             vec![0.3],
-            vec![30.0],
             vec![3.0],
             vec![TerminalState::Normal],
             vec![1u8],
@@ -513,7 +484,6 @@ mod regression_tests {
         assert_eq!(first.states(), &[1.0, 2.0, 3.0]);
         assert_eq!(first.actions(), &[0, 1, 2]);
         assert_eq!(first.log_probs(), &[0.1, 0.2, 0.3]);
-        assert_eq!(first.values(), &[10.0, 20.0, 30.0]);
         assert_eq!(first.rewards(), &[1.0, 2.0, 3.0]);
     }
 
@@ -569,7 +539,6 @@ mod regression_tests {
             2,
             vec![0, 1],
             vec![0.0, 0.0],
-            vec![0.0, 0.0],
             vec![1.0, 1.0],
             vec![TerminalState::None, TerminalState::Normal],
             vec![1u8, 0, 0, 1],
@@ -583,7 +552,6 @@ mod regression_tests {
         assert_eq!(memory.state_width(), 2);
         assert!(memory.states.capacity() >= 2 * memory.state_width());
         assert_eq!(memory.action_masks(), &[1u8, 0, 0, 1]);
-        assert_eq!(memory.values(), &[0.0, 0.0]);
         assert_eq!(memory.action_mask_width(), 2);
         assert!(memory.action_masks.capacity() >= 2 * memory.action_mask_width());
     }

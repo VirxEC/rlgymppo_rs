@@ -286,8 +286,23 @@ impl Memory {
                 self.state_width
             ));
         }
-        if self.log_probs.len() != rows || self.values.len() != rows || self.rewards.len() != rows {
-            return Err("log_probs, values and rewards must be row-aligned with actions".into());
+        if self.log_probs.len() != rows {
+            return Err(format!(
+                "log_probs has {} values for {rows} rows",
+                self.log_probs.len()
+            ));
+        }
+        if self.values.len() != rows {
+            return Err(format!(
+                "values has {} values for {rows} rows",
+                self.values.len()
+            ));
+        }
+        if self.rewards.len() != rows {
+            return Err(format!(
+                "rewards has {} values for {rows} rows",
+                self.rewards.len()
+            ));
         }
         if self.terminals.len() != rows {
             return Err("terminals must be row-aligned with actions".into());

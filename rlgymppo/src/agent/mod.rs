@@ -171,6 +171,18 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
         let memory_indices = (0..rollout_size).collect::<Vec<_>>();
 
+        // Fail loudly with row counts when collection returns a short
+        // rollout. Without this, the first batching helper below panics with
+        // a bare index-out-of-bounds that names no buffer.
+        assert!(
+            memory.len() >= rollout_size,
+            "Learner memory holds {} rows but the rollout needs {rollout_size}",
+            memory.len()
+        );
+        memory
+            .validate()
+            .unwrap_or_else(|error| panic!("Invalid learner memory: {error}"));
+
         // Snapshot parameters before training for update-magnitude computation.
         // This downloads all weights to the CPU, so it is timed separately.
         let snapshot_start = Instant::now();
@@ -254,9 +266,6 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             }
         };
 
-        memory
-            .validate()
-            .unwrap_or_else(|error| panic!("Invalid learner memory: {error}"));
         metrics["PPO/trunc bootstrap time"] = trunc_start.elapsed().as_secs_f64().into();
 
         let gae_start = Instant::now();

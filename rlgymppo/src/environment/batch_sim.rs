@@ -22,6 +22,12 @@ const MIN_TRAJECTORY_BASELINE_STEPS: usize = 32;
 pub(crate) const COLLECT_INFERENCE_TIME_KEY: &str = "Collect/inference time";
 /// Report key for the per-pool env-step wall time.
 pub(crate) const COLLECT_ENV_STEP_TIME_KEY: &str = "Collect/env step time";
+/// Report key for inference dispatch (upload plus launch), always exposed.
+pub(crate) const COLLECT_SUBMIT_TIME_KEY: &str = "Collect/submit time";
+/// Report key for the CPU delayed-phase physics inside the inference window.
+pub(crate) const COLLECT_DELAYED_TIME_KEY: &str = "Collect/delayed phase time";
+/// Report key for the blocking GPU sync (the un-hidden remainder).
+pub(crate) const COLLECT_WAIT_TIME_KEY: &str = "Collect/wait time";
 
 fn compute_trajectory_baseline_steps(
     episode_length_ema: Option<f64>,
@@ -780,6 +786,9 @@ where
 
         let mut total_infer_time = 0.0_f64;
         let mut total_env_step_time = 0.0_f64;
+        let mut total_submit_time = 0.0_f64;
+        let mut total_delayed_time = 0.0_f64;
+        let mut total_wait_time = 0.0_f64;
         let mut completed_episode_steps = 0_usize;
         let mut completed_episode_squared_steps = 0.0_f64;
         let mut completed_episode_count = 0_usize;
@@ -801,6 +810,7 @@ where
                     }
                 }
 
+                let submit_start = Instant::now();
                 let current_pending = (!self.self_play_current_indices.is_empty()).then(|| {
                     model.submit_react_indexed_flat(
                         &self.next_obs,
@@ -821,17 +831,22 @@ where
                         &self.device,
                     )
                 });
+                total_submit_time += submit_start.elapsed().as_secs_f64();
 
                 if action_delay > 0 {
-                    total_env_step_time += self.begin_delayed_phase(pool);
+                    let delayed = self.begin_delayed_phase(pool);
+                    total_env_step_time += delayed;
+                    total_delayed_time += delayed;
                 }
 
+                let wait_start = Instant::now();
                 let (current_actions, current_log_probs) = current_pending
                     .map(|pending| pending.wait())
                     .unwrap_or_default();
                 let (old_actions, _) = old_pending
                     .map(|pending| pending.wait())
                     .unwrap_or_default();
+                total_wait_time += wait_start.elapsed().as_secs_f64();
 
                 let player_count = self.total_players;
                 self.self_play_actions.clear();
@@ -851,15 +866,20 @@ where
                     mem::take(&mut self.self_play_log_probs),
                 )
             } else if action_delay == 0 {
-                model.react_flat(
+                // Fully synchronous: no overlap window, all dispatch cost.
+                let submit_start = Instant::now();
+                let out = model.react_flat(
                     &self.next_obs,
                     self.total_players,
                     self.state_width,
                     &self.next_masks,
                     self.mask_width,
                     &self.device,
-                )
+                );
+                total_submit_time += submit_start.elapsed().as_secs_f64();
+                out
             } else {
+                let submit_start = Instant::now();
                 let pending = model.submit_react_flat(
                     &self.next_obs,
                     self.total_players,
@@ -868,10 +888,16 @@ where
                     self.mask_width,
                     &self.device,
                 );
+                total_submit_time += submit_start.elapsed().as_secs_f64();
 
-                total_env_step_time += self.begin_delayed_phase(pool);
+                let delayed = self.begin_delayed_phase(pool);
+                total_env_step_time += delayed;
+                total_delayed_time += delayed;
 
-                pending.wait()
+                let wait_start = Instant::now();
+                let out = pending.wait();
+                total_wait_time += wait_start.elapsed().as_secs_f64();
+                out
             };
 
             total_infer_time += infer_start.elapsed().as_secs_f64();
@@ -940,6 +966,9 @@ where
         let mut report = self.get_metrics();
         report[COLLECT_INFERENCE_TIME_KEY] = total_infer_time.into();
         report[COLLECT_ENV_STEP_TIME_KEY] = total_env_step_time.into();
+        report[COLLECT_SUBMIT_TIME_KEY] = total_submit_time.into();
+        report[COLLECT_DELAYED_TIME_KEY] = total_delayed_time.into();
+        report[COLLECT_WAIT_TIME_KEY] = total_wait_time.into();
 
         (memory, report)
     }

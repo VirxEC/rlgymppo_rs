@@ -5,7 +5,10 @@ use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal,
 use rlgymppo_utils::Report;
 use rlgymppo_utils::shared_info::SharedInfoReport;
 
-use super::batch_sim::{COLLECT_ENV_STEP_TIME_KEY, COLLECT_INFERENCE_TIME_KEY};
+use super::batch_sim::{
+    COLLECT_DELAYED_TIME_KEY, COLLECT_ENV_STEP_TIME_KEY, COLLECT_INFERENCE_TIME_KEY,
+    COLLECT_SUBMIT_TIME_KEY, COLLECT_WAIT_TIME_KEY,
+};
 use super::pool_collector::PoolCollector;
 use super::sim::RewardSamplingConfig;
 use crate::agent::model::Actic;
@@ -162,6 +165,9 @@ where
         let num_pools = self.num_pools as f64;
         *self.metrics[COLLECT_INFERENCE_TIME_KEY].as_float_mut() /= num_pools;
         *self.metrics[COLLECT_ENV_STEP_TIME_KEY].as_float_mut() /= num_pools;
+        *self.metrics[COLLECT_SUBMIT_TIME_KEY].as_float_mut() /= num_pools;
+        *self.metrics[COLLECT_DELAYED_TIME_KEY].as_float_mut() /= num_pools;
+        *self.metrics[COLLECT_WAIT_TIME_KEY].as_float_mut() /= num_pools;
 
         (&self.memory, self.metrics.clone())
     }

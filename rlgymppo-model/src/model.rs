@@ -360,32 +360,10 @@ impl<B: Backend> Actic<B> {
             .wait()
     }
 
-    /// Dispatch stochastic inference for a flat, pre-sized obs batch and
-    /// retain the sampled output on the backend device until
-    /// [`PendingActions::wait`] is called. The collector stores all player
-    /// obs in one contiguous buffer in global player order.
-    pub fn submit_react_flat(
-        &self,
-        state: &[f32],
-        rows: usize,
-        state_width: usize,
-        masks: &[bool],
-        mask_width: usize,
-        device: &B::Device,
-    ) -> PendingActions<B> {
-        let input = to_state_tensor_2d_flat(state, rows, state_width, device);
-        let features = self.apply_shared_head(input);
-        let mask_tensor =
-            (mask_width > 0).then(|| to_mask_tensor_2d_flat(masks, rows, mask_width, device));
-        PendingActions {
-            sampled: sample_actions_from_logits_tensor(
-                self.actor.masked_logits(features, mask_tensor),
-                device,
-            ),
-        }
-    }
-
-    /// Like [`Self::submit_react_flat`], but for selected player rows.
+    /// Dispatch stochastic inference for selected flat player rows and retain
+    /// the sampled output on the backend device until
+    /// [`PendingActions::wait`] is called. Used for old-model self-play
+    /// inference over a subset of players.
     pub fn submit_react_indexed_flat(
         &self,
         state: &[f32],
@@ -407,9 +385,7 @@ impl<B: Backend> Actic<B> {
         }
     }
 
-    /// Like [`Self::submit_react_flat`], but also runs the critic on the same
-    /// shared features and retains the values. The collector stores them for
-    /// GAE so the learner never recomputes them.
+    /// Like [`Self::submit_react_flat_with_values`], but for all player rows.
     pub fn submit_react_flat_with_values(
         &self,
         state: &[f32],
@@ -469,20 +445,6 @@ impl<B: Backend> Actic<B> {
         device: &B::Device,
     ) -> (Vec<usize>, Vec<f32>, Vec<f32>) {
         self.submit_react_flat_with_values(state, rows, state_width, masks, mask_width, device)
-            .wait()
-    }
-
-    /// Synchronous stochastic inference for a flat, pre-sized obs batch.
-    pub fn react_flat(
-        &self,
-        state: &[f32],
-        rows: usize,
-        state_width: usize,
-        masks: &[bool],
-        mask_width: usize,
-        device: &B::Device,
-    ) -> (Vec<usize>, Vec<f32>) {
-        self.submit_react_flat(state, rows, state_width, masks, mask_width, device)
             .wait()
     }
 

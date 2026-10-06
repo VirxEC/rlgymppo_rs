@@ -178,8 +178,24 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let critic_params_before = flatten_net(&net.critic);
         metrics["PPO/param snapshot time"] = snapshot_start.elapsed().as_secs_f64().into();
 
+        // Upload ordered states once and keep them resident on the GPU.
+        // Value inference slices them with `narrow`, training gathers
+        // batches with `select`. States cross the bus a single time instead
+        // of once per phase. Timed as staging work.
+        let resident_start = Instant::now();
+        let resident_states = get_states_batch_range::<B::InnerBackend>(
+            memory.states(),
+            memory.state_width(),
+            0,
+            rollout_size,
+            &self.device,
+        );
+        let resident_secs = resident_start.elapsed().as_secs_f64();
+
         // Compute old critic values for GAE in mini-batches using a
         // non-autodiff model clone so no gradient graph accumulates.
+        // Slices of the resident tensor: no upload per chunk. Chunking
+        // still bounds forward activation memory.
         let value_inference_start = Instant::now();
         let old_values = {
             let nodiff_net = net.valid();
@@ -188,13 +204,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             let mut values = Vec::with_capacity(n);
             for start in (0..n).step_by(mb) {
                 let end = (start + mb).min(n);
-                let states = get_states_batch_range::<B::InnerBackend>(
-                    memory.states(),
-                    memory.state_width(),
-                    start,
-                    end,
-                    &self.device,
-                );
+                let states = resident_states.clone().narrow(0, start, end - start);
                 let features = nodiff_net.apply_shared_head(states);
                 let batch_vals = nodiff_net.critic.forward(features);
                 values.extend_from_slice(batch_vals.into_data().as_slice().unwrap());
@@ -319,8 +329,13 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
         let mut metric_totals = MetricTotals::new(&self.device);
         let training_start = Instant::now();
-        let mut batch_staging_time = Duration::ZERO;
+        let mut batch_staging_time = Duration::from_secs_f64(resident_secs);
         let mut batch_training_time = Duration::ZERO;
+
+        // Wrap the resident states for the autodiff backend once (no copy:
+        // the training graph references the same device storage). Batches
+        // gather their states from it on the GPU.
+        let resident_b = Tensor::<B, 2>::from_inner(resident_states);
 
         // Shuffle the full rollout up front so the RNG stream matches the
         // serial implementation exactly.
@@ -335,16 +350,19 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             }
         }
 
-        // Double-buffered pipeline: a staging thread fills CPU batch buffers
-        // while the learner thread uploads and trains. Only one batch lives
-        // on the GPU at a time, so VRAM stays bounded by the batch size
-        // instead of the rollout size.
-        let num_batches = epoch_batches.len();
+        // Double-buffered pipeline: a staging thread fills the small CPU
+        // batch buffers (actions, log-probs, advantages, targets, masks)
+        // while the learner thread uploads them, gathers states from the
+        // resident tensor, and trains. VRAM holds the resident states plus
+        // one batch instead of the full rollout plus one batch.
+        let epoch_batches_ref = &epoch_batches;
         std::thread::scope(|scope| {
-            let (staged_tx, staged_rx) = std::sync::mpsc::channel::<StagedBatch>();
+            // Bounded so at most two filled batches queue up: caps queued
+            // CPU RAM and keeps the producer from racing pointlessly ahead.
+            let (staged_tx, staged_rx) = std::sync::mpsc::sync_channel::<StagedBatch>(2);
 
             scope.spawn(move || {
-                for batch_indices in &epoch_batches {
+                for batch_indices in epoch_batches_ref {
                     let staged =
                         StagedBatch::stage(memory, &advantages, &target_vals, batch_indices);
                     if staged_tx.send(staged).is_err() {
@@ -355,7 +373,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
             let mut upload_time = Duration::ZERO;
             let mut primed = false;
-            for _ in 0..num_batches {
+            for batch_indices in &epoch_batches {
                 let recv_start = Instant::now();
                 let staged = staged_rx.recv().expect("staging thread is live");
                 if !primed {
@@ -369,7 +387,17 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 // Upload is timed separately for attribution.
                 let training_start = Instant::now();
                 let upload_start = Instant::now();
-                let batch = GpuBatch::from_staged(staged, &self.device);
+                // One index build plus upload per batch, shared by the state
+                // gather; the small fields arrive already gathered.
+                let index = Tensor::<B, 1, Int>::from_data(
+                    TensorData::new(
+                        batch_indices.iter().map(|&i| i as i64).collect::<Vec<_>>(),
+                        [batch_indices.len()],
+                    ),
+                    &self.device,
+                );
+                let states = resident_b.clone().select(0, index);
+                let batch = GpuBatch::from_staged(states, staged, &self.device);
                 upload_time += upload_start.elapsed();
                 self.train_gpu_batch(&mut net, &batch, &mut metric_totals);
                 batch_training_time += training_start.elapsed();
@@ -609,15 +637,15 @@ struct GpuBatch<B: Backend> {
 }
 
 /// One batch of rollout rows gathered on the CPU staging thread, ready to
-/// upload. Every buffer is allocated once at exact size: the `Vec`s move
-/// straight into `TensorData` on upload, so there are no growth reallocs.
+/// upload. States are excluded: they stay resident on the GPU and batches
+/// gather them with `select`. Every buffer here is allocated once at exact
+/// size: the `Vec`s move straight into `TensorData` on upload, so there are
+/// no growth reallocs.
 struct StagedBatch {
     rows: usize,
-    state_width: usize,
     mask_width: usize,
     /// CPU fill time, attributed to batch staging time by the learner thread.
     staged_secs: f64,
-    states: Vec<f32>,
     actions: Vec<u32>,
     log_probs: Vec<f32>,
     advantages: Vec<f32>,
@@ -634,21 +662,10 @@ impl StagedBatch {
     fn stage(memory: &Memory, advantages: &[f32], target_vals: &[f32], indices: &[usize]) -> Self {
         let fill_start = Instant::now();
         let rows = indices.len();
-        let state_width = memory.state_width();
         let mask_width = memory.action_mask_width();
-        let states = memory.states();
         let actions = memory.actions();
         let log_probs = memory.log_probs();
         let stored_masks = memory.action_masks();
-
-        let mut batch_states = vec![0.0; rows * state_width];
-        batch_states
-            .par_chunks_mut(state_width)
-            .enumerate()
-            .for_each(|(out_row, out)| {
-                let start = indices[out_row] * state_width;
-                out.copy_from_slice(&states[start..start + state_width]);
-            });
 
         let batch_actions = indices
             .par_iter()
@@ -687,10 +704,8 @@ impl StagedBatch {
 
         Self {
             rows,
-            state_width,
             mask_width,
             staged_secs: fill_start.elapsed().as_secs_f64(),
-            states: batch_states,
             actions: batch_actions,
             log_probs: batch_log_probs,
             advantages: batch_advantages,
@@ -701,15 +716,12 @@ impl StagedBatch {
 }
 
 impl<B: Backend> GpuBatch<B> {
-    /// Upload one staged batch. The staging `Vec`s move into `TensorData`
-    /// with no further copy on the host.
-    fn from_staged(staged: StagedBatch, device: &B::Device) -> Self {
+    /// Combine GPU-gathered states with one staged small-field batch. The
+    /// staging `Vec`s move into `TensorData` with no further copy on host.
+    fn from_staged(states: Tensor<B, 2>, staged: StagedBatch, device: &B::Device) -> Self {
         let rows = staged.rows;
         Self {
-            states: Tensor::from_data(
-                TensorData::new(staged.states, [rows, staged.state_width]),
-                device,
-            ),
+            states,
             actions: Tensor::from_data(TensorData::new(staged.actions, [rows, 1]), device),
             old_log_probs: Tensor::from_data(TensorData::new(staged.log_probs, [rows, 1]), device),
             advantages: Tensor::from_data(TensorData::new(staged.advantages, [rows, 1]), device),

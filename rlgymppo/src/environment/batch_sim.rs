@@ -728,7 +728,6 @@ where
         TRUNC: Send,
     {
         let mut memory = Memory::with_capacity(memory_capacity_hint);
-        memory.reserve_rollout(memory_capacity_hint, self.state_width, self.mask_width);
         self.prologue();
         let report = self.run_inner(
             model,

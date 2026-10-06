@@ -156,14 +156,9 @@ where
             && self.memory.state_width() > 0
             && self.memory.len() == budget;
         if !exact_shares {
+            // `clear` shrinks to trajectory baseline; the first merge
+            // push re-reserves full capacity via `set_widths`.
             self.memory.clear();
-            // Re-reserve the steady-state rollout capacity that `clear`
-            // shrinks away: without this the merge regrows 0 to 3.2GB
-            // every iteration. Widths persist across `clear` (zero on the
-            // first run: no-op).
-            let state_width = self.memory.state_width();
-            let mask_width = self.memory.action_mask_width();
-            self.memory.reserve_rollout(budget, state_width, mask_width);
         } else {
             self.memory.clear_trunc_next_states();
         }

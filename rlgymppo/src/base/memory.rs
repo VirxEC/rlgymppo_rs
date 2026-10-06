@@ -585,21 +585,6 @@ impl Memory {
         shards
     }
 
-    /// Reserve steady-state capacity for a `steps`-row rollout. Call once
-    /// per collection, after creation or `clear`: growth reallocs on
-    /// 800MB state buffers cost more than the reservation wastes. Widths
-    /// come from the caller because a fresh or cleared memory may not know
-    /// them yet. `Vec::reserve` never shrinks, so over-reserving is safe
-    /// and overbatching past `steps` still extends correctly.
-    pub fn reserve_rollout(&mut self, steps: usize, state_width: usize, mask_width: usize) {
-        self.states.reserve(steps.saturating_mul(state_width));
-        self.actions.reserve(steps);
-        self.log_probs.reserve(steps);
-        self.rewards.reserve(steps);
-        self.terminals.reserve(steps);
-        self.action_masks.reserve(steps.saturating_mul(mask_width));
-    }
-
     pub fn clear(&mut self) {
         // Keep a small baseline for the next collection, but discard any
         // high-water growth from an unusually large rollout or episode.

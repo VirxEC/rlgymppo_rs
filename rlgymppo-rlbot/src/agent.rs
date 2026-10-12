@@ -17,12 +17,42 @@ use rlgymppo_utils::rlgym::{Action, Obs};
 use crate::controls::to_rlbot_controls;
 use crate::state::to_rlgym_game_state;
 
-type Backend = Flex;
+pub type Backend = Flex;
 
-/// Configures the policy architecture used by an RLBot agent.
+/// Configures the policy architecture and checkpoint loading used by an RLBot agent.
+///
+/// Override [`PpoBotConfig::checkpoint_path`] to point at a different checkpoint
+/// directory, or override [`PpoBotConfig::load_policy`] entirely to load a
+/// checkpoint however you want (different file layout, embedded bytes, remote
+/// fetch, etc.). The default [`PpoBotConfig::load_policy`] loads
+/// `actor.mpk.gz` + `shared_head.mpk.gz` from [`PpoBotConfig::checkpoint_path`]
+/// with [`PpoBotConfig::policy_config`].
 pub trait PpoBotConfig: Send + 'static {
     /// Build the [`PolicyConfig`] for the given observation and action space sizes.
     fn policy_config(input_size: usize, action_size: usize) -> PolicyConfig;
+
+    /// Resolve the checkpoint directory to load from.
+    /// Defaults to [`default_checkpoint_path`].
+    fn checkpoint_path() -> PathBuf {
+        default_checkpoint_path()
+    }
+
+    /// Load the [`Policy`] however you want.
+    /// Defaults to [`Policy::load`] from [`PpoBotConfig::checkpoint_path`].
+    fn load_policy(input_size: usize, action_size: usize, device: &FlexDevice) -> Policy<Backend> {
+        let checkpoint = Self::checkpoint_path();
+        Policy::<Backend>::load(
+            &checkpoint,
+            &Self::policy_config(input_size, action_size),
+            device,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "load policy checkpoint from {}: {error}",
+                checkpoint.display()
+            )
+        })
+    }
 }
 
 /// Default policy architecture from the bundled example:
@@ -88,24 +118,14 @@ where
         let context = MatchContext::new(&match_config, &field_info)
             .expect("create RocketSim context from RLBot match");
         let device = Default::default();
-        let checkpoint = checkpoint_path();
         let observation = OBS::default();
         let action_parser = ACT::default();
         let shared_info = SI::from(controllable_info.identifier as u64);
-        let policy = Policy::<Backend>::load(
-            &checkpoint,
-            &CFG::policy_config(
-                observation.get_obs_space(&shared_info),
-                action_parser.get_action_space(&shared_info),
-            ),
+        let policy = CFG::load_policy(
+            observation.get_obs_space(&shared_info),
+            action_parser.get_action_space(&shared_info),
             &device,
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "load policy checkpoint from {}: {error}",
-                checkpoint.display()
-            )
-        });
+        );
 
         Self {
             player_index: controllable_info.index as usize,
@@ -168,7 +188,11 @@ where
     }
 }
 
-fn checkpoint_path() -> PathBuf {
+/// Default checkpoint resolution: `RLGYMPPO_CHECKPOINT` if set, otherwise the
+/// newest numeric directory under `./checkpoints` (parent directories searched).
+/// Falls back to the `checkpoints` directory itself when nothing else matches.
+#[must_use]
+pub fn default_checkpoint_path() -> PathBuf {
     if let Some(path) = std::env::var_os("RLGYMPPO_CHECKPOINT") {
         return PathBuf::from(path);
     }

@@ -22,7 +22,8 @@ Set `RLGYMPPO_CHECKPOINT` to a checkpoint directory containing:
 - `actor.mpk.gz`
 - `shared_head.mpk.gz`
 
-If unset, the bot selects the newest numeric directory under `./checkpoints`.
+If unset, the bot selects the newest numeric directory under `./checkpoints`
+(see `rlgymppo_rlbot::default_checkpoint_path`).
 The bundled policy architecture matches `rlgymppo-trainer::default_config`:
 
 - 141 observation values
@@ -31,6 +32,43 @@ The bundled policy architecture matches `rlgymppo-trainer::default_config`:
 - RMSNorm
 - 90 discrete actions
 - 8-frame action repeat
+
+### Custom checkpoint loading
+
+`PpoBotConfig` controls how the checkpoint is loaded. Override just the
+directory, or override `load_policy` entirely to load a checkpoint however you
+want (different file layout, embedded bytes, remote fetch, ...). The default
+`load_policy` loads `actor.mpk.gz` + `shared_head.mpk.gz` from
+`checkpoint_path` with `policy_config`:
+
+```rust
+use std::path::PathBuf;
+use burn::backend::flex::FlexDevice;
+use rlgymppo_model::{Policy, PolicyConfig};
+use rlgymppo_rlbot::{Backend, PpoBotConfig};
+
+struct MyConfig;
+
+impl PpoBotConfig for MyConfig {
+    fn policy_config(input_size: usize, action_size: usize) -> PolicyConfig {
+        // ... your architecture ...
+    }
+
+    // Option 1: custom directory, default loading logic is kept.
+    fn checkpoint_path() -> PathBuf {
+        PathBuf::from("/path/to/my/checkpoint")
+    }
+
+    // Option 2: fully custom loading (overrides `checkpoint_path`).
+    // fn load_policy(
+    //     input_size: usize,
+    //     action_size: usize,
+    //     device: &FlexDevice,
+    // ) -> Policy<Backend> {
+    //     // ... load however you want ...
+    // }
+}
+```
 
 ## Build
 

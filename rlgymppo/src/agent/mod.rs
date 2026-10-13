@@ -38,6 +38,34 @@ pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<Ad
     /// loading a checkpoint with freshly-created model parameters.
     make_optim: Option<Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O>>,
     device: B::Device,
+    /// Transfer-learning rounds completed; gates plasticity logging there.
+    transfer_rounds: u64,
+    /// Last computed plasticity diagnostics, re-emitted every iteration so
+    /// metric keys (and their TUI section) stay present between computations.
+    last_plasticity: Option<PlasticitySnapshot>,
+}
+
+/// Plasticity diagnostics for one actor/critic pair. Cached on `Ppo` and
+/// re-emitted every iteration so the keys stay present in every report.
+#[derive(Clone, Copy, Debug, Default)]
+struct PlasticitySnapshot {
+    actor_norm: f64,
+    critic_norm: f64,
+    actor_rank: f64,
+    critic_rank: f64,
+    actor_dormant: f64,
+    critic_dormant: f64,
+}
+
+impl PlasticitySnapshot {
+    fn emit(self, metrics: &mut Report) {
+        metrics["Update/actor weight norm"] = self.actor_norm.into();
+        metrics["Update/critic weight norm"] = self.critic_norm.into();
+        metrics["Update/actor stable rank"] = self.actor_rank.into();
+        metrics["Update/critic stable rank"] = self.critic_rank.into();
+        metrics["Update/actor dormant frac"] = self.actor_dormant.into();
+        metrics["Update/critic dormant frac"] = self.critic_dormant.into();
+    }
 }
 
 impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
@@ -49,6 +77,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             make_optim: None,
             config,
             device,
+            transfer_rounds: 0,
+            last_plasticity: None,
         }
     }
 
@@ -67,6 +97,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             make_optim: Some(make_optim),
             config,
             device,
+            transfer_rounds: 0,
+            last_plasticity: None,
         }
     }
 
@@ -437,6 +469,22 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         metrics["PPO/batch staging time"] = batch_staging_time.as_secs_f64().into();
         metrics["PPO/batch training time"] = batch_training_time.as_secs_f64().into();
 
+        // Plasticity diagnostics, re-emitted every iteration from the cache
+        // so the keys stay present between recomputations. Gated by
+        // `plasticity_log_interval` (`None` pays nothing).
+        {
+            let sample_len = rollout_size.min(2048);
+            let sample = resident_b.clone().narrow(0, 0, sample_len).cast(DType::F32);
+            self.maybe_log_plasticity(
+                stats.cumulative_model_updates,
+                &net.actor,
+                &net.critic,
+                net.shared_head.as_ref(),
+                sample,
+                metrics,
+            );
+        }
+
         stats.cumulative_timesteps += rollout_size as u64;
         stats.cumulative_epochs += self.config.epochs as u64;
         stats.cumulative_model_updates += 1;
@@ -654,6 +702,32 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 head,
                 shared_head_gradients.grads(),
             ));
+        }
+    }
+
+    /// Compute fresh plasticity diagnostics when `update_index` hits the
+    /// configured interval, cache them, and emit the cached values into
+    /// `metrics` every call. Re-emitting keeps the keys (and their TUI
+    /// section) present on iterations that skip recomputation. Does nothing
+    /// unless `plasticity_log_interval` is set.
+    fn maybe_log_plasticity(
+        &mut self,
+        update_index: u64,
+        actor: &Net<B>,
+        critic: &Net<B>,
+        head: Option<&Net<B>>,
+        sample_states: Tensor<B, 2>,
+        metrics: &mut Report,
+    ) {
+        let interval = match self.config.plasticity_log_interval {
+            Some(interval) if interval > 0 => interval as u64,
+            _ => return,
+        };
+        if update_index.is_multiple_of(interval) {
+            self.last_plasticity = Some(plasticity_snapshot(actor, critic, head, sample_states));
+        }
+        if let Some(snapshot) = self.last_plasticity {
+            snapshot.emit(metrics);
         }
     }
 }
@@ -880,4 +954,152 @@ fn l2_diff(a: &[f32], b: &[f32]) -> f64 {
         .map(|(x, y)| (*x as f64 - *y as f64).powi(2))
         .sum::<f64>()
         .sqrt()
+}
+
+/// L2 norm of a flat parameter vector.
+fn l2_norm(a: &[f32]) -> f64 {
+    a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt()
+}
+
+/// Largest singular value of a row-major `rows x cols` matrix via power
+/// iteration (deterministic uniform start, no dependencies).
+fn top_singular_value(matrix: &[f32], rows: usize, cols: usize) -> f32 {
+    assert_eq!(matrix.len(), rows * cols);
+    let mut vec = vec![1.0 / (cols as f32).sqrt(); cols];
+    let mut next = vec![0.0; cols.max(rows)];
+    for _ in 0..40 {
+        // u = W v, normalized.
+        for (row, out) in matrix.chunks_exact(cols).take(rows).zip(next.iter_mut()) {
+            *out = row.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
+        }
+        let norm = next[..rows]
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt()
+            .max(f32::EPSILON);
+        for out in next.iter_mut().take(rows) {
+            *out /= norm;
+        }
+        // v = W^T u, normalized.
+        for (c, out) in vec.iter_mut().enumerate() {
+            *out = matrix
+                .iter()
+                .skip(c)
+                .step_by(cols)
+                .take(rows)
+                .zip(next.iter())
+                .map(|(a, u)| a * u)
+                .sum();
+        }
+        let norm = vec
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt()
+            .max(f32::EPSILON);
+        for out in vec.iter_mut() {
+            *out /= norm;
+        }
+    }
+    // sigma = ||W v|| with the converged v.
+    let sigma_sq: f32 = matrix
+        .chunks_exact(cols)
+        .take(rows)
+        .map(|row| {
+            let dot: f32 = row.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
+            dot * dot
+        })
+        .sum();
+    sigma_sq.sqrt().max(f32::EPSILON)
+}
+
+/// Mean stable rank (`||W||_F^2 / sigma_max^2`) over a `Net`'s hidden linear
+/// layers. Low rank (near 1) with many units signals representation collapse.
+fn mean_stable_rank<B: Backend>(net: &Net<B>) -> f64 {
+    let hidden = if net.layer_norms().is_empty() {
+        net.linear_layers().len()
+    } else {
+        net.layer_norms().len()
+    };
+    let mut rank_sum = 0.0;
+    let mut layers = 0usize;
+    for layer in net.linear_layers().iter().take(hidden) {
+        let data = layer
+            .weight
+            .val()
+            .clone()
+            .into_data()
+            .into_vec::<f32>()
+            .unwrap();
+        let [rows, cols] = layer.weight.val().shape().dims::<2>();
+        let frob_sq: f32 = data.iter().map(|x| x * x).sum();
+        let sigma = top_singular_value(&data, rows, cols);
+        rank_sum += f64::from(frob_sq / (sigma * sigma).max(f32::EPSILON));
+        layers += 1;
+    }
+    rank_sum / layers.max(1) as f64
+}
+
+/// Compute plasticity diagnostics for one actor/critic pair: parameter L2
+/// norms, mean hidden-layer stable rank, and the fraction of hidden units
+/// whose mean absolute post-ReLU activation falls below `1e-3` (dormant).
+/// When a shared feature head is present, `sample_states` are raw
+/// observations and are passed through it first so dormancy is measured on
+/// each net's true inputs.
+fn plasticity_snapshot<B: Backend>(
+    actor: &Net<B>,
+    critic: &Net<B>,
+    head: Option<&Net<B>>,
+    sample_states: Tensor<B, 2>,
+) -> PlasticitySnapshot {
+    const DORMANT_THRESHOLD: f32 = 1e-3;
+
+    let actor_flat = flatten_net(actor);
+    let critic_flat = flatten_net(critic);
+    let actor_norm = l2_norm(&actor_flat);
+    let critic_norm = l2_norm(&critic_flat);
+    let actor_rank = mean_stable_rank(actor);
+    let critic_rank = mean_stable_rank(critic);
+
+    let sample_states = match head {
+        Some(head) => head.forward(sample_states),
+        None => sample_states,
+    };
+    let mut dormant = [0.0; 2];
+    for (i, net) in [actor, critic].iter().enumerate() {
+        let means = net.hidden_dormancy(sample_states.clone());
+        dormant[i] = means
+            .iter()
+            .filter(|mean| **mean < DORMANT_THRESHOLD)
+            .count() as f64
+            / means.len().max(1) as f64;
+    }
+
+    PlasticitySnapshot {
+        actor_norm,
+        critic_norm,
+        actor_rank,
+        critic_rank,
+        actor_dormant: dormant[0],
+        critic_dormant: dormant[1],
+    }
+}
+
+#[cfg(test)]
+mod plasticity_tests {
+    use super::*;
+
+    #[test]
+    fn top_singular_value_of_scaled_identity() {
+        let matrix = vec![3.0, 0.0, 0.0, 3.0];
+        assert!((top_singular_value(&matrix, 2, 2) - 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn top_singular_value_of_rank_one_matrix() {
+        // [[1, 2], [2, 4]] has singular values {5, 0}.
+        let matrix = vec![1.0, 2.0, 2.0, 4.0];
+        assert!((top_singular_value(&matrix, 2, 2) - 5.0).abs() < 1e-3);
+    }
 }

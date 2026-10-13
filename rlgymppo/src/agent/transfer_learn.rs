@@ -381,6 +381,27 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         metrics["Transfer/update magnitude"] =
             l2_diff(&actor_params_before, &actor_params_after).into();
 
+        // Plasticity diagnostics, same keys as the PPO path, re-emitted
+        // every round from the cache. The critic is reported but never
+        // modified by distillation.
+        {
+            let sample_len = n.min(2048);
+            let sample = resident_student
+                .clone()
+                .narrow(0, 0, sample_len)
+                .cast(DType::F32);
+            let round = self.transfer_rounds;
+            self.maybe_log_plasticity(
+                round,
+                &net.actor,
+                &net.critic,
+                net.shared_head.as_ref(),
+                sample,
+                metrics,
+            );
+        }
+
+        self.transfer_rounds += 1;
         (net, n)
     }
 }
@@ -641,5 +662,99 @@ mod tests {
             critic_before,
             "distillation must not touch the critic"
         );
+    }
+
+    #[test]
+    fn distillation_reports_plasticity_metrics() {
+        let device = Default::default();
+        let obs = 8;
+        let n_actions = 5;
+        let n = 64;
+
+        let teacher = Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let root = std::env::temp_dir().join(format!(
+            "rlgymppo-transfer-plasticity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+        teacher
+            .actor
+            .clone()
+            .save_file(root.join("actor"), &recorder)
+            .unwrap();
+        teacher
+            .shared_head
+            .as_ref()
+            .unwrap()
+            .clone()
+            .save_file(root.join("shared_head"), &recorder)
+            .unwrap();
+        let teacher = Policy::<Flex>::load(
+            &root,
+            &rlgymppo_model::PolicyConfig {
+                input_size: obs,
+                action_size: n_actions,
+                actor_layer_sizes: vec![8],
+                shared_head_layer_sizes: vec![8],
+                norm: rlgymppo_model::NormSelection::None,
+            },
+            &device,
+        )
+        .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let mut net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let memory = memory_batch(n, obs, 0, n_actions);
+        let tl = TransferLearnConfig {
+            lr: 0.05,
+            batch_size: n,
+            mini_batch_size: 32,
+            epochs: 2,
+            loss_scale: 1.0,
+            ..Default::default()
+        };
+
+        let mut ppo = PpoLearnerConfig {
+            learning_rate: 0.05,
+            plasticity_log_interval: Some(1),
+            ..Default::default()
+        }
+        .init(device);
+
+        let mut metrics = Report::default();
+        (net, _) = ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
+        assert!(metrics["Transfer/loss"].as_float().is_finite());
+        let critic_before = flatten_net(&net.critic);
+        let mut metrics = Report::default();
+        (net, _) = ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
+
+        assert_eq!(
+            flatten_net(&net.critic),
+            critic_before,
+            "plasticity logging must not modify the critic"
+        );
+
+        assert_eq!(
+            ppo.transfer_rounds, 2,
+            "each transfer_learn call counts one round"
+        );
+        for key in [
+            "Update/actor weight norm",
+            "Update/critic weight norm",
+            "Update/actor stable rank",
+            "Update/critic stable rank",
+            "Update/actor dormant frac",
+            "Update/critic dormant frac",
+        ] {
+            assert!(
+                metrics[key].as_float().is_finite(),
+                "plasticity metric {key} should be finite"
+            );
+        }
     }
 }

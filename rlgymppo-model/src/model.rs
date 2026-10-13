@@ -1,6 +1,7 @@
 use burn::nn::modules::norm::{Normalization, NormalizationConfig};
 use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
+use burn::tensor::Transaction;
 use burn::tensor::activation::{log_softmax, relu, softmax};
 
 use crate::tensor::{
@@ -120,6 +121,42 @@ impl<B: Backend> Net<B> {
         } else {
             output
         }
+    }
+
+    /// Mean absolute post-ReLU activation per hidden layer, in order.
+    ///
+    /// Mirrors [`Net::forward`] over the hidden stack only (no output layer).
+    /// Entries near zero (below ~`1e-3`) mark dormant units. All scalars sync
+    /// in one transaction; any transient autodiff graph is dropped with the
+    /// returned values.
+    pub fn hidden_dormancy(&self, input: Tensor<B, 2>) -> Vec<f32> {
+        let mut output = input;
+
+        let num_hidden = if self.has_output_layer {
+            self.linear_layers.len() - 1
+        } else {
+            self.linear_layers.len()
+        };
+
+        let mut means = Vec::with_capacity(num_hidden);
+        for (i, layer) in self.linear_layers[..num_hidden].iter().enumerate() {
+            output = layer.forward(output);
+            if let Some(norm) = self.layer_norms.get(i) {
+                output = norm.forward(output);
+            }
+            output = relu(output);
+            means.push(output.clone().abs().mean());
+        }
+
+        let mut transaction = Transaction::default();
+        for mean in &means {
+            transaction = transaction.register(mean.clone());
+        }
+        transaction
+            .execute()
+            .iter()
+            .map(|data| data.to_vec::<f32>().unwrap()[0])
+            .collect()
     }
 
     /// `mask` is an optional [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
@@ -433,5 +470,22 @@ impl<B: Backend> Actic<B> {
         let mask_tensor =
             (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
         argmax_actions(self.actor.masked_logits(features, mask_tensor))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::backend::Flex;
+
+    use super::*;
+
+    #[test]
+    fn hidden_dormancy_reports_per_hidden_layer() {
+        let device = Default::default();
+        let net = Net::<Flex>::new(4, 2, vec![8, 8], &device, None, true);
+        let input = Tensor::<Flex, 2>::zeros([16, 4], &device);
+        let means = net.hidden_dormancy(input);
+        assert_eq!(means.len(), 2);
+        assert!(means.iter().all(|mean| mean.is_finite() && *mean >= 0.0));
     }
 }

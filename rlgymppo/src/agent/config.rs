@@ -86,6 +86,10 @@ pub struct PpoLearnerConfig {
     /// Disabled by default to preserve the historical behavior of discarding
     /// overflow episodes.
     pub retain_overflow_episodes: bool,
+
+    /// Report plasticity diagnostics (`Update/* weight norm`, `stable rank`,
+    /// `dormant frac`) every N updates. `None` (the default) disables them.
+    pub plasticity_log_interval: Option<usize>,
 }
 
 impl Default for PpoLearnerConfig {
@@ -116,6 +120,7 @@ impl Default for PpoLearnerConfig {
             reward_sample_interval: 8,
             max_episode_length: Some(1800),
             retain_overflow_episodes: false,
+            plasticity_log_interval: None,
         }
     }
 }

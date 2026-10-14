@@ -17,7 +17,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent::Ppo;
-pub use agent::config::{GaeEstimator, PpoLearnerConfig};
+pub use agent::config::{
+    AdaptiveClipConfig, GaeEstimator, LrSchedule, PercentileAdvConfig, PpoLearnerConfig,
+    RegenConfig,
+};
 pub use agent::model::{Actic, Net, linear_weight_param_ids};
 pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
@@ -1527,6 +1530,10 @@ where
             let (memory, mut metrics) = self.collector.run_with_budget(nodiff_model, tl.batch_size);
             let collect_elapsed = collect_start.elapsed().as_secs_f64();
 
+            // Same episode-length accounting as the PPO loop. Computed here
+            // because `memory` is moved into distillation below.
+            let ep_len = calculate_episode_length(memory);
+
             // distill the teacher's action distribution into the student
             let train_start = Instant::now();
             let num_new_steps;
@@ -1548,6 +1555,7 @@ where
             );
 
             metrics["Collect/timesteps"] = num_new_steps.into();
+            metrics["Collect/episode length"] = ep_len.into();
             metrics["Timing/collection"] = collect_elapsed.into();
             metrics["Timing/consumption"] = consumption_elapsed.into();
             metrics["Throughput/collected"] = (num_new_steps as f64 / collect_elapsed).into();

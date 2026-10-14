@@ -16,6 +16,103 @@ pub enum GaeEstimator {
     TerminationTime,
 }
 
+/// Learning-rate schedule applied per optimizer update.
+///
+/// Iteration counting starts at zero and uses `Stats::cumulative_model_updates`
+/// on the PPO path (one increment per `learn` call) and an internal round
+/// counter on the transfer-learning path (one increment per `transfer_learn`
+/// call). `Constant` preserves the historical flat-learning-rate behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum LrSchedule {
+    /// No decay: the configured learning rate is used unchanged.
+    #[default]
+    Constant,
+    /// Multiply the learning rate by `decay_per_iteration` every update.
+    /// `1.0` disables decay. For example, halving over 100,000 updates needs
+    /// `0.5f32.powf(1.0 / 100_000.0) ~= 0.999993`.
+    Exponential { decay_per_iteration: f32 },
+    /// Cosine decay from `1.0` to `min_scale` over `total_iterations`
+    /// updates, then flat at `min_scale`.
+    Cosine {
+        total_iterations: u64,
+        min_scale: f32,
+    },
+}
+
+impl LrSchedule {
+    /// Multiplicative learning-rate factor for the given completed-update count.
+    pub fn scale(self, completed_updates: u64) -> f64 {
+        match self {
+            Self::Constant => 1.0,
+            Self::Exponential {
+                decay_per_iteration,
+            } => f64::from(decay_per_iteration).powi(completed_updates.min(1_000_000_000) as i32),
+            Self::Cosine {
+                total_iterations,
+                min_scale,
+            } => {
+                let total = total_iterations.max(1) as f64;
+                let t = (completed_updates as f64 / total).min(1.0);
+                let cosine = 0.5 * (1.0 + (std::f64::consts::PI * t).cos());
+                f64::from(min_scale) + (1.0 - f64::from(min_scale)) * cosine
+            }
+        }
+    }
+}
+
+/// Regenerative regularization (soft shrink-and-perturb toward initialization).
+///
+/// After every optimizer step each parameter is pulled toward its value at the
+/// start of the run: `theta <- theta - strength * (theta - theta_init)`, plus
+/// optional isotropic Gaussian noise (`noise_std`). The snapshot is taken
+/// lazily from the first updated network (and re-taken after a checkpoint
+/// load, which replaces the model), so enabling this adds one extra copy of
+/// the parameters in memory. `None` (the default) disables it entirely.
+///
+/// This is the "continuous regularizer" family that mitigates plasticity loss
+/// in on-policy RL; the noise term makes it behave like soft
+/// shrink-and-perturb, except blending is toward the run's own initialization
+/// rather than freshly sampled weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RegenConfig {
+    /// Pull toward initialization per optimizer step. `0.0` disables the pull
+    /// (noise still applies when `noise_std > 0.0`). Must be in `[0, 1)`.
+    pub strength: f32,
+    /// Standard deviation of Gaussian noise added per optimizer step.
+    pub noise_std: f32,
+}
+
+/// CAPO-style coherence-adaptive PPO clipping.
+///
+/// Per rollout row, the directional consistency (sign agreement) of TD
+/// residuals inside a forward window is measured; rows whose local signal is
+/// consistent get a wider clip bound (up to `max_scale * clip_range`) and
+/// rows with contradictory signal get a narrower one (down to
+/// `min_scale * clip_range`). Windows stop at trajectory boundaries, so no
+/// coherence leaks across episodes. `None` (the default) keeps the fixed
+/// scalar `clip_range` behavior with zero extra cost.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AdaptiveClipConfig {
+    /// Forward window size (including the row itself) for the consistency vote.
+    pub window: usize,
+    /// Clip multiplier for fully incoherent rows (e.g. `0.5`).
+    pub min_scale: f32,
+    /// Clip multiplier for fully coherent rows (e.g. `1.5`).
+    pub max_scale: f32,
+}
+
+/// DreamerV3-style percentile advantage scaling.
+///
+/// Tracks an EMA of the batch `p95 - p5` advantage spread and divides
+/// advantages by it whenever it exceeds `1.0`, keeping policy-gradient scales
+/// stable as returns grow. Takes precedence over `standardize_advantages`
+/// when both are set. `None` (the default) disables it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PercentileAdvConfig {
+    /// EMA decay for the spread estimate (e.g. `0.99`).
+    pub ema_decay: f32,
+}
+
 pub struct PpoLearnerConfig {
     pub gamma: f32,
     pub lambda: f32,
@@ -87,6 +184,19 @@ pub struct PpoLearnerConfig {
     /// overflow episodes.
     pub retain_overflow_episodes: bool,
 
+    // ── Long-run training extensions ──────────────────────────────
+    /// Learning-rate schedule applied per optimizer update.
+    /// `Constant` (the default) preserves the historical flat rate.
+    pub lr_schedule: LrSchedule,
+    /// Regenerative regularization toward initialization (soft
+    /// shrink-and-perturb family). `None` (the default) disables it.
+    pub regen: Option<RegenConfig>,
+    /// Coherence-adaptive per-sample PPO clipping. `None` (the default)
+    /// keeps the fixed scalar `clip_range`.
+    pub adaptive_clip: Option<AdaptiveClipConfig>,
+    /// DreamerV3-style percentile advantage scaling. Takes precedence over
+    /// `standardize_advantages` when both are set. `None` disables it.
+    pub percentile_adv_scaling: Option<PercentileAdvConfig>,
     /// Report plasticity diagnostics (`Update/* weight norm`, `stable rank`,
     /// `dormant frac`) every N updates. `None` (the default) disables them.
     pub plasticity_log_interval: Option<usize>,
@@ -120,6 +230,10 @@ impl Default for PpoLearnerConfig {
             reward_sample_interval: 8,
             max_episode_length: Some(1800),
             retain_overflow_episodes: false,
+            lr_schedule: LrSchedule::Constant,
+            regen: None,
+            adaptive_clip: None,
+            percentile_adv_scaling: None,
             plasticity_log_interval: None,
         }
     }

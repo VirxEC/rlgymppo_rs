@@ -23,7 +23,7 @@ use rayon::prelude::*;
 use rlgymppo_utils::Report;
 
 use crate::OptimizerNetwork;
-use crate::agent::config::PpoLearnerConfig;
+use crate::agent::config::{PpoLearnerConfig, RegenConfig};
 use crate::agent::gae::{GAEOutput, get_gae};
 use crate::agent::model::{Actic, Net, PPOOutput};
 use crate::base::{Memory, TerminalState, get_batch_1d, get_states_batch_range};
@@ -38,11 +38,25 @@ pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<Ad
     /// loading a checkpoint with freshly-created model parameters.
     make_optim: Option<Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O>>,
     device: B::Device,
-    /// Transfer-learning rounds completed; gates plasticity logging there.
+    /// Lazily captured initialization snapshot for regenerative
+    /// regularization. Taken from the first updated network (and re-taken
+    /// after a checkpoint load replaces the model). `None` until needed.
+    init_snapshot: Option<InitSnapshot<B>>,
+    /// Transfer-learning rounds completed; drives the LR schedule there.
     transfer_rounds: u64,
+    /// EMA of the batch advantage spread for percentile scaling.
+    adv_scale_ema: f32,
     /// Last computed plasticity diagnostics, re-emitted every iteration so
     /// metric keys (and their TUI section) stay present between computations.
     last_plasticity: Option<PlasticitySnapshot>,
+}
+
+/// Parameter snapshot used by regenerative regularization. Cloned device
+/// tensors, so enabling `regen` holds one extra copy of the parameters.
+struct InitSnapshot<B: Backend> {
+    actor: Net<B>,
+    critic: Net<B>,
+    head: Option<Net<B>>,
 }
 
 /// Plasticity diagnostics for one actor/critic pair. Cached on `Ppo` and
@@ -77,7 +91,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             make_optim: None,
             config,
             device,
+            init_snapshot: None,
             transfer_rounds: 0,
+            adv_scale_ema: 1.0,
             last_plasticity: None,
         }
     }
@@ -97,7 +113,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             make_optim: Some(make_optim),
             config,
             device,
+            init_snapshot: None,
             transfer_rounds: 0,
+            adv_scale_ema: 1.0,
             last_plasticity: None,
         }
     }
@@ -112,6 +130,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         self.policy_optimizer = make_optim(OptimizerNetwork::Policy, &model.actor);
         self.value_optimizer = make_optim(OptimizerNetwork::Value, &model.critic);
         self.shared_head_optimizer = make_optim(OptimizerNetwork::SharedHead, shared_head);
+        // The loaded model replaces the parameters, so any initialization
+        // snapshot (regenerative regularization target) is stale.
+        self.init_snapshot = None;
     }
 
     /// Save the optimizer states (momentum/velocity buffers) to a checkpoint folder.
@@ -334,10 +355,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             target_vals,
             mut advantages,
             rew_clip_portion,
+            deltas,
         } = get_gae(
             old_values,
             get_batch_1d(memory.rewards(), &memory_indices),
-            terminals,
+            &terminals,
             &trunc_val_preds,
             self.config.gamma,
             self.config.lambda,
@@ -374,7 +396,24 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         metrics["GAE/returns STD"] = (stats.return_stat.get_std() as f64).into();
 
         // Optionally standardize advantages to zero mean and unit variance.
-        if self.config.standardize_advantages {
+        // Percentile scaling takes precedence when both are configured: the
+        // two normalizations compose badly (standardized advantages always
+        // have a spread above 1, which would pin the percentile scale).
+        if let Some(percentile) = self.config.percentile_adv_scaling {
+            let n = advantages.len();
+            let mut sorted = advantages.clone();
+            sorted.sort_by(f32::total_cmp);
+            let quantile = |p: f32| sorted[((p * (n - 1) as f32) as usize).min(n - 1)];
+            let spread = quantile(0.95) - quantile(0.05);
+            self.adv_scale_ema =
+                percentile.ema_decay * self.adv_scale_ema + (1.0 - percentile.ema_decay) * spread;
+            metrics["GAE/adv scale"] = f64::from(self.adv_scale_ema).into();
+            if self.adv_scale_ema > 1.0 {
+                for advantage in &mut advantages {
+                    *advantage /= self.adv_scale_ema;
+                }
+            }
+        } else if self.config.standardize_advantages {
             let mean = advantages.iter().sum::<f32>() / advantages.len() as f32;
             let var = advantages.iter().map(|a| (a - mean).powi(2)).sum::<f32>()
                 / advantages.len() as f32;
@@ -384,6 +423,32 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 *a = (*a - mean) / std;
             }
         }
+
+        // Per-row PPO clip bounds from TD-residual coherence. Disabled
+        // (`None`) means every row uses the fixed scalar `clip_range`.
+        let clip_eps = match self.config.adaptive_clip {
+            Some(clip) => {
+                assert!(clip.window > 0, "adaptive clip window must be positive");
+                let scales = coherence_scales(&deltas, &terminals, clip.window);
+                let mean_scale = scales.iter().sum::<f32>() / scales.len().max(1) as f32;
+                metrics["PPO/mean clip scale"] = f64::from(mean_scale).into();
+                scales
+                    .iter()
+                    .map(|scale| {
+                        self.config.clip_range * clip.min_scale.max(clip.max_scale.min(*scale))
+                    })
+                    .collect::<Vec<_>>()
+            }
+            None => vec![self.config.clip_range; advantages.len()],
+        };
+
+        // Learning-rate schedule factor for this update (1.0 when Constant).
+        // Computed once per `learn` call: every mini-batch in this rollout
+        // shares the same factor.
+        let lr_scale = self
+            .config
+            .lr_schedule
+            .scale(stats.cumulative_model_updates);
 
         let mut metric_totals = MetricTotals::new(&self.device);
         let training_start = Instant::now();
@@ -421,8 +486,13 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
             scope.spawn(move || {
                 for batch_indices in epoch_batches_ref {
-                    let staged =
-                        StagedBatch::stage(memory, &advantages, &target_vals, batch_indices);
+                    let staged = StagedBatch::stage(
+                        memory,
+                        &advantages,
+                        &target_vals,
+                        &clip_eps,
+                        batch_indices,
+                    );
                     if staged_tx.send(staged).is_err() {
                         break;
                     }
@@ -458,7 +528,13 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 let states = resident_b.clone().select(0, index).cast(DType::F32);
                 let batch = GpuBatch::from_staged(states, staged, &self.device);
                 upload_time += upload_start.elapsed();
-                self.train_gpu_batch(&mut net, &batch, &mut metric_totals, &mut optim_time);
+                self.train_gpu_batch(
+                    &mut net,
+                    &batch,
+                    &mut metric_totals,
+                    &mut optim_time,
+                    lr_scale,
+                );
                 batch_training_time += training_start.elapsed();
             }
             metrics["PPO/upload time"] = upload_time.as_secs_f64().into();
@@ -550,6 +626,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         batch: &GpuBatch<B>,
         metric_totals: &mut MetricTotals<B>,
         optim_time: &mut Duration,
+        lr_scale: f64,
     ) {
         let mut actor_gradients = GradientsAccumulator::new();
         let mut critic_gradients = GradientsAccumulator::new();
@@ -566,6 +643,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             let advantage_batch = mini_batch.advantages;
             let target_vals_batch = mini_batch.target_vals;
             let mask_batch = mini_batch.action_masks;
+            let clip_eps_batch = mini_batch.clip_eps;
 
             self.train_mini_batch(
                 net,
@@ -575,6 +653,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 advantage_batch,
                 target_vals_batch,
                 mask_batch,
+                clip_eps_batch,
                 mini_batch_len as f32 / batch_len as f32,
                 &mut actor_gradients,
                 &mut critic_gradients,
@@ -589,6 +668,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             actor_gradients,
             critic_gradients,
             shared_head_gradients,
+            lr_scale,
         );
         *optim_time += optim_start.elapsed();
     }
@@ -603,6 +683,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         advantage_batch: Tensor<B, 2>,
         target_vals_batch: Tensor<B, 2>,
         mask_batch: Option<Tensor<B, 2>>,
+        clip_eps_batch: Tensor<B, 2>,
         mini_batch_weight: f32,
         actor_gradients: &mut GradientsAccumulator<Net<B>>,
         critic_gradients: &mut GradientsAccumulator<Net<B>>,
@@ -626,13 +707,17 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let action_log_prob = log_prob.gather(1, action_batch.clone());
         let log_prob_diff = action_log_prob - old_log_probs_batch;
         let ratios = log_prob_diff.clone().exp();
-        let clipped_ratios = ratios
-            .clone()
-            .clamp(1.0 - self.config.clip_range, 1.0 + self.config.clip_range);
+        // Per-sample clip bounds (`clip_eps` is the fixed `clip_range` for
+        // every row unless adaptive clipping is enabled).
+        let lower = clip_eps_batch.clone().mul_scalar(-1.0).add_scalar(1.0);
+        let upper = clip_eps_batch.add_scalar(1.0);
+        let clipped_ratios = ratios.clone().min_pair(upper).max_pair(lower);
         let kl_mean = ((ratios.clone() - 1.0) - log_prob_diff).mean();
-        let clip_fraction = (ratios.clone() - 1.0)
+        let clip_fraction = clipped_ratios
+            .clone()
+            .sub(ratios.clone())
             .abs()
-            .greater_elem(self.config.clip_range)
+            .greater_elem(0.0)
             .float()
             .mean();
         let actor_loss = -(ratios * advantage_batch.clone())
@@ -677,15 +762,18 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         mut actor_gradients: GradientsAccumulator<Net<B>>,
         mut critic_gradients: GradientsAccumulator<Net<B>>,
         mut shared_head_gradients: GradientsAccumulator<Net<B>>,
+        lr_scale: f64,
     ) {
-        let actor_lr = self
+        let base_actor_lr = self
             .config
             .actor_learning_rate
             .unwrap_or(self.config.learning_rate);
-        let critic_lr = self
+        let base_critic_lr = self
             .config
             .critic_learning_rate
             .unwrap_or(self.config.learning_rate);
+        let actor_lr = (f64::from(base_actor_lr) * lr_scale) as f32;
+        let critic_lr = (f64::from(base_critic_lr) * lr_scale) as f32;
         let shared_head_lr = actor_lr.min(critic_lr);
 
         net.actor =
@@ -703,6 +791,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 shared_head_gradients.grads(),
             ));
         }
+
+        self.apply_regen(net, self.config.regen, true);
     }
 
     /// Compute fresh plasticity diagnostics when `update_index` hits the
@@ -730,6 +820,48 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             snapshot.emit(metrics);
         }
     }
+
+    /// Lazily snapshot the initialization parameters, then pull the
+    /// configured networks toward them. No-op when `regen` is `None`.
+    /// Distillation passes its own config and `include_critic: false` to
+    /// preserve its critic-untouched invariant.
+    fn apply_regen(
+        &mut self,
+        net: &mut Actic<B>,
+        regen: Option<RegenConfig>,
+        include_critic: bool,
+    ) {
+        let Some(regen) = regen else {
+            return;
+        };
+        assert!(
+            regen.strength >= 0.0 && regen.strength < 1.0,
+            "regen strength must be in [0, 1)"
+        );
+        assert!(
+            regen.noise_std >= 0.0,
+            "regen noise_std must be non-negative"
+        );
+        if self.init_snapshot.is_none() {
+            self.init_snapshot = Some(InitSnapshot {
+                actor: net.actor.clone(),
+                critic: net.critic.clone(),
+                head: net.shared_head.clone(),
+            });
+        }
+        let snapshot = self.init_snapshot.as_ref().expect("snapshot just taken");
+        let strength = f64::from(regen.strength);
+        let noise = f64::from(regen.noise_std);
+        net.actor
+            .regen_step(&snapshot.actor, strength, noise, &self.device);
+        if include_critic {
+            net.critic
+                .regen_step(&snapshot.critic, strength, noise, &self.device);
+        }
+        if let (Some(head), Some(init_head)) = (net.shared_head.as_mut(), snapshot.head.as_ref()) {
+            head.regen_step(init_head, strength, noise, &self.device);
+        }
+    }
 }
 
 struct GpuBatch<B: Backend> {
@@ -739,6 +871,8 @@ struct GpuBatch<B: Backend> {
     advantages: Tensor<B, 2>,
     target_vals: Tensor<B, 2>,
     action_masks: Option<Tensor<B, 2>>,
+    /// Per-row PPO clip bound (fixed `clip_range` unless adaptive clipping).
+    clip_eps: Tensor<B, 2>,
 }
 
 /// One batch of rollout rows gathered on the CPU staging thread, ready to
@@ -755,6 +889,8 @@ struct StagedBatch {
     log_probs: Vec<f32>,
     advantages: Vec<f32>,
     target_vals: Vec<f32>,
+    /// Per-row PPO clip bound (fixed `clip_range` unless adaptive clipping).
+    clip_eps: Vec<f32>,
     /// `u8` masks (1 = valid), uploaded as-is and upcast on the GPU.
     /// Empty when the env provides no masks.
     masks: Vec<u8>,
@@ -764,7 +900,13 @@ impl StagedBatch {
     /// Gather one shuffled batch across all CPU cores. Row copies run as
     /// parallel chunk writes; scalar columns use parallel collect. All
     /// reads are disjoint, so no synchronization is needed.
-    fn stage(memory: &Memory, advantages: &[f32], target_vals: &[f32], indices: &[usize]) -> Self {
+    fn stage(
+        memory: &Memory,
+        advantages: &[f32],
+        target_vals: &[f32],
+        clip_eps: &[f32],
+        indices: &[usize],
+    ) -> Self {
         let fill_start = Instant::now();
         let rows = indices.len();
         let mask_width = memory.action_mask_width();
@@ -792,6 +934,11 @@ impl StagedBatch {
             .map(|&index| target_vals[index])
             .collect::<Vec<_>>();
 
+        let batch_clip_eps = indices
+            .par_iter()
+            .map(|&index| clip_eps[index])
+            .collect::<Vec<_>>();
+
         let mut batch_masks = Vec::new();
         if !stored_masks.is_empty() {
             batch_masks = vec![0u8; rows * mask_width];
@@ -812,6 +959,7 @@ impl StagedBatch {
             log_probs: batch_log_probs,
             advantages: batch_advantages,
             target_vals: batch_target_vals,
+            clip_eps: batch_clip_eps,
             masks: batch_masks,
         }
     }
@@ -828,6 +976,7 @@ impl<B: Backend> GpuBatch<B> {
             old_log_probs: Tensor::from_data(TensorData::new(staged.log_probs, [rows, 1]), device),
             advantages: Tensor::from_data(TensorData::new(staged.advantages, [rows, 1]), device),
             target_vals: Tensor::from_data(TensorData::new(staged.target_vals, [rows, 1]), device),
+            clip_eps: Tensor::from_data(TensorData::new(staged.clip_eps, [rows, 1]), device),
             action_masks: (!staged.masks.is_empty()).then(|| {
                 Tensor::<B, 2, Int>::from_data(
                     TensorData::new(staged.masks, [rows, staged.mask_width]),
@@ -846,6 +995,7 @@ impl<B: Backend> GpuBatch<B> {
             old_log_probs: self.old_log_probs.clone().narrow(0, offset, len),
             advantages: self.advantages.clone().narrow(0, offset, len),
             target_vals: self.target_vals.clone().narrow(0, offset, len),
+            clip_eps: self.clip_eps.clone().narrow(0, offset, len),
             action_masks: self
                 .action_masks
                 .as_ref()
@@ -959,6 +1109,46 @@ fn l2_diff(a: &[f32], b: &[f32]) -> f64 {
 /// L2 norm of a flat parameter vector.
 fn l2_norm(a: &[f32]) -> f64 {
     a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt()
+}
+
+/// Per-row TD-residual coherence in `[0, 1]`: the fraction of residuals in a
+/// forward window (including the row itself) sharing the row's sign. Windows
+/// stop after a trajectory boundary row, so coherence never leaks across
+/// episodes. Zero residuals count as agreeing; rows with no nonzero residuals
+/// score `0.5`.
+fn coherence_scales(deltas: &[f32], terminals: &[TerminalState], window: usize) -> Vec<f32> {
+    assert_eq!(
+        deltas.len(),
+        terminals.len(),
+        "deltas and terminals must have the same length"
+    );
+    let window = window.max(1);
+    let n = deltas.len();
+    let mut scales = vec![0.5; n];
+    for i in 0..n {
+        let sign = deltas[i].signum();
+        let mut agree = 0usize;
+        let mut total = 0usize;
+        let mut j = i;
+        while j < n && total < window {
+            let delta = deltas[j];
+            if delta != 0.0 {
+                total += 1;
+                if sign == 0.0 || delta.signum() == sign {
+                    agree += 1;
+                }
+            }
+            let boundary = terminals[j] != TerminalState::None;
+            j += 1;
+            if boundary {
+                break;
+            }
+        }
+        if total > 0 {
+            scales[i] = agree as f32 / total as f32;
+        }
+    }
+    scales
 }
 
 /// Largest singular value of a row-major `rows x cols` matrix via power
@@ -1083,23 +1273,5 @@ fn plasticity_snapshot<B: Backend>(
         critic_rank,
         actor_dormant: dormant[0],
         critic_dormant: dormant[1],
-    }
-}
-
-#[cfg(test)]
-mod plasticity_tests {
-    use super::*;
-
-    #[test]
-    fn top_singular_value_of_scaled_identity() {
-        let matrix = vec![3.0, 0.0, 0.0, 3.0];
-        assert!((top_singular_value(&matrix, 2, 2) - 3.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn top_singular_value_of_rank_one_matrix() {
-        // [[1, 2], [2, 4]] has singular values {5, 0}.
-        let matrix = vec![1.0, 2.0, 2.0, 4.0];
-        assert!((top_singular_value(&matrix, 2, 2) - 5.0).abs() < 1e-3);
     }
 }

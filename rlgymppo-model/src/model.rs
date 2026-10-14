@@ -1,8 +1,9 @@
+use burn::module::Param;
 use burn::nn::modules::norm::{Normalization, NormalizationConfig};
 use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
-use burn::tensor::Transaction;
 use burn::tensor::activation::{log_softmax, relu, softmax};
+use burn::tensor::{Distribution, Transaction};
 
 use crate::tensor::{
     SampledActions, argmax_actions, sample_actions_from_logits, sample_actions_from_logits_tensor,
@@ -159,6 +160,78 @@ impl<B: Backend> Net<B> {
             .collect()
     }
 
+    /// Blend every parameter toward a reference snapshot (regenerative
+    /// regularization): `theta <- theta - strength * (theta - init)`.
+    ///
+    /// Optional isotropic Gaussian noise (`noise_std > 0.0`, applied to linear
+    /// weights and biases only) makes this behave like soft
+    /// shrink-and-perturb, except blending is toward the run's own
+    /// initialization rather than freshly sampled weights. Normalization
+    /// scales are shrunk without noise. Parameter IDs are preserved, so
+    /// optimizer momentum state stays valid.
+    pub fn regen_step(&mut self, init: &Self, strength: f64, noise_std: f64, device: &B::Device) {
+        assert!(
+            (0.0..1.0).contains(&strength),
+            "regen strength must be in [0, 1), got {strength}"
+        );
+        assert!(noise_std >= 0.0, "regen noise_std must be non-negative");
+        assert_eq!(
+            self.linear_layers.len(),
+            init.linear_layers.len(),
+            "regen snapshot architecture mismatch"
+        );
+
+        for (layer, init_layer) in self.linear_layers.iter_mut().zip(init.linear_layers.iter()) {
+            let id = layer.weight.id;
+            layer.weight = Param::initialized(
+                id,
+                blend_param(
+                    &layer.weight,
+                    &init_layer.weight,
+                    strength,
+                    noise_std,
+                    device,
+                ),
+            );
+            if let (Some(bias), Some(init_bias)) = (layer.bias.as_mut(), init_layer.bias.as_ref()) {
+                let id = bias.id;
+                *bias = Param::initialized(
+                    id,
+                    blend_param(bias, init_bias, strength, noise_std, device),
+                );
+            }
+        }
+
+        for (norm, init_norm) in self.layer_norms.iter_mut().zip(init.layer_norms.iter()) {
+            match (norm, init_norm) {
+                (Normalization::Layer(ln), Normalization::Layer(init_ln)) => {
+                    let id = ln.gamma.id;
+                    ln.gamma = Param::initialized(
+                        id,
+                        blend_param(&ln.gamma, &init_ln.gamma, strength, 0.0, device),
+                    );
+                    if let (Some(beta), Some(init_beta)) = (ln.beta.as_mut(), init_ln.beta.as_ref())
+                    {
+                        let id = beta.id;
+                        *beta = Param::initialized(
+                            id,
+                            blend_param(beta, init_beta, strength, 0.0, device),
+                        );
+                    }
+                }
+                (Normalization::Rms(rms), Normalization::Rms(init_rms)) => {
+                    let id = rms.gamma.id;
+                    rms.gamma = Param::initialized(
+                        id,
+                        blend_param(&rms.gamma, &init_rms.gamma, strength, 0.0, device),
+                    );
+                }
+                _ => {
+                    // Mismatched normalization variants: leave untouched.
+                }
+            }
+        }
+    }
     /// `mask` is an optional [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
     /// Masks disabled actions by adding a large negative bias to their logits.
     pub fn linear_layers(&self) -> &[Linear<B>] {
@@ -183,7 +256,25 @@ impl<B: Backend> Net<B> {
     }
 
     pub fn infer(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
-        softmax(self.masked_logits(input, mask), 1).clamp(1e-11, 1.0)
+        self.infer_with_temperature(input, mask, 1.0)
+    }
+
+    /// Softmax action distribution with temperature scaling: `softmax(logits / temperature)`.
+    ///
+    /// `temperature == 1.0` matches [`Net::infer`] exactly; higher values
+    /// soften the distribution (higher entropy targets for distillation).
+    /// Must be positive and finite.
+    pub fn infer_with_temperature(
+        &self,
+        input: Tensor<B, 2>,
+        mask: Option<Tensor<B, 2>>,
+        temperature: f32,
+    ) -> Tensor<B, 2> {
+        assert!(
+            temperature > 0.0 && temperature.is_finite(),
+            "temperature must be positive and finite, got {temperature}"
+        );
+        softmax(self.masked_logits(input, mask) / temperature, 1).clamp(1e-11, 1.0)
     }
 
     pub fn react_deterministic(
@@ -243,12 +334,38 @@ impl<B: Backend> Net<B> {
     }
 }
 
+/// Blend one parameter tensor toward its initialization snapshot:
+/// `(1 - strength) * param + strength * init`, plus optional isotropic
+/// Gaussian noise. See [`Net::regen_step`].
+fn blend_param<B: Backend, const D: usize>(
+    param: &Param<Tensor<B, D>>,
+    init: &Param<Tensor<B, D>>,
+    strength: f64,
+    noise_std: f64,
+    device: &B::Device,
+) -> Tensor<B, D> {
+    let blended = param
+        .val()
+        .clone()
+        .mul_scalar(1.0 - strength)
+        .add(init.val().clone().mul_scalar(strength));
+    if noise_std > 0.0 {
+        let shape = blended.shape().dims::<D>();
+        blended.add(Tensor::random(
+            shape,
+            Distribution::Normal(0.0, noise_std),
+            device,
+        ))
+    } else {
+        blended
+    }
+}
+
 /// Device-resident actor output. Calling [`Self::wait`] is the first point at
 /// which sampled actions and log probabilities are transferred back to the CPU.
 pub struct PendingActions<B: Backend> {
     sampled: SampledActions<B>,
 }
-
 impl<B: Backend> PendingActions<B> {
     pub fn wait(self) -> (Vec<usize>, Vec<f32>) {
         sampled_actions_to_vec(self.sampled)
@@ -476,8 +593,53 @@ impl<B: Backend> Actic<B> {
 #[cfg(test)]
 mod tests {
     use burn::backend::Flex;
+    use burn::prelude::Backend;
 
     use super::*;
+
+    fn flat<B: Backend>(net: &Net<B>) -> Vec<f32> {
+        let mut data = Vec::new();
+        for layer in net.linear_layers() {
+            data.extend(
+                layer
+                    .weight
+                    .val()
+                    .clone()
+                    .into_data()
+                    .into_vec::<f32>()
+                    .unwrap(),
+            );
+        }
+        data
+    }
+
+    #[test]
+    fn regen_step_with_zero_strength_is_identity() {
+        let device = Default::default();
+        let mut net = Net::<Flex>::new(4, 2, vec![8, 8], &device, None, true);
+        let init = net.clone();
+        let before = flat(&net);
+        net.regen_step(&init, 0.0, 0.0, &device);
+        assert_eq!(flat(&net), before);
+    }
+
+    #[test]
+    fn regen_step_pulls_toward_snapshot() {
+        let device = Default::default();
+        let mut net = Net::<Flex>::new(4, 2, vec![8, 8], &device, None, true);
+        let init = net.clone();
+        let init_flat = flat(&init);
+
+        // Move away with pure noise, then pull halfway back.
+        net.regen_step(&init, 0.0, 1.0, &device);
+        let noisy = flat(&net);
+        assert_ne!(noisy, init_flat);
+        net.regen_step(&init, 0.5, 0.0, &device);
+        let pulled = flat(&net);
+        for ((p, n), i) in pulled.iter().zip(noisy.iter()).zip(init_flat.iter()) {
+            assert!((p - (0.5 * n + 0.5 * i)).abs() < 1e-5);
+        }
+    }
 
     #[test]
     fn hidden_dormancy_reports_per_hidden_layer() {
@@ -487,5 +649,31 @@ mod tests {
         let means = net.hidden_dormancy(input);
         assert_eq!(means.len(), 2);
         assert!(means.iter().all(|mean| mean.is_finite() && *mean >= 0.0));
+    }
+
+    #[test]
+    fn temperature_one_matches_infer_and_softens() {
+        let device = Default::default();
+        let net = Net::<Flex>::new(4, 3, vec![8], &device, None, true);
+        let input = Tensor::<Flex, 2>::ones([8, 4], &device);
+        let base: Vec<f32> = net
+            .infer(input.clone(), None)
+            .into_data()
+            .into_vec()
+            .unwrap();
+        let same: Vec<f32> = net
+            .infer_with_temperature(input.clone(), None, 1.0)
+            .into_data()
+            .into_vec()
+            .unwrap();
+        assert_eq!(base, same);
+        let soft: Vec<f32> = net
+            .infer_with_temperature(input, None, 2.0)
+            .into_data()
+            .into_vec()
+            .unwrap();
+        let entropy =
+            |probs: &[f32]| -probs.iter().map(|p| p * p.max(1e-11).ln()).sum::<f32>() / 8.0;
+        assert!(entropy(&soft) >= entropy(&base));
     }
 }

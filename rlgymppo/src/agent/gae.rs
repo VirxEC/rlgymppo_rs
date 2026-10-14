@@ -6,6 +6,9 @@ pub(crate) struct GAEOutput {
     pub(crate) target_vals: Vec<f32>,
     pub(crate) advantages: Vec<f32>,
     pub(crate) rew_clip_portion: f32,
+    /// Per-row TD residual (`pred_ret - value`), kept for coherence-based
+    /// extensions such as adaptive clipping. Raw (pre-standardization).
+    pub(crate) deltas: Vec<f32>,
 }
 
 /// Calculate returns and GAE advantages from row-aligned rollout data.
@@ -17,7 +20,7 @@ pub(crate) struct GAEOutput {
 pub(crate) fn get_gae(
     values: Vec<f32>,
     rewards: Vec<f32>,
-    terminals: Vec<TerminalState>,
+    terminals: &[TerminalState],
     trunc_val_preds: &[f32],
     gamma: f32,
     lambda: f32,
@@ -55,6 +58,7 @@ pub(crate) fn get_gae(
     let mut returns = vec![0.0; n_returns];
     let mut target_vals = vec![0.0; n_returns];
     let mut advantages = vec![0.0; n_returns];
+    let mut deltas = vec![0.0; n_returns];
 
     let mut return_scale = 1.0 / return_std;
     if return_scale.is_nan() || return_scale == 0.0 {
@@ -103,6 +107,7 @@ pub(crate) fn get_gae(
 
         let pred_ret = norm_reward + gamma * next_val * not_done;
         let delta = pred_ret - values[i];
+        deltas[i] = delta;
 
         last_return = rewards[i] + last_return * gamma * not_done * not_trunc;
         returns[i] = last_return;
@@ -124,6 +129,7 @@ pub(crate) fn get_gae(
         target_vals,
         advantages,
         rew_clip_portion,
+        deltas,
     }
 }
 
@@ -170,7 +176,7 @@ mod tests {
         get_gae(
             values.to_vec(),
             rewards.to_vec(),
-            terminals.to_vec(),
+            terminals,
             trunc_values,
             gamma,
             lambda,

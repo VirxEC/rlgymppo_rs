@@ -92,11 +92,23 @@ impl<B: Backend> Policy<B> {
     /// negative logit bias. Used as the teacher target distribution during
     /// transfer learning (knowledge distillation).
     pub fn infer(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+        self.infer_with_temperature(input, mask, 1.0)
+    }
+
+    /// Temperature-scaled teacher distribution for distillation. `1.0`
+    /// matches [`Policy::infer`]; higher values soften the targets.
+    pub fn infer_with_temperature(
+        &self,
+        input: Tensor<B, 2>,
+        mask: Option<Tensor<B, 2>>,
+        temperature: f32,
+    ) -> Tensor<B, 2> {
         let features = match &self.shared_head {
             Some(head) => head.forward(input),
             None => input,
         };
-        self.actor.infer(features, mask)
+        self.actor
+            .infer_with_temperature(features, mask, temperature)
     }
 
     #[must_use]

@@ -11,6 +11,7 @@ use rlgymppo_utils::Report;
 use super::{flatten_net, l2_diff};
 use crate::NormSelection;
 use crate::agent::Ppo;
+use crate::agent::config::{LrSchedule, RegenConfig};
 use crate::agent::model::{Actic, Net};
 use crate::base::{Memory, get_states_batch_range};
 
@@ -86,6 +87,18 @@ pub struct TransferLearnConfig {
     pub loss_scale: f32,
     /// Exponent applied to each sample's loss before averaging.
     pub loss_exponent: f32,
+    /// Learning-rate schedule applied per distillation round.
+    /// `Constant` (the default) preserves the historical flat rate.
+    pub lr_schedule: LrSchedule,
+    /// Regenerative regularization toward initialization, applied to the
+    /// student actor and shared head only (the critic is never touched by
+    /// distillation). `None` (the default) disables it.
+    pub regen: Option<RegenConfig>,
+    /// Temperature for the teacher's softmax targets. `1.0` (the default)
+    /// preserves the historical raw-teacher distribution; higher values
+    /// (e.g. `2.0`) soften peaked teachers so small students get denser
+    /// gradients. Must be positive and finite.
+    pub teacher_temperature: f32,
 }
 
 impl Default for TransferLearnConfig {
@@ -98,6 +111,9 @@ impl Default for TransferLearnConfig {
             use_kl_div: false,
             loss_scale: 500.0,
             loss_exponent: 1.0,
+            lr_schedule: LrSchedule::Constant,
+            regen: None,
+            teacher_temperature: 1.0,
         }
     }
 }
@@ -114,6 +130,10 @@ impl TransferLearnConfig {
         assert!(
             self.loss_scale > 0.0,
             "loss scale must be greater than zero"
+        );
+        assert!(
+            self.teacher_temperature > 0.0 && self.teacher_temperature.is_finite(),
+            "teacher temperature must be positive and finite"
         );
         assert_eq!(
             self.batch_size % self.mini_batch_size,
@@ -232,7 +252,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     .narrow(0, start, chunk_len)
                     .cast(FloatDType::F32)
             });
-            let probs = teacher.infer(states, masks);
+            let probs = teacher.infer_with_temperature(states, masks, tl.teacher_temperature);
             let chunk_entropy = -(probs.clone() * probs.clone().log()).sum_dim(1).mean();
             let weighted = chunk_entropy * weight;
             teacher_entropy = Some(match teacher_entropy {
@@ -339,9 +359,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 }
             }
 
-            // One optimizer step per epoch over the whole batch.
+            // One optimizer step per epoch over the whole batch. The LR
+            // schedule runs on completed distillation rounds.
             let optim_start = Instant::now();
-            let lr: f64 = tl.lr.into();
+            let lr = (f64::from(tl.lr) * tl.lr_schedule.scale(self.transfer_rounds)) as f32;
+            let lr: f64 = lr.into();
             net.actor = self
                 .policy_optimizer
                 .step(lr, net.actor.clone(), actor_gradients.grads());
@@ -352,6 +374,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     head_gradients.grads(),
                 ));
             }
+            self.apply_regen(&mut net, tl.regen, false);
             optim_time += optim_start.elapsed();
         }
 
@@ -665,7 +688,9 @@ mod tests {
     }
 
     #[test]
-    fn distillation_reports_plasticity_metrics() {
+    fn distillation_supports_schedule_regen_and_plasticity_logging() {
+        use crate::agent::config::{LrSchedule, RegenConfig};
+
         let device = Default::default();
         let obs = 8;
         let n_actions = 5;
@@ -673,7 +698,7 @@ mod tests {
 
         let teacher = Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
         let root = std::env::temp_dir().join(format!(
-            "rlgymppo-transfer-plasticity-{}-{}",
+            "rlgymppo-transfer-regen-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -716,6 +741,13 @@ mod tests {
             mini_batch_size: 32,
             epochs: 2,
             loss_scale: 1.0,
+            lr_schedule: LrSchedule::Exponential {
+                decay_per_iteration: 0.999,
+            },
+            regen: Some(RegenConfig {
+                strength: 1e-3,
+                noise_std: 0.0,
+            }),
             ..Default::default()
         };
 
@@ -726,19 +758,28 @@ mod tests {
         }
         .init(device);
 
-        let mut metrics = Report::default();
-        (net, _) = ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
-        assert!(metrics["Transfer/loss"].as_float().is_finite());
         let critic_before = flatten_net(&net.critic);
         let mut metrics = Report::default();
         (net, _) = ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
+        let first_loss = metrics["Transfer/loss"].as_float();
 
+        let mut metrics = Report::default();
+        (net, _) = ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
+        let second_loss = metrics["Transfer/loss"].as_float();
+
+        assert!(
+            first_loss.is_finite() && first_loss > 0.0,
+            "first distillation loss should be finite and positive, got {first_loss}"
+        );
+        assert!(
+            second_loss < first_loss,
+            "distillation should reduce the loss with schedule+regen ({first_loss} -> {second_loss})"
+        );
         assert_eq!(
             flatten_net(&net.critic),
             critic_before,
-            "plasticity logging must not modify the critic"
+            "distillation with regen must not touch the critic"
         );
-
         assert_eq!(
             ppo.transfer_rounds, 2,
             "each transfer_learn call counts one round"
@@ -756,5 +797,89 @@ mod tests {
                 "plasticity metric {key} should be finite"
             );
         }
+    }
+
+    #[test]
+    fn distillation_softens_teacher_targets_with_temperature() {
+        let device = Default::default();
+        let obs = 8;
+        let n_actions = 5;
+        let n = 64;
+
+        let teacher = Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let root = std::env::temp_dir().join(format!(
+            "rlgymppo-transfer-temp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+        teacher
+            .actor
+            .clone()
+            .save_file(root.join("actor"), &recorder)
+            .unwrap();
+        teacher
+            .shared_head
+            .as_ref()
+            .unwrap()
+            .clone()
+            .save_file(root.join("shared_head"), &recorder)
+            .unwrap();
+        let teacher = Policy::<Flex>::load(
+            &root,
+            &rlgymppo_model::PolicyConfig {
+                input_size: obs,
+                action_size: n_actions,
+                actor_layer_sizes: vec![8],
+                shared_head_layer_sizes: vec![8],
+                norm: rlgymppo_model::NormSelection::None,
+            },
+            &device,
+        )
+        .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let memory = memory_batch(n, obs, 0, n_actions);
+        let base_tl = TransferLearnConfig {
+            lr: 0.05,
+            batch_size: n,
+            mini_batch_size: 32,
+            epochs: 1,
+            loss_scale: 1.0,
+            ..Default::default()
+        };
+
+        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+            learning_rate: 0.05,
+            ..Default::default()
+        }
+        .init(device);
+
+        let mut metrics = Report::default();
+        ppo.transfer_learn(net.clone(), &teacher, &memory, &base_tl, &mut metrics);
+        let base_entropy = metrics["Transfer/teacher entropy"].as_float();
+        assert!(base_entropy.is_finite());
+
+        let hot_tl = TransferLearnConfig {
+            teacher_temperature: 2.0,
+            ..base_tl
+        };
+        let mut metrics = Report::default();
+        ppo.transfer_learn(net, &teacher, &memory, &hot_tl, &mut metrics);
+        let hot_loss = metrics["Transfer/loss"].as_float();
+        let hot_entropy = metrics["Transfer/teacher entropy"].as_float();
+        assert!(
+            hot_loss.is_finite() && hot_loss > 0.0,
+            "softened distillation loss should be finite and positive, got {hot_loss}"
+        );
+        assert!(
+            hot_entropy >= base_entropy,
+            "higher temperature should not sharpen the teacher ({base_entropy} -> {hot_entropy})"
+        );
     }
 }

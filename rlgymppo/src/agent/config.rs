@@ -37,6 +37,14 @@ pub enum LrSchedule {
         total_iterations: u64,
         min_scale: f32,
     },
+    /// Exponential decay with a floor: multiplies by `decay_per_iteration`
+    /// every update but never drops below `min_scale`. Pins an early
+    /// milestone (e.g. 3e-3 -> 1e-3 at 200B steps) while guaranteeing a
+    /// long convergence tail instead of decaying into the dirt.
+    ExponentialWithFloor {
+        decay_per_iteration: f32,
+        min_scale: f32,
+    },
 }
 
 impl LrSchedule {
@@ -56,6 +64,12 @@ impl LrSchedule {
                 let cosine = 0.5 * (1.0 + (std::f64::consts::PI * t).cos());
                 f64::from(min_scale) + (1.0 - f64::from(min_scale)) * cosine
             }
+            Self::ExponentialWithFloor {
+                decay_per_iteration,
+                min_scale,
+            } => f64::from(decay_per_iteration)
+                .powi(completed_updates.min(1_000_000_000) as i32)
+                .max(f64::from(min_scale)),
         }
     }
 }

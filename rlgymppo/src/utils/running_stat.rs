@@ -13,6 +13,13 @@ pub struct Stats {
     pub cumulative_timesteps: u64,
     pub cumulative_model_updates: u64,
     pub cumulative_epochs: u64,
+    /// Completed transfer-learning (distillation) rounds. Drives the transfer
+    /// LR schedule (`TransferLearnConfig::lr_schedule`). Defaults to `0` so
+    /// legacy checkpoints without the field resume at round `0` with an
+    /// explicit warning (the true count is unrecoverable there) rather than
+    /// silently pretending the schedule is correct.
+    #[serde(default)]
+    pub transfer_rounds: u64,
     pub return_stat: WelfordRunningStat,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wandb_run: Option<WandbRun>,

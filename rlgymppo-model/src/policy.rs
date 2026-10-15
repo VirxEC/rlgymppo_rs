@@ -87,6 +87,18 @@ impl<B: Backend> Policy<B> {
         Ok(Self { shared_head, actor })
     }
 
+    /// Masked action logits (`actor.forward` over shared-head features plus
+    /// the invalid-action bias). Exposed so distillation can run the expensive
+    /// forward once and derive both the tempered and `T=1` distributions via
+    /// [`Net::probs_with_temperature`].
+    pub fn masked_logits(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+        let features = match &self.shared_head {
+            Some(head) => head.forward(input),
+            None => input,
+        };
+        self.actor.masked_logits(features, mask)
+    }
+
     /// Compute the stochastic action distribution `softmax(masked_logits)`
     /// clamped to `[1e-11, 1]`, optionally masking invalid actions with a large
     /// negative logit bias. Used as the teacher target distribution during
@@ -199,5 +211,32 @@ mod tests {
                 .into_iter()
                 .all(f32::is_finite)
         );
+    }
+
+    #[test]
+    fn masked_logits_matches_infer_paths() {
+        let device = Default::default();
+        let policy = Policy::<Flex> {
+            shared_head: Some(Net::<Flex>::new(4, 0, vec![8], &device, None, false)),
+            actor: Net::<Flex>::new(8, 3, vec![8], &device, None, true),
+        };
+        let input = Tensor::<Flex, 2>::ones([4, 4], &device);
+        let logits = policy.masked_logits(input.clone(), None);
+        let via_logits_t1 = Net::<Flex>::probs_with_temperature(logits.clone(), 1.0);
+        let via_logits_hot = Net::<Flex>::probs_with_temperature(logits, 2.0);
+        let direct_t1: Vec<f32> = policy
+            .infer(input.clone(), None)
+            .into_data()
+            .into_vec()
+            .unwrap();
+        let direct_hot: Vec<f32> = policy
+            .infer_with_temperature(input, None, 2.0)
+            .into_data()
+            .into_vec()
+            .unwrap();
+        let from_logits_t1: Vec<f32> = via_logits_t1.into_data().into_vec().unwrap();
+        let from_logits_hot: Vec<f32> = via_logits_hot.into_data().into_vec().unwrap();
+        assert_eq!(direct_t1, from_logits_t1);
+        assert_eq!(direct_hot, from_logits_hot);
     }
 }

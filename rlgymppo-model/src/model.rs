@@ -124,12 +124,14 @@ impl<B: Backend> Net<B> {
         }
     }
 
-    /// Mean absolute post-ReLU activation per hidden layer, in order.
+    /// Mean absolute post-ReLU activation per hidden unit, flattened across
+    /// hidden layers in order.
     ///
     /// Mirrors [`Net::forward`] over the hidden stack only (no output layer).
-    /// Entries near zero (below ~`1e-3`) mark dormant units. All scalars sync
-    /// in one transaction; any transient autodiff graph is dropped with the
-    /// returned values.
+    /// Each entry is the batch-mean absolute activation of one hidden unit;
+    /// entries below `1e-3` mark dormant units. All rows sync in one
+    /// transaction; any transient autodiff graph is dropped with the returned
+    /// values.
     pub fn hidden_dormancy(&self, input: Tensor<B, 2>) -> Vec<f32> {
         let mut output = input;
 
@@ -139,25 +141,26 @@ impl<B: Backend> Net<B> {
             self.linear_layers.len()
         };
 
-        let mut means = Vec::with_capacity(num_hidden);
+        let mut per_unit = Vec::with_capacity(num_hidden);
         for (i, layer) in self.linear_layers[..num_hidden].iter().enumerate() {
             output = layer.forward(output);
             if let Some(norm) = self.layer_norms.get(i) {
                 output = norm.forward(output);
             }
             output = relu(output);
-            means.push(output.clone().abs().mean());
+            // Batch-mean absolute activation per unit: [batch, units] -> [1, units].
+            per_unit.push(output.clone().abs().mean_dim(0));
         }
 
         let mut transaction = Transaction::default();
-        for mean in &means {
-            transaction = transaction.register(mean.clone());
+        for units in &per_unit {
+            transaction = transaction.register(units.clone());
         }
-        transaction
-            .execute()
-            .iter()
-            .map(|data| data.to_vec::<f32>().unwrap()[0])
-            .collect()
+        let mut out = Vec::new();
+        for data in transaction.execute() {
+            out.extend(data.to_vec::<f32>().unwrap());
+        }
+        out
     }
 
     /// Blend every parameter toward a reference snapshot (regenerative
@@ -270,11 +273,20 @@ impl<B: Backend> Net<B> {
         mask: Option<Tensor<B, 2>>,
         temperature: f32,
     ) -> Tensor<B, 2> {
+        Self::probs_with_temperature(self.masked_logits(input, mask), temperature)
+    }
+
+    /// Softmax distribution from precomputed (already masked) logits.
+    ///
+    /// Shared helper so callers can run the expensive forward once and derive
+    /// both the tempered training distribution and the `T=1` deployment
+    /// distribution from the same logits. Must be positive and finite.
+    pub fn probs_with_temperature(logits: Tensor<B, 2>, temperature: f32) -> Tensor<B, 2> {
         assert!(
             temperature > 0.0 && temperature.is_finite(),
             "temperature must be positive and finite, got {temperature}"
         );
-        softmax(self.masked_logits(input, mask) / temperature, 1).clamp(1e-11, 1.0)
+        softmax(logits / temperature, 1).clamp(1e-11, 1.0)
     }
 
     pub fn react_deterministic(
@@ -642,13 +654,61 @@ mod tests {
     }
 
     #[test]
-    fn hidden_dormancy_reports_per_hidden_layer() {
+    fn hidden_dormancy_reports_per_hidden_unit() {
         let device = Default::default();
         let net = Net::<Flex>::new(4, 2, vec![8, 8], &device, None, true);
         let input = Tensor::<Flex, 2>::zeros([16, 4], &device);
         let means = net.hidden_dormancy(input);
-        assert_eq!(means.len(), 2);
+        // One entry per hidden unit flattened across layers (8 + 8), not one
+        // per layer.
+        assert_eq!(means.len(), 16);
         assert!(means.iter().all(|mean| mean.is_finite() && *mean >= 0.0));
+    }
+
+    #[test]
+    fn hidden_dormancy_detects_partial_dead_units() {
+        let device = Default::default();
+        let mut net = Net::<Flex>::new(2, 2, vec![4, 4], &device, None, true);
+        // Force a known pattern: zero weights so each hidden output is
+        // `relu(bias)` broadcast over the batch. First hidden layer has two
+        // dead units (negative bias) and two live units.
+        let biases: [[f32; 4]; 2] = [[-1.0, -1.0, 1.0, 1.0], [0.5, 0.5, 0.5, 0.5]];
+        for (idx, bias_vals) in biases.iter().enumerate() {
+            let layer = &mut net.linear_layers[idx];
+            let w_id = layer.weight.id;
+            let zero_w = layer.weight.val().clone().mul_scalar(0.0);
+            layer.weight = Param::initialized(w_id, zero_w);
+            if let Some(bias) = layer.bias.as_mut() {
+                let b_id = bias.id;
+                let b_tensor: Tensor<Flex, 1> =
+                    Tensor::from_data(TensorData::new(bias_vals.to_vec(), [4]), &device);
+                *bias = Param::initialized(b_id, b_tensor);
+            }
+        }
+        let input = Tensor::<Flex, 2>::zeros([8, 2], &device);
+        let means = net.hidden_dormancy(input);
+        assert_eq!(means.len(), 8);
+        // First layer: [0, 0, 1, 1]; second layer sees only the live outputs
+        // but has zero weights, so `relu(0.5)` on all four units.
+        let dead = means.iter().filter(|m| **m < 1e-3).count();
+        let live = means.iter().filter(|m| **m >= 1e-3).count();
+        assert_eq!(dead, 2, "expected two dormant units, got {means:?}");
+        assert_eq!(live, 6, "expected six live units, got {means:?}");
+        for (i, mean) in means.iter().enumerate() {
+            if i < 2 {
+                assert!(mean.abs() < 1e-6, "unit {i} should be dead, got {mean}");
+            } else if i < 4 {
+                assert!(
+                    (mean - 1.0).abs() < 1e-5,
+                    "unit {i} should be 1.0, got {mean}"
+                );
+            } else {
+                assert!(
+                    (mean - 0.5).abs() < 1e-5,
+                    "unit {i} should be 0.5, got {mean}"
+                );
+            }
+        }
     }
 
     #[test]

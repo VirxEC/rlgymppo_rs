@@ -965,6 +965,12 @@ where
 {
     /// Load the previously saved model, training stats, and optimizer state.
     /// Does nothing if the model can't be loaded, this is safe to call unconditionally.
+    ///
+    /// Restores the transfer-round count (`Stats::transfer_rounds`) into the
+    /// PPO schedule state and the regen anchor (`*_init` files) when present.
+    /// Legacy checkpoints predate both: they resume the transfer LR schedule
+    /// from round `0` and re-anchor regen to the loaded weights, each with an
+    /// explicit warning (the original counts/anchors are unrecoverable).
     pub fn load(&mut self) {
         (self.model, self.stats) =
             load_latest_model(self.model.clone(), &self.checkpoints_folder, &self.device);
@@ -976,6 +982,15 @@ where
 
         if let Some(latest_folder) = latest_checkpoint_folder(&self.checkpoints_folder) {
             self.ppo.load_optimizers(&latest_folder);
+            self.ppo.load_regen_snapshot(&latest_folder, &self.model);
+            self.ppo.set_transfer_rounds(self.stats.transfer_rounds);
+            if !self.ppo.has_regen_snapshot() && self.ppo.ppo_regen_enabled() {
+                eprintln!(
+                    "Warning: checkpoint has no regen anchor (legacy); regen will \
+                     initialize from the loaded weights on the next update, not the \
+                     run's original initialization."
+                );
+            }
         }
 
         // Load saved policy versions from disk.
@@ -1399,11 +1414,48 @@ where
                 .shared_head
                 .as_ref()
                 .map_or(0, |head| head.num_params());
+        let student_actor_params = self.model.actor.num_params();
+        let student_head_params = self
+            .model
+            .shared_head
+            .as_ref()
+            .map_or(0, |head| head.num_params());
+        println!(
+            " > Transfer learning: teacher checkpoint: {}",
+            teacher_folder.display()
+        );
         println!(
             " > Transfer learning: teacher has {teacher_params} params, \
-             student actor has {} params",
-            self.model.actor.num_params()
+             student has {} params (actor {student_actor_params} + head {student_head_params})",
+            student_actor_params + student_head_params
         );
+        // Legacy resume warnings (load stays quiet so pure-PPO loads do not
+        // false-positive). A legacy transfer checkpoint has no
+        // `transfer_rounds` field (defaults to 0) and no `*_init` anchor
+        // files, which is indistinguishable from a fresh transfer started
+        // from PPO weights — the messages below say when to ignore them.
+        if self.stats.transfer_rounds == 0
+            && self.stats.cumulative_model_updates > 0
+            && tl.lr_schedule != crate::LrSchedule::Constant
+        {
+            eprintln!(
+                "Warning: transfer-round count is 0 despite prior updates. If resuming \
+                 transfer learning from a legacy checkpoint, the LR schedule restarts from \
+                 round 0 instead of continuing. If starting a fresh transfer from PPO \
+                 weights, ignore this warning."
+            );
+        }
+        if tl.regen.is_some()
+            && !self.ppo.has_regen_snapshot()
+            && self.stats.cumulative_model_updates > 0
+        {
+            eprintln!(
+                "Warning: starting transfer with regen but no saved anchor despite prior \
+                 updates; the anchor will be the current weights. If resuming a legacy \
+                 transfer run this is not the original transfer-start anchor. If starting a \
+                 fresh transfer, this anchor (the transfer start) is correct."
+            );
+        }
 
         // Initialise the wandb MetricSender via embedded Python before
         // the TUI so the "wandb run started" message goes to stdout
@@ -1547,6 +1599,9 @@ where
             self.stats.cumulative_timesteps += num_new_steps as u64;
             self.stats.cumulative_model_updates += 1;
             self.stats.cumulative_epochs += tl.epochs as u64;
+            // Persist the transfer-round count so cosine/exponential LR
+            // schedules continue (not restart) across restarts.
+            self.stats.transfer_rounds = self.ppo.transfer_rounds();
             self.version_mgr.on_iteration(
                 &self.model.valid(),
                 self.stats.cumulative_timesteps,

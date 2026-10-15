@@ -19,9 +19,11 @@ pub enum GaeEstimator {
 /// Learning-rate schedule applied per optimizer update.
 ///
 /// Iteration counting starts at zero and uses `Stats::cumulative_model_updates`
-/// on the PPO path (one increment per `learn` call) and an internal round
-/// counter on the transfer-learning path (one increment per `transfer_learn`
-/// call). `Constant` preserves the historical flat-learning-rate behavior.
+/// on the PPO path (one increment per `learn` call) and a separate
+/// transfer-round counter on the transfer-learning path (one increment per
+/// `transfer_learn` call, persisted via `Stats::transfer_rounds` so restarts
+/// continue rather than restart the schedule). `Constant` preserves the
+/// historical flat-learning-rate behavior.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum LrSchedule {
     /// No decay: the configured learning rate is used unchanged.
@@ -78,10 +80,12 @@ impl LrSchedule {
 ///
 /// After every optimizer step each parameter is pulled toward its value at the
 /// start of the run: `theta <- theta - strength * (theta - theta_init)`, plus
-/// optional isotropic Gaussian noise (`noise_std`). The snapshot is taken
-/// lazily from the first updated network (and re-taken after a checkpoint
-/// load, which replaces the model), so enabling this adds one extra copy of
-/// the parameters in memory. `None` (the default) disables it entirely.
+/// optional isotropic Gaussian noise (`noise_std`). The anchor is captured
+/// from the pre-update network on the first training call that enables it
+/// and preserved across checkpoint save/load (`*_init` files), so enabling
+/// this adds one extra copy of the parameters in memory. Legacy checkpoints
+/// without anchor files re-anchor to the loaded weights with a warning.
+/// `None` (the default) disables it entirely.
 ///
 /// This is the "continuous regularizer" family that mitigates plasticity loss
 /// in on-policy RL; the noise term makes it behave like soft

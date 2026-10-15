@@ -38,9 +38,10 @@ pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<Ad
     /// loading a checkpoint with freshly-created model parameters.
     make_optim: Option<Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O>>,
     device: B::Device,
-    /// Lazily captured initialization snapshot for regenerative
-    /// regularization. Taken from the first updated network (and re-taken
-    /// after a checkpoint load replaces the model). `None` until needed.
+    /// Fixed initialization anchor for regenerative regularization.
+    /// Captured from the pre-update network on the first training call that
+    /// enables `regen` (see `ensure_regen_snapshot`), then preserved across
+    /// checkpoint save/load. `None` until needed.
     init_snapshot: Option<InitSnapshot<B>>,
     /// Transfer-learning rounds completed; drives the LR schedule there.
     transfer_rounds: u64,
@@ -121,6 +122,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     }
 
     /// Recreate model-aware optimizers for a newly-loaded model.
+    ///
+    /// Clears the regen anchor: call `load_regen_snapshot` afterwards to
+    /// restore the original anchor from the checkpoint folder (legacy
+    /// checkpoints without anchor files fall back to the loaded weights with
+    /// a warning when `regen` is enabled).
     pub fn reinit_optimizers(&mut self, model: &Actic<B>) {
         let Some(make_optim) = self.make_optim.as_ref() else {
             return;
@@ -131,7 +137,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         self.value_optimizer = make_optim(OptimizerNetwork::Value, &model.critic);
         self.shared_head_optimizer = make_optim(OptimizerNetwork::SharedHead, shared_head);
         // The loaded model replaces the parameters, so any initialization
-        // snapshot (regenerative regularization target) is stale.
+        // snapshot is stale until `load_regen_snapshot` restores the saved
+        // anchor (or `ensure_regen_snapshot` re-captures with a warning).
         self.init_snapshot = None;
     }
 
@@ -163,6 +170,130 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
         #[cfg(not(feature = "tui"))]
         println!("Saved optimizer states to: {folder:?}");
+    }
+
+    /// Completed transfer-learning rounds (one per `transfer_learn` call).
+    /// Drives the transfer LR schedule. Persisted via `Stats::transfer_rounds`
+    /// (see `Learner::load`); use the accessor pair to keep them in sync.
+    pub fn transfer_rounds(&self) -> u64 {
+        self.transfer_rounds
+    }
+
+    /// Restore the transfer-round count from a checkpoint (see
+    /// `Stats::transfer_rounds`). Legacy checkpoints without the field load
+    /// as `0`; callers warn instead of silently assuming it is correct.
+    pub fn set_transfer_rounds(&mut self, rounds: u64) {
+        self.transfer_rounds = rounds;
+    }
+
+    /// Whether a regen anchor is currently held.
+    pub fn has_regen_snapshot(&self) -> bool {
+        self.init_snapshot.is_some()
+    }
+
+    /// Whether the PPO path has regenerative regularization enabled.
+    /// Transfer-learning regen is per-call (`TransferLearnConfig::regen`),
+    /// so this only reflects the PPO config.
+    pub fn ppo_regen_enabled(&self) -> bool {
+        self.config.regen.is_some()
+    }
+
+    /// Capture the regen anchor from the pre-update network when `regen` is
+    /// enabled and no anchor exists yet. Must run before the first optimizer
+    /// step so the anchor is the true initialization, not post-update weights.
+    pub fn ensure_regen_snapshot(&mut self, net: &Actic<B>, regen: Option<RegenConfig>) {
+        if regen.is_none() || self.init_snapshot.is_some() {
+            return;
+        }
+        self.init_snapshot = Some(InitSnapshot {
+            actor: net.actor.clone(),
+            critic: net.critic.clone(),
+            head: net.shared_head.clone(),
+        });
+    }
+
+    /// Save the regen anchor (`*_init` files) alongside a checkpoint. No-op
+    /// when no anchor exists yet. Values only; live `ParamId`s are preserved
+    /// by `regen_step` (see `blend_param`).
+    pub fn save_regen_snapshot(&self, folder: &Path) {
+        let Some(snapshot) = self.init_snapshot.as_ref() else {
+            return;
+        };
+        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+        snapshot
+            .actor
+            .clone()
+            .save_file(folder.join("actor_init"), &recorder)
+            .unwrap();
+        snapshot
+            .critic
+            .clone()
+            .save_file(folder.join("critic_init"), &recorder)
+            .unwrap();
+        if let Some(head) = snapshot.head.as_ref() {
+            head.clone()
+                .save_file(folder.join("shared_head_init"), &recorder)
+                .unwrap();
+        }
+    }
+
+    /// Restore the regen anchor saved by `save_regen_snapshot`. No-op for
+    /// legacy checkpoints without anchor files (caller warns and falls back
+    /// to the loaded weights when `regen` is enabled). Never fails on
+    /// missing files; mismatched architectures fall back with a warning.
+    pub fn load_regen_snapshot(&mut self, folder: &Path, model: &Actic<B>) {
+        if !folder.join("actor_init.mpk.gz").is_file() {
+            return;
+        }
+        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+        let actor = model
+            .actor
+            .clone()
+            .load_file(folder.join("actor_init"), &recorder, &self.device)
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "Warning: failed to load regen actor anchor ({e}); using loaded weights."
+                );
+                model.actor.clone()
+            });
+        let critic = model
+            .critic
+            .clone()
+            .load_file(folder.join("critic_init"), &recorder, &self.device)
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "Warning: failed to load regen critic anchor ({e}); using loaded weights."
+                );
+                model.critic.clone()
+            });
+        let head = match (
+            model.shared_head.clone(),
+            folder.join("shared_head_init.mpk.gz").is_file(),
+        ) {
+            (Some(template), true) => Some(
+                template
+                    .load_file(folder.join("shared_head_init"), &recorder, &self.device)
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "Warning: failed to load regen head anchor ({e}); using loaded weights."
+                        );
+                        model.shared_head.clone().expect("head just matched")
+                    }),
+            ),
+            (Some(_), false) => {
+                eprintln!(
+                    "Warning: regen anchor is partial (actor anchor present but shared-head anchor \
+                     missing); using loaded head weights for the head."
+                );
+                model.shared_head.clone()
+            }
+            (None, _) => None,
+        };
+        self.init_snapshot = Some(InitSnapshot {
+            actor,
+            critic,
+            head,
+        });
     }
 
     /// Load the optimizer states from a checkpoint folder.
@@ -235,6 +366,20 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         memory
             .validate()
             .unwrap_or_else(|error| panic!("Invalid learner memory: {error}"));
+
+        // Fix the regen anchor to the pre-update weights (not post-step).
+        // Preserved across checkpoints via save/load; legacy checkpoints warn
+        // and fall back to the loaded weights.
+        {
+            let had_snapshot = self.has_regen_snapshot();
+            self.ensure_regen_snapshot(&net, self.config.regen);
+            if self.config.regen.is_some() && !had_snapshot && stats.cumulative_model_updates > 0 {
+                eprintln!(
+                    "Warning: regen anchor missing (legacy checkpoint); anchoring to the loaded \
+                     weights, not the run's original initialization."
+                );
+            }
+        }
 
         // Snapshot parameters before training for update-magnitude computation.
         // This downloads all weights to the CPU, so it is timed separately.
@@ -821,10 +966,12 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         }
     }
 
-    /// Lazily snapshot the initialization parameters, then pull the
-    /// configured networks toward them. No-op when `regen` is `None`.
-    /// Distillation passes its own config and `include_critic: false` to
-    /// preserve its critic-untouched invariant.
+    /// Pull the configured networks toward the fixed initialization anchor.
+    /// No-op when `regen` is `None`. The anchor must already exist via
+    /// `ensure_regen_snapshot` (called before the first update); the fallback
+    /// below only covers regen enabled mid-run after updates. Distillation
+    /// passes its own config and `include_critic: false` to preserve its
+    /// critic-untouched invariant.
     fn apply_regen(
         &mut self,
         net: &mut Actic<B>,

@@ -97,6 +97,7 @@ pub fn save_checkpoint<
 ) -> PathBuf {
     let folder = save_model(model, running_stats, &base_folder, limit);
     ppo.save_optimizers(&folder);
+    ppo.save_regen_snapshot(&folder);
     folder
 }
 

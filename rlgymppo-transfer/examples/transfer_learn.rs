@@ -1,6 +1,6 @@
 // Transfer learning: distill `rlgymppo-trainer`'s parent model (the big
 // policy trained by the `rlgymppo-trainer` `run` example) into a smaller
-// student policy, then continue with normal PPO training afterwards.
+// student policy. PPO fine-tuning requires a separate run.
 //
 // Before running, train the parent model with the `rlgymppo-trainer` `run`
 // example (its checkpoints land in `./checkpoints`). This example then:
@@ -9,7 +9,8 @@
 //     `DefaultObs<1>` (53 floats) instead of the parent's `DefaultObs<3>`
 //     (141 floats) — everything else is identical,
 //   - trains the student's actor and shared head to match the teacher's
-//     action distribution.
+//     action distribution. The student critic stays untrained. Rewards are
+//     metrics only. This example does not run PPO updates.
 //
 // ```sh
 // cargo run -p rlgymppo-transfer --example transfer_learn --features torch

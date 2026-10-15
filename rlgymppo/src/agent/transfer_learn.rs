@@ -522,9 +522,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         metrics["Transfer/actor update magnitude"] = actor_magnitude.into();
         metrics["Transfer/head update magnitude"] = head_magnitude.into();
 
-        // Plasticity diagnostics, same keys as the PPO path, re-emitted
-        // every round from the cache. The critic is reported but never
-        // modified by distillation.
+        // Policy-only plasticity diagnostics (actor + shared head),
+        // re-emitted every round from the cache. The critic stays frozen
+        // during distillation, so it is neither measured nor reported here.
         {
             let sample_len = n.min(2048);
             let sample = resident_student
@@ -532,10 +532,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 .narrow(0, 0, sample_len)
                 .cast(DType::F32);
             let round = self.transfer_rounds;
-            self.maybe_log_plasticity(
+            self.maybe_log_transfer_plasticity(
                 round,
                 &net.actor,
-                &net.critic,
                 net.shared_head.as_ref(),
                 sample,
                 metrics,
@@ -937,15 +936,25 @@ mod tests {
         );
         for key in [
             "Update/actor weight norm",
-            "Update/critic weight norm",
+            "Update/head weight norm",
             "Update/actor stable rank",
-            "Update/critic stable rank",
+            "Update/head stable rank",
             "Update/actor dormant frac",
-            "Update/critic dormant frac",
+            "Update/head dormant frac",
         ] {
             assert!(
                 metrics[key].as_float().is_finite(),
-                "plasticity metric {key} should be finite"
+                "policy plasticity metric {key} should be finite"
+            );
+        }
+        for key in [
+            "Update/critic weight norm",
+            "Update/critic stable rank",
+            "Update/critic dormant frac",
+        ] {
+            assert!(
+                !metrics.to_flat_map().contains_key(key),
+                "frozen critic metric {key} must not be emitted in transfer mode"
             );
         }
     }
@@ -1491,5 +1500,212 @@ mod tests {
         );
         assert!(total > actor, "total must exceed actor-only magnitude");
         assert!(metrics["Transfer/lr"].as_float() > 0.0);
+    }
+
+    #[test]
+    fn transfer_plasticity_reports_actor_and_head_not_critic() {
+        let device = Default::default();
+        let obs = 6;
+        let n_actions = 4;
+        let n = 32;
+        let teacher_actic =
+            Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let teacher = Policy::<Flex> {
+            actor: teacher_actic.actor.clone(),
+            shared_head: teacher_actic.shared_head.clone(),
+        };
+        let memory = memory_batch(n, obs, 0, n_actions);
+        let tl = TransferLearnConfig {
+            lr: 0.05,
+            batch_size: n,
+            mini_batch_size: 16,
+            epochs: 1,
+            loss_scale: 1.0,
+            ..Default::default()
+        };
+        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+            learning_rate: 0.05,
+            plasticity_log_interval: Some(1),
+            ..Default::default()
+        }
+        .init(device);
+        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+
+        let mut metrics = Report::default();
+        let (net, _) = ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
+        for key in [
+            "Update/actor weight norm",
+            "Update/head weight norm",
+            "Update/actor stable rank",
+            "Update/head stable rank",
+            "Update/actor dormant frac",
+            "Update/head dormant frac",
+        ] {
+            let value = metrics[key].as_float();
+            assert!(
+                value.is_finite(),
+                "policy plasticity metric {key} should be finite, got {value}"
+            );
+        }
+        assert!(metrics["Update/actor weight norm"].as_float() > 0.0);
+        assert!(metrics["Update/head weight norm"].as_float() > 0.0);
+        for key in ["Update/actor dormant frac", "Update/head dormant frac"] {
+            let value = metrics[key].as_float();
+            assert!(
+                (0.0..=1.0).contains(&value),
+                "dormancy {key} should be a fraction, got {value}"
+            );
+        }
+        for key in [
+            "Update/critic weight norm",
+            "Update/critic stable rank",
+            "Update/critic dormant frac",
+        ] {
+            assert!(
+                !metrics.to_flat_map().contains_key(key),
+                "frozen critic metric {key} must not be emitted in transfer mode"
+            );
+        }
+
+        // Second round re-emits the same policy-only keys from the cache.
+        let mut metrics = Report::default();
+        ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
+        for key in [
+            "Update/actor weight norm",
+            "Update/head weight norm",
+            "Update/actor stable rank",
+            "Update/head stable rank",
+            "Update/actor dormant frac",
+            "Update/head dormant frac",
+        ] {
+            assert!(
+                metrics[key].as_float().is_finite(),
+                "re-emitted policy metric {key} should stay finite"
+            );
+        }
+        for key in [
+            "Update/critic weight norm",
+            "Update/critic stable rank",
+            "Update/critic dormant frac",
+        ] {
+            assert!(
+                !metrics.to_flat_map().contains_key(key),
+                "frozen critic metric {key} must stay absent across rounds"
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_plasticity_omits_head_when_absent() {
+        let device = Default::default();
+        let obs = 6;
+        let n_actions = 4;
+        let n = 32;
+        let teacher_actic =
+            Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[], &device, None);
+        assert!(
+            teacher_actic.shared_head.is_none(),
+            "teacher fixture must have no shared head"
+        );
+        let teacher = Policy::<Flex> {
+            actor: teacher_actic.actor.clone(),
+            shared_head: None,
+        };
+        let memory = memory_batch(n, obs, 0, n_actions);
+        let tl = TransferLearnConfig {
+            lr: 0.05,
+            batch_size: n,
+            mini_batch_size: 16,
+            epochs: 1,
+            loss_scale: 1.0,
+            ..Default::default()
+        };
+        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+            learning_rate: 0.05,
+            plasticity_log_interval: Some(1),
+            ..Default::default()
+        }
+        .init(device);
+        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[], &device, None);
+        assert!(
+            net.shared_head.is_none(),
+            "student fixture must have no shared head"
+        );
+
+        let mut metrics = Report::default();
+        ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
+        for key in [
+            "Update/actor weight norm",
+            "Update/actor stable rank",
+            "Update/actor dormant frac",
+        ] {
+            assert!(
+                metrics[key].as_float().is_finite(),
+                "actor plasticity metric {key} should be finite without a head"
+            );
+        }
+        for key in [
+            "Update/head weight norm",
+            "Update/head stable rank",
+            "Update/head dormant frac",
+            "Update/critic weight norm",
+            "Update/critic stable rank",
+            "Update/critic dormant frac",
+        ] {
+            assert!(
+                !metrics.to_flat_map().contains_key(key),
+                "metric {key} must be absent when there is no head (no misleading zeros)"
+            );
+        }
+    }
+
+    #[test]
+    fn ppo_plasticity_still_reports_actor_and_critic() {
+        use burn::tensor::TensorData;
+
+        let device = Default::default();
+        let obs = 6;
+        let net = Actic::<B>::new(obs, 4, vec![8], vec![8], &[8], &device, None);
+        // Varied sample rows so dormancy is measured on non-constant inputs.
+        let states: Vec<f32> = (0..8 * obs).map(|i| ((i % 7) as f32) / 7.0 - 0.5).collect();
+        let sample = Tensor::<B, 2>::from_data(TensorData::new(states, [8, obs]), &device);
+        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+            learning_rate: 0.05,
+            plasticity_log_interval: Some(1),
+            ..Default::default()
+        }
+        .init(device);
+        let mut metrics = Report::default();
+        ppo.maybe_log_plasticity(
+            0,
+            &net.actor,
+            &net.critic,
+            net.shared_head.as_ref(),
+            sample,
+            &mut metrics,
+        );
+        for key in [
+            "Update/actor weight norm",
+            "Update/critic weight norm",
+            "Update/actor stable rank",
+            "Update/critic stable rank",
+            "Update/actor dormant frac",
+            "Update/critic dormant frac",
+        ] {
+            assert!(
+                metrics[key].as_float().is_finite(),
+                "PPO plasticity metric {key} should stay finite"
+            );
+        }
+        for key in [
+            "Update/head weight norm",
+            "Update/head stable rank",
+            "Update/head dormant frac",
+        ] {
+            assert!(
+                !metrics.to_flat_map().contains_key(key),
+                "PPO must not emit head metric {key}"
+            );
+        }
     }
 }

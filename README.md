@@ -150,14 +150,25 @@ Models, optimizer states, and training stats are saved to the folder specified
 by `checkpoints_folder` (defaults to `./checkpoints`). On restart, `learner.load()`
 resumes from the latest checkpoint — safe to call unconditionally.
 
-### Transfer learning
+### Transfer learning: policy distillation
 
-If you have an already-trained model that is too large, you can distill it
-into a smaller policy with `learner.transfer_learn(...)`. The student acts in
-the environment while the frozen teacher (described by a `TeacherConfig`)
-scores the same states; the student's actor and shared head are trained to
-match the teacher's action distribution (mean-absolute-difference or KL-div
-loss, scaled by `loss_scale`). The critic is not trained.
+Use `learner.transfer_learn(...)` to distill a trained teacher into a smaller
+student policy. The student acts in the environment. The frozen teacher
+(described by `TeacherConfig`) scores the same states. The student's actor
+and shared head learn to match the teacher's action distribution. The loss
+uses mean absolute difference or forward KL divergence, scaled by `loss_scale`.
+
+**This loop trains the policy only.** It does not train the student critic,
+compute a value loss, or run PPO updates. Rewards are metrics only. A new
+critic stays untrained. It is not copied from the teacher. Checkpoints retain
+the critic and its optimizer for resume compatibility. Keep the critic shape
+unchanged when resuming an existing run.
+
+The dashboard header shows **Policy distillation**. When plasticity logging
+is enabled, `Update/actor ...` and `Update/head ...` report weight norm,
+stable rank, and dormant fraction. The head metrics are absent if the student
+has no shared head. Distillation does not compute or report critic diagnostics.
+Normal PPO retains its actor and critic diagnostics.
 
 The teacher and student must share the same action space, but the observation
 space may differ: pass an old (teacher) obs builder factory to
@@ -196,10 +207,15 @@ checkpoints (the latest is used). Keep it distinct from the folder this run
 saves its own checkpoints to. The distillation hyperparameters (learning rate,
 batch sizes, epochs, loss) live in `TransferLearnConfig`.
 
-Run it with a small `config` (smaller `policy_layer_sizes` etc.) and watch
-`Transfer/loss` and `Transfer/accuracy` (argmax agreement with the teacher).
-Once distillation has converged, stop with `Q`, then continue with normal PPO
-training (`learner.load()` + `learner.learn()`) to fine-tune.
+Use a small policy configuration and monitor `Transfer/loss` and
+`Transfer/accuracy` (argmax agreement with the teacher). The deployed policy
+parameter count includes the actor and shared head. It excludes the critic
+and teacher. A larger critic does not improve distillation.
+
+PPO fine-tuning is a separate, optional phase. There is no automatic transition.
+To start it, save the run and stop with `Q`. Resume with `learner.load()` and
+call `learner.learn()` instead. Keep the student architecture and observations
+compatible with the checkpoint. The new critic still needs value training.
 
 The `rlgymppo-transfer` crate bundles a ready-to-run transfer-learning
 example that pretends `rlgymppo-trainer` is the parent model: it loads the

@@ -176,8 +176,10 @@ pub(crate) fn render_header(
         .get("Cumulative/updates")
         .map(|v| format_num(*v))
         .unwrap_or_default();
+    // Show transfer mode when the current report holds distillation keys.
+    let is_distillation = metrics.keys().any(|key| key.starts_with("Transfer/"));
 
-    let header_text = Text::from(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " rlgymppo ",
             Style::default()
@@ -192,7 +194,18 @@ pub(crate) fn render_header(
             format!("Iteration: {updates}"),
             Style::default().fg(Color::Green),
         ),
-    ]));
+    ];
+    if is_distillation {
+        spans.push(Span::raw(" │ "));
+        spans.push(Span::styled(
+            "Policy distillation",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let header_text = Text::from(Line::from(spans));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1262,6 +1275,62 @@ mod tests {
         let heights = [7, 3, 2];
         assert!(!can_partition_heights(&heights, 2)); // target 6, 7 > 6
         assert!(can_partition_heights(&heights, 1));
+    }
+
+    fn render_header_text(metrics: &HashMap<String, f64>) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_header(frame, frame.area(), metrics))
+            .expect("draw header");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn test_header_shows_policy_distillation_for_transfer_reports() {
+        let mut metrics = HashMap::new();
+        metrics.insert("Cumulative/steps".into(), 1000.0);
+        metrics.insert("Cumulative/updates".into(), 10.0);
+        metrics.insert("Transfer/loss".into(), 0.5);
+
+        let text = render_header_text(&metrics);
+        assert!(
+            text.contains("Policy distillation"),
+            "header must show the label for transfer reports: {text:?}"
+        );
+        assert!(text.contains("Steps:"), "header must keep steps: {text:?}");
+        assert!(
+            text.contains("Iteration:"),
+            "header must keep iteration: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_header_hides_policy_distillation_for_ppo_reports() {
+        let mut metrics = HashMap::new();
+        metrics.insert("Cumulative/steps".into(), 1000.0);
+        metrics.insert("Cumulative/updates".into(), 10.0);
+        metrics.insert("Loss/policy".into(), 0.1);
+
+        let text = render_header_text(&metrics);
+        assert!(
+            !text.contains("Policy distillation"),
+            "header must hide the label for PPO reports: {text:?}"
+        );
+        assert!(text.contains("Steps:"), "header must keep steps: {text:?}");
+        assert!(
+            text.contains("Iteration:"),
+            "header must keep iteration: {text:?}"
+        );
     }
 }
 

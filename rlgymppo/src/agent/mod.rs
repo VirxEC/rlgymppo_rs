@@ -50,6 +50,11 @@ pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<Ad
     /// Last computed plasticity diagnostics, re-emitted every iteration so
     /// metric keys (and their TUI section) stay present between computations.
     last_plasticity: Option<PlasticitySnapshot>,
+    /// Last computed policy-only (actor + shared head) diagnostics for
+    /// transfer learning, re-emitted every round. Separate from
+    /// `last_plasticity` so transfer rounds never emit frozen-critic keys
+    /// and PPO never emits head keys.
+    last_transfer_plasticity: Option<PolicyPlasticitySnapshot>,
 }
 
 /// Parameter snapshot used by regenerative regularization. Cloned device
@@ -83,6 +88,36 @@ impl PlasticitySnapshot {
     }
 }
 
+/// Policy-only plasticity diagnostics for transfer learning (actor + shared
+/// head). Cached on `Ppo` separately from [`PlasticitySnapshot`] and
+/// re-emitted every round so the keys stay present between recomputations.
+/// Head fields are `None` when the student has no shared head; `emit` then
+/// skips the head keys instead of reporting misleading zeros.
+#[derive(Clone, Copy, Debug, Default)]
+struct PolicyPlasticitySnapshot {
+    actor_norm: f64,
+    actor_rank: f64,
+    actor_dormant: f64,
+    head_norm: Option<f64>,
+    head_rank: Option<f64>,
+    head_dormant: Option<f64>,
+}
+
+impl PolicyPlasticitySnapshot {
+    fn emit(self, metrics: &mut Report) {
+        metrics["Update/actor weight norm"] = self.actor_norm.into();
+        metrics["Update/actor stable rank"] = self.actor_rank.into();
+        metrics["Update/actor dormant frac"] = self.actor_dormant.into();
+        if let (Some(norm), Some(rank), Some(dormant)) =
+            (self.head_norm, self.head_rank, self.head_dormant)
+        {
+            metrics["Update/head weight norm"] = norm.into();
+            metrics["Update/head stable rank"] = rank.into();
+            metrics["Update/head dormant frac"] = dormant.into();
+        }
+    }
+}
+
 impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     pub fn new(config: PpoLearnerConfig, device: B::Device, make_optim: impl Fn() -> O) -> Self {
         Self {
@@ -96,6 +131,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             transfer_rounds: 0,
             adv_scale_ema: 1.0,
             last_plasticity: None,
+            last_transfer_plasticity: None,
         }
     }
 
@@ -118,6 +154,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             transfer_rounds: 0,
             adv_scale_ema: 1.0,
             last_plasticity: None,
+            last_transfer_plasticity: None,
         }
     }
 
@@ -966,6 +1003,33 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         }
     }
 
+    /// Compute fresh policy-only (actor + shared head) diagnostics when `round`
+    /// hits the configured interval, cache them, and emit the cached values
+    /// into `metrics` every call. Mirrors [`Self::maybe_log_plasticity`] but
+    /// never touches the frozen critic: distillation leaves it untrained, so
+    /// reporting it would show misleading dormancy. Does nothing unless
+    /// `plasticity_log_interval` is set.
+    fn maybe_log_transfer_plasticity(
+        &mut self,
+        round: u64,
+        actor: &Net<B>,
+        head: Option<&Net<B>>,
+        sample_states: Tensor<B, 2>,
+        metrics: &mut Report,
+    ) {
+        let interval = match self.config.plasticity_log_interval {
+            Some(interval) if interval > 0 => interval as u64,
+            _ => return,
+        };
+        if round.is_multiple_of(interval) {
+            self.last_transfer_plasticity =
+                Some(policy_plasticity_snapshot(actor, head, sample_states));
+        }
+        if let Some(snapshot) = self.last_transfer_plasticity {
+            snapshot.emit(metrics);
+        }
+    }
+
     /// Pull the configured networks toward the fixed initialization anchor.
     /// No-op when `regen` is `None`. The anchor must already exist via
     /// `ensure_regen_snapshot` (called before the first update); the fallback
@@ -1420,5 +1484,58 @@ fn plasticity_snapshot<B: Backend>(
         critic_rank,
         actor_dormant: dormant[0],
         critic_dormant: dormant[1],
+    }
+}
+
+/// Compute policy-only plasticity diagnostics for transfer learning: actor and
+/// shared-head L2 norms, mean hidden-layer stable rank, and dormant-unit
+/// fraction. The critic is never read: it stays frozen during distillation,
+/// so its dormancy would mislead. `sample_states` are raw observations; the
+/// actor is measured on head-transformed features while the head itself is
+/// measured on the raw inputs. A missing head yields `None` head fields so
+/// [`PolicyPlasticitySnapshot::emit`] skips those keys.
+fn policy_plasticity_snapshot<B: Backend>(
+    actor: &Net<B>,
+    head: Option<&Net<B>>,
+    sample_states: Tensor<B, 2>,
+) -> PolicyPlasticitySnapshot {
+    const DORMANT_THRESHOLD: f32 = 1e-3;
+
+    let actor_norm = l2_norm(&flatten_net(actor));
+    let actor_rank = mean_stable_rank(actor);
+
+    let (head_norm, head_rank, head_dormant) = match head {
+        Some(head) => {
+            let norm = l2_norm(&flatten_net(head));
+            let rank = mean_stable_rank(head);
+            let means = head.hidden_dormancy(sample_states.clone());
+            let dormant = means
+                .iter()
+                .filter(|mean| **mean < DORMANT_THRESHOLD)
+                .count() as f64
+                / means.len().max(1) as f64;
+            (Some(norm), Some(rank), Some(dormant))
+        }
+        None => (None, None, None),
+    };
+
+    let actor_inputs = match head {
+        Some(head) => head.forward(sample_states),
+        None => sample_states,
+    };
+    let actor_means = actor.hidden_dormancy(actor_inputs);
+    let actor_dormant = actor_means
+        .iter()
+        .filter(|mean| **mean < DORMANT_THRESHOLD)
+        .count() as f64
+        / actor_means.len().max(1) as f64;
+
+    PolicyPlasticitySnapshot {
+        actor_norm,
+        actor_rank,
+        actor_dormant,
+        head_norm,
+        head_rank,
+        head_dormant,
     }
 }

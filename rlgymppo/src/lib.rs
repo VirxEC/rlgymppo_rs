@@ -1363,9 +1363,15 @@ where
     /// head are trained to match the teacher's action distribution. When the
     /// learner was initialized with [`LearnerConfig::init_with_old_obs`],
     /// the teacher consumes the old obs builder's (different) observation
-    /// space; otherwise it shares the student's. The critic is not trained, so
-    /// once distillation has produced a good warm start, restart the run and
-    /// call [`Learner::learn`] to continue with normal PPO training.
+    /// space; otherwise it shares the student's.
+    ///
+    /// This loop performs policy distillation only. It does not train the
+    /// student critic or run PPO updates. Rewards are metrics only. Plasticity
+    /// diagnostics report the actor and shared head, not the unused critic.
+    /// Checkpoints retain the critic and its optimizer for resume compatibility.
+    /// To train with PPO later, explicitly resume with [`Learner::learn`] and
+    /// the same student architecture and observations. There is no automatic
+    /// transition to PPO.
     pub fn transfer_learn(mut self, teacher: TeacherConfig, tl: TransferLearnConfig) {
         teacher.validate();
         tl.validate();
@@ -1377,10 +1383,8 @@ where
              Enable the 'wandb' feature in Cargo.toml to use Weights & Biases logging."
         );
 
-        // Transfer learning doesn't use the skill tracker (evaluating the
-        // policy against previous versions or the optional fixed Nexto is
-        // meaningless mid-distillation), so shut it down before collecting
-        // any batches.
+        // This loop does not schedule skill evaluations. Stop the tracker
+        // before collecting distillation batches.
         if let Some(st) = self.skill_tracker.take() {
             let ratings = st.join(&mut self.version_mgr.versions);
             self.stats.skill_ratings = Some(ratings.data);
@@ -1421,14 +1425,17 @@ where
             .as_ref()
             .map_or(0, |head| head.num_params());
         println!(
-            " > Transfer learning: teacher checkpoint: {}",
+            " > Policy distillation: teacher checkpoint: {}",
             teacher_folder.display()
         );
         println!(
-            " > Transfer learning: teacher has {teacher_params} params, \
-             student has {} params (actor {student_actor_params} + head {student_head_params})",
+            " > Policy distillation: teacher has {teacher_params} policy params, \
+             student has {} policy params (actor {student_actor_params} + head {student_head_params})",
             student_actor_params + student_head_params
         );
+        println!(" > Train the student actor and shared head only. No PPO updates run.");
+        println!(" > Rewards are metrics only. Critic weights and optimizer stay unchanged.");
+        println!(" > Checkpoints retain the unused critic for resume compatibility.");
         // Legacy resume warnings (load stays quiet so pure-PPO loads do not
         // false-positive). A legacy transfer checkpoint has no
         // `transfer_rounds` field (defaults to 0) and no `*_init` anchor
@@ -1553,7 +1560,7 @@ where
         }
 
         #[cfg(not(feature = "tui"))]
-        println!("Running transfer learning. This might be slow at first...");
+        println!("Running policy distillation. This might be slow at first...");
         Self::print_controls_prompt();
 
         let inital_cumulative_updates = self.stats.cumulative_model_updates;

@@ -1,5 +1,5 @@
 use burn::prelude::*;
-use burn::tensor::{DType, f16};
+use burn::tensor::{DType, Device, f16};
 use rayon::prelude::*;
 
 /// Terminal-state encoding.
@@ -25,18 +25,18 @@ fn convert_states_to_f16(data: &[f32]) -> Vec<f16> {
 /// Upload state rows `[start, end)` as device `f16`: half the bytes cross
 /// the bus and half the VRAM stays resident.
 ///
-/// The returned tensor holds half-precision storage despite its `Tensor<B,
-/// 2>` type. Slice it with `narrow` or `select` first, then upcast the
+/// The returned tensor holds half-precision storage despite its `Tensor<2>`
+/// type. Slice it with `narrow` or `select` first, then upcast the
 /// slice with `.cast(DType::F32)` before running the model. Never feed it
 /// to the model directly: mixed-precision matmuls fail on dtype mismatch.
 /// See [`convert_states_to_f16`] for the precision bounds.
-pub fn get_states_batch_range<B: Backend>(
+pub fn get_states_batch_range(
     data: &[f32],
     width: usize,
     start: usize,
     end: usize,
-    device: &B::Device,
-) -> Tensor<B, 2> {
+    device: &Device,
+) -> Tensor<2> {
     let rows = end - start;
     let half = convert_states_to_f16(&data[start * width..end * width]);
     Tensor::from_data(TensorData::new(half, [rows, width]), (device, DType::F16))
@@ -640,7 +640,6 @@ mod regression_tests {
 
     #[cfg(all(test, feature = "flex"))]
     mod flex_gated {
-        use burn::backend::Flex;
         use burn::tensor::FloatDType;
 
         use super::*;
@@ -650,14 +649,14 @@ mod regression_tests {
             // Exercises the learner's exact plumbing: `f16` device storage,
             // `narrow` a slice, upcast, read back. Values must match within
             // half precision.
-            let device = Default::default();
+            let device = Device::flex();
             let data: Vec<f32> = (0..32).map(|i| i as f32 * 0.5).collect();
-            let states = get_states_batch_range::<Flex>(&data, 8, 0, 4, &device);
+            let states = get_states_batch_range(&data, 8, 0, 4, &device);
             let back: Vec<f32> = states
                 .narrow(0, 1, 2)
                 .cast(DType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(back.len(), 16);
             for (actual, expected) in back.iter().zip(data[8..24].iter()) {
@@ -670,12 +669,12 @@ mod regression_tests {
             // Masks upload as `u8` once and slices upcast on the device.
             // Values are exactly 0/1, so the readback must match bit-exactly.
             // Mirrors the transfer-learning resident mask plumbing.
-            let device = Default::default();
+            let device = Device::flex();
             let data: Vec<u8> = vec![1, 0, 1, 1, 0, 0, 1, 0];
-            let masks = Tensor::<Flex, 2, Int>::from_data(TensorData::new(data, [2, 4]), &device)
+            let masks = Tensor::<2, Int>::from_data(TensorData::new(data, [2, 4]), &device)
                 .narrow(0, 0, 2)
                 .cast(FloatDType::F32);
-            let back: Vec<f32> = masks.into_data().to_vec::<f32>().unwrap();
+            let back: Vec<f32> = masks.into_data().try_to_vec::<f32>().unwrap();
             assert_eq!(back, vec![1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]);
         }
     }

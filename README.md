@@ -12,7 +12,7 @@ The workspace is split into nine crates:
 | Crate | Purpose |
 |---|---|
 | `rlgymppo` | Core PPO learner, multi-threaded environment runner, and training loop. |
-| `rlgymppo-model` | Backend-generic policy/model definitions and checkpoint-compatible inference loading. |
+| `rlgymppo-model` | Runtime-device policy/model definitions and checkpoint-compatible inference loading. |
 | `rlgymppo-nexto` | Nexto model inference, observation builder, action table, and pre-generated model weights. |
 | `rlgymppo-rlbot` | RLBot v5 agent that runs trained policies with Burn Flex and RocketSim state enrichment. |
 | `rlgymppo-utils` | Reusable RLGym observation builders, action parsers, and shared-info traits, without depending on the PPO learner. |
@@ -27,6 +27,8 @@ RocketSim types so inference applications can reuse the same observation and
 action logic without depending on the PPO training stack.
 
 ### Quick start
+
+Burn 0.22 requires Rust 1.95 or later.
 
 See [`rlgymppo-trainer/examples/run.rs`](rlgymppo-trainer/examples/run.rs) for a
 complete training example. The core logic lives in
@@ -50,9 +52,13 @@ cargo run -p rlgymppo-trainer --example run --features torch
 At a high level, training looks like this:
 
 ```rust
+use burn::tensor::Device;
+
+#[allow(deprecated)] // Keep the LibTorch backend.
 let config = LearnerConfig {
-    num_threads: 4,
-    num_games_per_thread: 64,
+    num_pools: 1,
+    num_threads_per_pool: 4,
+    num_games_per_pool: 256,
     ppo: PpoLearnerConfig {
         timesteps_per_iteration: 80_000,
         batch_size: 40_000,
@@ -79,17 +85,35 @@ let config = LearnerConfig {
         nexto_mmr: Some(1500.0),
         ..Default::default()
     },
-    device: LibTorchDevice::Cuda(0),
-    render_device: LibTorchDevice::Cpu,
+    device: Device::libtorch_cuda(0).autodiff(),
+    render_device: Device::libtorch(),
     wandb_project_name: Some("rlgym-ppo".into()),
     wandb_run_name: Some("ppo-bot-v1".into()),
     ..Default::default()
 };
 
-let mut learner = config.init(create_env);
+let mut learner = config.init(create_env, rlgymppo::default_adamw_optimizer());
 learner.load();    // resume from checkpoint if one exists
 learner.learn();   // train forever (or until num_additional_iterations)
 ```
+
+### Burn 0.22 checkpoints
+
+New checkpoints use burnpack files: `actor.bpk`, `critic.bpk`, and
+`shared_head.bpk` when a shared head is configured. Optimizer state and regen
+anchors also use `.bpk` files. Checkpoints saved by this version can resume
+training with optimizer state.
+
+Burn 0.22 cannot read legacy `.mpk` or `.mpk.gz` files. Renaming them does not
+convert them. Load model weights with the original Burn 0.21 model and recorder.
+Export each component through `burn-store` to burnpack or SafeTensors. Import
+the weights into the matching Burn 0.22 component, then save it as `.bpk`.
+Keep parameter paths and shapes unchanged. Compare outputs before resuming.
+See the [Burn migration guide](https://burn.dev/books/burn/migrating-to-0.22.html#migrating-checkpoints).
+
+This process does not convert legacy optimizer state. Start with fresh optimizer
+state after converting the weights. Keep an unchanged copy of the old checkpoint.
+Use a separate checkpoint directory for the converted run.
 
 ### Skill tracking
 
@@ -240,7 +264,7 @@ learner.transfer_learn(
 `TeacherConfig` describes the teacher (its `policy_layer_sizes`,
 `shared_head_layer_sizes`, and `norm`); its observation size is probed
 automatically from the old obs builder. `models_path` may point directly at a
-checkpoint folder (containing `actor.mpk.gz`) or at a directory of timestamped
+checkpoint folder (containing `actor.bpk`) or at a directory of timestamped
 checkpoints (the latest is used). Keep it distinct from the folder this run
 saves its own checkpoints to. The distillation hyperparameters (learning rate,
 batch sizes, epochs, loss) live in `TransferLearnConfig`.
@@ -275,21 +299,27 @@ this is `pip install wandb`, then find where wandb was installed and set
 
 ### Backends
 
-The project uses [Burn](https://burn.dev) and supports all its backends. Enable
-exactly one via a feature flag:
+The project uses [Burn](https://burn.dev) 0.22. The examples require exactly
+one backend feature. Model and tensor APIs use runtime `burn::tensor::Device`
+values instead of backend type parameters.
 
 | Feature | Backend | Device types |
 |---|---|---|
-| `torch` | LibTorch (libtorch C++) | `Cuda(N)`, `Cpu`, `Mps`, `Vulkan` |
-| `cuda` | Pure Rust CUDA | `CudaDevice` |
-| `metal` | Apple Metal | `WgpuDevice` |
-| `rocm` | AMD ROCm | `RocmDevice` |
-| `wgpu` | Cross-platform GPU | `WgpuDevice` |
-| `flex` | CPU fallback | `Default` |
-| `candle` | Candle ML framework | `CandleDevice` |
+| `torch` | LibTorch (`burn-tch`) | `Device::libtorch_cuda(N)`, `Device::libtorch()` |
+| `cuda` | Pure Rust CUDA | `Device::cuda(N)` |
+| `metal` | Apple Metal | `Device::metal(Default::default())` |
+| `rocm` | AMD ROCm | `Device::rocm(N)` |
+| `wgpu` | Cross-platform GPU | `Device::wgpu(Default::default())` |
+| `flex` | CPU fallback | `Device::flex()` |
 
-**torch** is the most mature and fastest backend, supporting CUDA, CPU, MPS,
-and Vulkan devices.
+The `torch` feature still uses `burn-tch`. Burn 0.22 deprecates this backend.
+The examples suppress its deprecation warnings while support is retained.
+Burn 0.22 removed Candle.
+
+Call `.autodiff()` on a training device. Learner initialization also enables
+autodiff on its training device. Use a plain device for inference.
+Use explicit device constructors: `Device::default()` can change its backend
+when Cargo features change.
 
 To point Rust to your LibTorch installation, you may need to set environment
 variables like `LIBTORCH`, `LIBTORCH_INCLUDE`, and `LIBTORCH_LIB`. See

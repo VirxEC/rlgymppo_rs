@@ -4,8 +4,7 @@
     feature = "metal",
     feature = "rocm",
     feature = "wgpu",
-    feature = "flex",
-    feature = "candle"
+    feature = "flex"
 )))]
 compile_error!(
     "enable exactly one backend feature to run this example, e.g. `cargo run -p rlgymppo-trainer --example run --features torch`"
@@ -19,8 +18,7 @@ compile_error!(
             feature = "metal",
             feature = "rocm",
             feature = "wgpu",
-            feature = "flex",
-            feature = "candle"
+            feature = "flex"
         )
     ),
     all(
@@ -29,120 +27,59 @@ compile_error!(
             feature = "metal",
             feature = "rocm",
             feature = "wgpu",
-            feature = "flex",
-            feature = "candle"
+            feature = "flex"
         )
     ),
     all(
         feature = "metal",
-        any(
-            feature = "rocm",
-            feature = "wgpu",
-            feature = "flex",
-            feature = "candle"
-        )
+        any(feature = "rocm", feature = "wgpu", feature = "flex")
     ),
-    all(
-        feature = "rocm",
-        any(feature = "wgpu", feature = "flex", feature = "candle")
-    ),
-    all(feature = "wgpu", any(feature = "flex", feature = "candle")),
-    all(feature = "flex", feature = "candle"),
+    all(feature = "rocm", any(feature = "wgpu", feature = "flex")),
+    all(feature = "wgpu", feature = "flex"),
 ))]
 compile_error!(
     "enable only one backend feature to run this example; backend features are mutually exclusive"
 );
 
 fn main() {
-    #[cfg(feature = "torch")]
-    {
-        use burn::backend::LibTorch;
-        use burn::backend::libtorch::LibTorchDevice;
-        use rlgymppo::burn::backend::Autodiff;
+    use burn::tensor::Device;
 
-        rlgymppo_trainer::run::<Autodiff<LibTorch>>(
-            LibTorchDevice::Cuda(0),
-            LibTorchDevice::Cpu,
-            Some(LibTorchDevice::Cpu),
+    #[cfg(feature = "torch")]
+    #[allow(
+        deprecated,
+        reason = "Keep burn-tch support until a later backend migration."
+    )]
+    {
+        rlgymppo_trainer::run(
+            Device::libtorch_cuda(0).autodiff(),
+            Device::libtorch(),
+            Some(Device::libtorch()),
             true,
         );
     }
 
     #[cfg(feature = "cuda")]
-    {
-        use burn::backend::Cuda;
-        use burn::backend::cuda::CudaDevice;
-        use rlgymppo::burn::backend::Autodiff;
-
-        rlgymppo_trainer::run::<Autodiff<Cuda>>(
-            CudaDevice::new(0),
-            CudaDevice::default(),
-            None,
-            false,
-        );
-    }
+    rlgymppo_trainer::run(Device::cuda(0).autodiff(), Device::cuda(0), None, false);
 
     #[cfg(feature = "metal")]
-    {
-        use burn::backend::Metal;
-        use burn::backend::wgpu::WgpuDevice;
-        use rlgymppo::burn::backend::Autodiff;
-
-        rlgymppo_trainer::run::<Autodiff<Metal>>(
-            WgpuDevice::default(),
-            WgpuDevice::default(),
-            None,
-            false,
-        );
-    }
+    rlgymppo_trainer::run(
+        Device::metal(Default::default()).autodiff(),
+        Device::metal(Default::default()),
+        None,
+        false,
+    );
 
     #[cfg(feature = "rocm")]
-    {
-        use burn::backend::Rocm;
-        use burn::backend::rocm::RocmDevice;
-        use rlgymppo::burn::backend::Autodiff;
-
-        rlgymppo_trainer::run::<Autodiff<Rocm>>(
-            RocmDevice::new(0),
-            RocmDevice::default(),
-            None,
-            false,
-        );
-    }
+    rlgymppo_trainer::run(Device::rocm(0).autodiff(), Device::rocm(0), None, false);
 
     #[cfg(feature = "wgpu")]
-    {
-        use burn::backend::Wgpu;
-        use burn::backend::wgpu::WgpuDevice;
-        use rlgymppo::burn::backend::Autodiff;
-
-        rlgymppo_trainer::run::<Autodiff<Wgpu>>(
-            WgpuDevice::default(),
-            WgpuDevice::default(),
-            Some(WgpuDevice::Cpu),
-            true,
-        );
-    }
+    rlgymppo_trainer::run(
+        Device::wgpu(Default::default()).autodiff(),
+        Device::wgpu(Default::default()),
+        Some(Device::wgpu(burn::tensor::DeviceKind::Cpu)),
+        true,
+    );
 
     #[cfg(feature = "flex")]
-    {
-        use burn::backend::Flex;
-        use rlgymppo::burn::backend::Autodiff;
-
-        rlgymppo_trainer::run::<Autodiff<Flex>>(Default::default(), Default::default(), None, true);
-    }
-
-    #[cfg(feature = "candle")]
-    {
-        use burn::backend::Candle;
-        use burn::backend::candle::CandleDevice;
-        use rlgymppo::burn::backend::Autodiff;
-
-        rlgymppo_trainer::run::<Autodiff<Candle>>(
-            CandleDevice::default(),
-            CandleDevice::default(),
-            Some(CandleDevice::Cpu),
-            true,
-        );
-    }
+    rlgymppo_trainer::run(Device::flex().autodiff(), Device::flex(), None, true);
 }

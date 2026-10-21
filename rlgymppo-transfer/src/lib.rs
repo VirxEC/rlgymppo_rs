@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 use std::thread::available_parallelism;
 
-use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::Device;
 use rlgymppo::rlgym::{Env, Obs};
 use rlgymppo::rocketsim::{Arena, CarBodyConfig, GameMode, Team, init_from_default};
 use rlgymppo::{
@@ -104,12 +104,12 @@ pub fn teacher_config() -> TeacherConfig {
 /// The student's `LearnerConfig`: a copy of `rlgymppo_trainer::default_config`
 /// with a smaller network and its own checkpoint folder (if you change the
 /// trainer's setup, update these to match).
-fn default_config<B: AutodiffBackend>(
-    device: B::Device,
-    render_device: B::Device,
-    skill_tracker_device: Option<B::Device>,
+fn default_config(
+    device: Device,
+    render_device: Device,
+    skill_tracker_device: Option<Device>,
     async_skill_tracker: bool,
-) -> LearnerConfig<B> {
+) -> LearnerConfig {
     // Samples collected before each PPO update. Larger values reduce per-update
     // overhead but use more CPU memory and make policy updates less frequent.
     let timesteps_per_iteration = 100_000;
@@ -195,10 +195,10 @@ fn default_config<B: AutodiffBackend>(
 /// (watch `Transfer/loss` and `Transfer/accuracy`), stop with `Q`, then run
 /// `rlgymppo_trainer::run` with `checkpoints_folder` pointed at
 /// `checkpoints_transfer` to continue with normal PPO training.
-pub fn transfer_learn<B: AutodiffBackend>(
-    device: B::Device,
-    render_device: B::Device,
-    skill_tracker_device: Option<B::Device>,
+pub fn transfer_learn(
+    device: Device,
+    render_device: Device,
+    skill_tracker_device: Option<Device>,
     async_skill_tracker: bool,
 ) {
     init_from_default(cfg!(not(debug_assertions))).unwrap();
@@ -207,13 +207,13 @@ pub fn transfer_learn<B: AutodiffBackend>(
     let make_old_obs =
         || Box::new(DefaultObs::<3>) as Box<dyn Obs<rlgymppo_trainer::SharedInfo> + Send>;
 
-    let mut learner = default_config::<B>(
+    let mut learner = default_config(
         device,
         render_device,
         skill_tracker_device,
         async_skill_tracker,
     )
-    .init_with_old_obs(create_env, default_adamw_optimizer::<B>(), make_old_obs);
+    .init_with_old_obs(create_env, default_adamw_optimizer(), make_old_obs);
     learner.load(); // resume an earlier distillation run if one exists
     learner.transfer_learn(teacher_config(), TransferLearnConfig::default());
 }

@@ -2,7 +2,7 @@
 //!
 //! This crate bundles three pieces that work together:
 //!
-//! - [`model`] — [`NextoModel`], a backend-generic Burn inference model with
+//! - [`model`] — [`NextoModel`], a runtime-device Burn inference model with
 //!   pre-generated weights committed in `nexto/nexto-model.bpk`.
 //! - [`obs`] — [`NextoObsBuilder`], which reads an `rlgym::GameState` and
 //!   produces the q/kv/mask tensors the model consumes.

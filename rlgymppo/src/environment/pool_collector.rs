@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use burn::prelude::Backend;
+use burn::tensor::Device;
 use rayon::ThreadPool;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 use rlgymppo_utils::Report;
@@ -14,9 +14,8 @@ use crate::base::{Memory, MemoryShard};
 
 /// One independent rollout collector: a [`BatchSim`], its rayon pool, and
 /// its budget share. Pool jobs never touch the GPU or call `wait()`.
-pub(crate) struct PoolCollector<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+pub(crate) struct PoolCollector<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    B: Backend,
     SS: StateSetter<SI>,
     SI: SharedInfoProvider,
     OBS: Obs<SI>,
@@ -25,16 +24,14 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    batch_sim: BatchSim<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+    batch_sim: BatchSim<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
     pool: ThreadPool,
     remaining_steps: Arc<AtomicUsize>,
     overbatching: bool,
 }
 
-impl<B, SS, OBS, ACT, REW, TERM, TRUNC, SI> PoolCollector<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<SS, OBS, ACT, REW, TERM, TRUNC, SI> PoolCollector<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    B: Backend + Send + 'static,
-    B::Device: Send,
     SS: StateSetter<SI> + Send,
     SI: SharedInfoProvider + SharedInfoReport + Send,
     OBS: Obs<SI> + Send,
@@ -51,7 +48,7 @@ where
         pool_index: usize,
         num_games_per_pool: usize,
         num_threads_per_pool: usize,
-        device: B::Device,
+        device: Device,
         reward_sampling: RewardSamplingConfig,
         max_episode_length: Option<usize>,
         retain_overflow_episodes: bool,
@@ -94,8 +91,8 @@ where
     /// budget.
     pub(crate) fn run(
         &mut self,
-        model: &Actic<B>,
-        self_play: Option<(&Actic<B>, usize)>,
+        model: &Actic,
+        self_play: Option<(&Actic, usize)>,
         share: usize,
     ) -> (Memory, Report) {
         self.remaining_steps.store(share, Ordering::Release);
@@ -115,8 +112,8 @@ where
     /// asserts full shares at the join.
     pub(crate) fn run_into_shard(
         &mut self,
-        model: &Actic<B>,
-        self_play: Option<(&Actic<B>, usize)>,
+        model: &Actic,
+        self_play: Option<(&Actic, usize)>,
         share: usize,
         shard: &mut MemoryShard,
     ) -> Report {
@@ -138,7 +135,7 @@ mod flex_gated {
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
-    use burn::backend::Flex;
+    use burn::tensor::Device;
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
     use rlgym::GameState;
@@ -167,7 +164,6 @@ mod flex_gated {
         TestSharedInfo,
     >;
     type ThreadSimType = ThreadSim<
-        Flex,
         StateSetter,
         DefaultObs<1>,
         Action,
@@ -252,12 +248,12 @@ mod flex_gated {
         )
     }
 
-    fn make_model() -> Actic<Flex> {
+    fn make_model() -> Actic {
         let probe = make_env(None);
         let obs_space = probe.get_obs_space();
         let action_space = probe.get_action_space();
-        let device = Default::default();
-        Actic::<Flex>::new(
+        let device = Device::flex();
+        Actic::new(
             obs_space,
             action_space,
             vec![8],

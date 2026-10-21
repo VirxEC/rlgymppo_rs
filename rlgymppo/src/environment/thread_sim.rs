@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::time::Instant;
 
-use burn::prelude::Backend;
+use burn::tensor::Device;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
 use rlgymppo_utils::Report;
 use rlgymppo_utils::shared_info::SharedInfoReport;
@@ -27,7 +27,7 @@ use crate::base::Memory;
 ///
 /// Each pool owns its games, its inference batch, and its rayon pool.
 /// The results merge in pool order.
-pub struct ThreadSim<B: Backend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+pub struct ThreadSim<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
     SI: SharedInfoProvider,
@@ -37,7 +37,7 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    collectors: Vec<PoolCollector<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>>,
+    collectors: Vec<PoolCollector<SS, OBS, ACT, REW, TERM, TRUNC, SI>>,
     num_pools: usize,
     memory: Memory,
     metrics: Report,
@@ -47,9 +47,8 @@ where
     _marker: PhantomData<fn(SS, OBS, ACT, REW, TERM, TRUNC, SI)>,
 }
 
-impl<B, SS, OBS, ACT, REW, TERM, TRUNC, SI> ThreadSim<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<SS, OBS, ACT, REW, TERM, TRUNC, SI> ThreadSim<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    B: Backend + Send + 'static,
     SS: StateSetter<SI> + Send,
     SI: SharedInfoProvider + SharedInfoReport + Send,
     OBS: Obs<SI> + Send,
@@ -68,7 +67,7 @@ where
         num_threads_per_pool: usize,
         num_pools: usize,
         num_games_per_pool: usize,
-        device: B::Device,
+        device: Device,
         reward_sampling: RewardSamplingConfig,
         max_episode_length: Option<usize>,
         retain_overflow_episodes: bool,
@@ -78,7 +77,7 @@ where
     where
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         FO: Fn() -> Box<dyn Obs<SI> + Send> + Clone + Send + 'static,
-        B::Device: Send,
+        Device: Send,
     {
         assert!(
             num_threads_per_pool > 0,
@@ -119,17 +118,13 @@ where
 
     /// Publish the model (and optionally an old self-play model) and
     /// collect the resulting trajectories.
-    pub fn run(
-        &mut self,
-        model: Actic<B>,
-        self_play: Option<(Actic<B>, usize)>,
-    ) -> (&Memory, Report) {
+    pub fn run(&mut self, model: Actic, self_play: Option<(Actic, usize)>) -> (&Memory, Report) {
         self.run_internal(model, self_play, self.rollout_budget)
     }
 
     /// Like [`Self::run`], but with an explicit rollout budget. Used by
     /// transfer learning.
-    pub fn run_with_budget(&mut self, model: Actic<B>, budget: usize) -> (&Memory, Report) {
+    pub fn run_with_budget(&mut self, model: Actic, budget: usize) -> (&Memory, Report) {
         self.run_internal(model, None, budget)
     }
 
@@ -139,8 +134,8 @@ where
     /// averaged for comparability.
     fn run_internal(
         &mut self,
-        model: Actic<B>,
-        self_play: Option<(Actic<B>, usize)>,
+        model: Actic,
+        self_play: Option<(Actic, usize)>,
         budget: usize,
     ) -> (&Memory, Report) {
         // Exact-budget path: every pool fills exactly its share (no

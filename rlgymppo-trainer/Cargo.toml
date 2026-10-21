@@ -8,7 +8,7 @@ name = "run"
 required-features = ["backend"]
 
 [dependencies]
-burn = { version = "0.21.0", features = ["autodiff"] }
+burn = { version = "0.22.0", features = ["autodiff"] }
 rand = { workspace = true }
 rlgymppo = { path = "../rlgymppo", default-features = false }
 rlgymppo-utils = {path = "../rlgymppo-utils"}
@@ -19,7 +19,6 @@ backend = []
 tui = ["rlgymppo/tui"]
 wandb = ["rlgymppo/wandb"]
 
-candle = ["backend", "burn/candle"]
 cuda = ["backend", "burn/cuda"]
 flex = ["backend", "burn/flex"]
 metal = ["backend", "burn/metal"]

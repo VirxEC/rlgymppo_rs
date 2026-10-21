@@ -2,7 +2,6 @@ use std::fs;
 use std::path::PathBuf;
 
 use burn::prelude::*;
-use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use rand::Rng;
 use rand::rngs::SmallRng;
 
@@ -54,17 +53,17 @@ impl Default for SelfPlayConfig {
 /// Uses `Module::clone()` for a deep copy so later mutations of the
 /// original network do not affect the stored version.
 #[derive(Clone, Debug)]
-pub struct PolicyVersion<B: Backend> {
+pub struct PolicyVersion {
     pub timesteps: u64,
-    pub model: Actic<B>,
+    pub model: Actic,
     /// Frozen Elo ratings at the time this version was created.
     pub ratings: SkillRating,
 }
 
-impl<B: Backend> PolicyVersion<B> {
+impl PolicyVersion {
     /// Deep-copy the model into a frozen version snapshot.
     /// Optionally records the current skill ratings.
-    pub fn from_model(model: &Actic<B>, timesteps: u64, ratings: SkillRating) -> Self {
+    pub fn from_model(model: &Actic, timesteps: u64, ratings: SkillRating) -> Self {
         // Burn's Module derive provides Clone, which does a true
         // deep-copy (independent parameter buffers).
         Self {
@@ -76,14 +75,14 @@ impl<B: Backend> PolicyVersion<B> {
 }
 
 /// Manages a sliding window of saved policy versions for self-play.
-pub struct VersionManager<B: Backend> {
-    pub versions: Vec<PolicyVersion<B>>,
+pub struct VersionManager {
+    pub versions: Vec<PolicyVersion>,
     config: SelfPlayConfig,
     #[allow(dead_code)]
     save_folder: PathBuf,
 }
 
-impl<B: Backend> VersionManager<B> {
+impl VersionManager {
     pub fn new(save_folder: PathBuf, config: SelfPlayConfig) -> Self {
         Self {
             versions: Vec::new(),
@@ -110,7 +109,7 @@ impl<B: Backend> VersionManager<B> {
     /// (the skill tracker's current Elo ratings).
     pub fn on_iteration(
         &mut self,
-        model: &Actic<B>,
+        model: &Actic,
         cur_timesteps: u64,
         prev_timesteps: u64,
         cur_ratings: Option<&SkillRating>,
@@ -157,7 +156,7 @@ impl<B: Backend> VersionManager<B> {
         self.prune_saved_versions();
     }
 
-    fn persist_version(&self, version: &PolicyVersion<B>) {
+    fn persist_version(&self, version: &PolicyVersion) {
         let path = self.save_folder.join(version.timesteps.to_string());
 
         if path.exists() {
@@ -170,23 +169,22 @@ impl<B: Backend> VersionManager<B> {
         }
 
         fs::create_dir_all(&path).unwrap();
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
         version
             .model
             .actor
             .clone()
-            .save_file(path.join("actor"), &recorder)
+            .save_file(path.join("actor.bpk"))
             .unwrap();
         version
             .model
             .critic
             .clone()
-            .save_file(path.join("critic"), &recorder)
+            .save_file(path.join("critic.bpk"))
             .unwrap();
         if let Some(ref head) = version.model.shared_head {
             head.clone()
-                .save_file(path.join("shared_head"), &recorder)
+                .save_file(path.join("shared_head.bpk"))
                 .unwrap();
         }
 
@@ -231,14 +229,12 @@ impl<B: Backend> VersionManager<B> {
     /// are replaced from disk).  Versions whose timestep exceeds
     /// `cur_timesteps` are skipped to avoid loading checkpoints that
     /// are newer than the current model.
-    pub fn load_versions(&mut self, template: &Actic<B>, device: &B::Device, cur_timesteps: u64) {
+    pub fn load_versions(&mut self, template: &Actic, _device: &Device, cur_timesteps: u64) {
         self.versions.clear();
 
         if !self.save_folder.exists() {
             return;
         }
-
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
         // Discover numbered directories.
         let mut timesteps: Vec<u64> = Vec::new();
@@ -267,6 +263,15 @@ impl<B: Backend> VersionManager<B> {
 
         for ts in timesteps {
             let path = self.save_folder.join(ts.to_string());
+            for component in ["actor", "critic", "shared_head"] {
+                let legacy = path.join(format!("{component}.mpk.gz"));
+                if legacy.is_file() && !path.join(format!("{component}.bpk")).is_file() {
+                    panic!(
+                        "Found legacy policy-version checkpoint {}. Burn 0.22 cannot load .mpk.gz; convert it with Burn 0.21 before loading versions.",
+                        legacy.display()
+                    );
+                }
+            }
 
             // Destructure the template so we can move individual fields.
             let Actic {
@@ -275,20 +280,24 @@ impl<B: Backend> VersionManager<B> {
                 shared_head: t_head,
             } = template.clone();
 
-            // `load_file` consumes the module, so we clone a backup for
-            // the fallback path.  Cloning is cheap relative to I/O.
             let actor = t_actor
                 .clone()
-                .load_file(path.join("actor"), &recorder, device)
-                .unwrap_or(t_actor);
+                .try_load_file(path.join("actor.bpk"))
+                .unwrap_or_else(|error| {
+                    panic!("Failed to load actor policy version {}: {error}", ts)
+                });
             let critic = t_critic
                 .clone()
-                .load_file(path.join("critic"), &recorder, device)
-                .unwrap_or(t_critic);
+                .try_load_file(path.join("critic.bpk"))
+                .unwrap_or_else(|error| {
+                    panic!("Failed to load critic policy version {}: {error}", ts)
+                });
             let shared_head = t_head.map(|head| {
                 head.clone()
-                    .load_file(path.join("shared_head"), &recorder, device)
-                    .unwrap_or(head)
+                    .try_load_file(path.join("shared_head.bpk"))
+                    .unwrap_or_else(|error| {
+                        panic!("Failed to load shared-head policy version {}: {error}", ts)
+                    })
             });
 
             // Attempt to load frozen skill ratings.

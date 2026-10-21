@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use burn::backend::Flex;
-use burn::backend::flex::FlexDevice;
+use burn::tensor::Device;
 use rlbot_rocketsim::rlbot::agents::BotAgent;
 use rlbot_rocketsim::rlbot::flat::{
     ControllableInfo, FieldInfo, GamePacket, MatchConfiguration, MatchPhase, PlayerInput,
@@ -17,15 +16,13 @@ use rlgymppo_utils::rlgym::{Action, Obs};
 use crate::controls::to_rlbot_controls;
 use crate::state::to_rlgym_game_state;
 
-pub type Backend = Flex;
-
 /// Configures the policy architecture and checkpoint loading used by an RLBot agent.
 ///
 /// Override [`PpoBotConfig::checkpoint_path`] to point at a different checkpoint
 /// directory, or override [`PpoBotConfig::load_policy`] entirely to load a
 /// checkpoint however you want (different file layout, embedded bytes, remote
 /// fetch, etc.). The default [`PpoBotConfig::load_policy`] loads
-/// `actor.mpk.gz` + `shared_head.mpk.gz` from [`PpoBotConfig::checkpoint_path`]
+/// `actor.bpk` + `shared_head.bpk` from [`PpoBotConfig::checkpoint_path`]
 /// with [`PpoBotConfig::policy_config`].
 pub trait PpoBotConfig: Send + 'static {
     /// Build the [`PolicyConfig`] for the given observation and action space sizes.
@@ -39,9 +36,9 @@ pub trait PpoBotConfig: Send + 'static {
 
     /// Load the [`Policy`] however you want.
     /// Defaults to [`Policy::load`] from [`PpoBotConfig::checkpoint_path`].
-    fn load_policy(input_size: usize, action_size: usize, device: &FlexDevice) -> Policy<Backend> {
+    fn load_policy(input_size: usize, action_size: usize, device: &Device) -> Policy {
         let checkpoint = Self::checkpoint_path();
-        Policy::<Backend>::load(
+        Policy::load(
             &checkpoint,
             &Self::policy_config(input_size, action_size),
             device,
@@ -91,8 +88,8 @@ pub struct ConfigurablePpoBot<OBS, ACT, SI, CFG: PpoBotConfig = DefaultConfig> {
     observation: OBS,
     action_parser: ACT,
     shared_info: SI,
-    policy: Policy<Backend>,
-    device: FlexDevice,
+    policy: Policy,
+    device: Device,
     held_controls: CarControls,
     next_decision_frame: Option<u32>,
     _config: std::marker::PhantomData<CFG>,
@@ -117,7 +114,7 @@ where
     ) -> Self {
         let context = MatchContext::new(&match_config, &field_info)
             .expect("create RocketSim context from RLBot match");
-        let device = Default::default();
+        let device = Device::flex();
         let observation = OBS::default();
         let action_parser = ACT::default();
         let shared_info = SI::from(controllable_info.identifier as u64);

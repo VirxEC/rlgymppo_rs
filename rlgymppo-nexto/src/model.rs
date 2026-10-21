@@ -20,15 +20,14 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use burn::prelude::*;
-use burn::tensor::cast::ToElement;
-use burn_store::{BurnpackError, BurnpackStore, ModuleSnapshot};
+use burn_store::{BurnpackStore, ModuleSnapshot};
 use thiserror::Error;
 
 use crate::obs::{KV_LEN, NextoObs, Q_LEN};
 
 /// Pre-generated backend-generic Burn model with committed weights.
 /// Its `forward(q, kv, mask)` returns
-/// `(logits: Tensor<B, 2>, attn_w0: Tensor<B, 3>, attn_w1: Tensor<B, 3>)`.
+/// `(logits: Tensor<2>, attn_w0: Tensor<3>, attn_w1: Tensor<3>)`.
 /// The generated code contains constructors (e.g. `from_bytes`) this crate
 /// does not use, and its generated style trips clippy (e.g. `eq_op` in reshape
 /// math).
@@ -38,40 +37,40 @@ pub(crate) mod generated {
 }
 
 /// Device-resident output of a [`NextoModel`] forward pass.
-pub struct NextoOutput<B: Backend> {
+pub struct NextoOutput {
     /// Per-action logits: `[batch, 90]`.
-    pub logits: Tensor<B, 2>,
+    pub logits: Tensor<2>,
     /// Per-entity attention weights from the two perceiver blocks:
     /// `[batch, 1, entities]` each.
-    pub attn_weights: [Tensor<B, 3>; 2],
+    pub attn_weights: [Tensor<3>; 2],
 }
 
 /// Errors while loading or running a [`NextoModel`].
 #[derive(Debug, Error)]
 pub enum NextoError {
     /// The BurnPack (`.bpk`) weight file could not be read or applied.
-    #[error("failed to load Nexto BurnPack weights from '{path}': {source}")]
+    #[error("failed to load Nexto BurnPack weights from '{path}': {detail}")]
     Burnpack {
         /// Path of the `.bpk` file that was opened.
         path: String,
         /// Underlying store error.
-        source: BurnpackError,
+        detail: String,
     },
 }
 
 /// Nexto policy with dynamic player/entity counts for deterministic inference
 /// on any Burn backend.
-pub struct NextoModel<B: Backend> {
-    net: generated::Model<B>,
-    device: B::Device,
+pub struct NextoModel {
+    net: generated::Model,
+    device: burn::tensor::Device,
 }
 
-impl<B: Backend> NextoModel<B> {
+impl NextoModel {
     /// Load the default (embedded) Nexto weights onto `device`.
     ///
     /// The weights are baked into the binary at compile time as a BurnPack
     /// (`.bpk`) artifact, so no file is needed at runtime.
-    pub fn new(device: &B::Device) -> Self {
+    pub fn new(device: &burn::tensor::Device) -> Self {
         Self {
             net: generated::Model::from_embedded(device),
             device: device.clone(),
@@ -82,13 +81,13 @@ impl<B: Backend> NextoModel<B> {
     ///
     /// The checked-in `.bpk` file is the default weight source; the extension is
     /// appended if missing.
-    pub fn load(path: impl AsRef<Path>, device: &B::Device) -> Result<Self, NextoError> {
+    pub fn load(path: impl AsRef<Path>, device: &burn::tensor::Device) -> Result<Self, NextoError> {
         let mut net = generated::Model::new(device);
         let mut store = BurnpackStore::from_file(path.as_ref());
         net.load_from(&mut store)
             .map_err(|source| NextoError::Burnpack {
                 path: path.as_ref().display().to_string(),
-                source,
+                detail: source.to_string(),
             })?;
         Ok(Self {
             net,
@@ -97,12 +96,12 @@ impl<B: Backend> NextoModel<B> {
     }
 
     /// The device the model was loaded onto.
-    pub fn device(&self) -> &B::Device {
+    pub fn device(&self) -> &burn::tensor::Device {
         &self.device
     }
 
     /// Full forward pass: logits plus the two attention-weight tensors.
-    pub fn forward(&self, q: Tensor<B, 3>, kv: Tensor<B, 3>, mask: Tensor<B, 2>) -> NextoOutput<B> {
+    pub fn forward(&self, q: Tensor<3>, kv: Tensor<3>, mask: Tensor<2>) -> NextoOutput {
         let (logits, w0, w1) = self.net.forward(q, kv, mask);
         NextoOutput {
             logits,
@@ -111,24 +110,19 @@ impl<B: Backend> NextoModel<B> {
     }
 
     /// Per-action logits: `[batch, 90]`.
-    pub fn logits(&self, q: Tensor<B, 3>, kv: Tensor<B, 3>, mask: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn logits(&self, q: Tensor<3>, kv: Tensor<3>, mask: Tensor<2>) -> Tensor<2> {
         self.forward(q, kv, mask).logits
     }
 
     /// Deterministic action index (argmax of the logits) for each row of the
     /// batch.
-    pub fn actions(&self, q: Tensor<B, 3>, kv: Tensor<B, 3>, mask: Tensor<B, 2>) -> Vec<usize> {
-        self.logits(q, kv, mask)
-            .argmax(1)
-            .into_data()
-            .iter::<B::IntElem>()
-            .map(|value| value.to_usize())
-            .collect()
+    pub fn actions(&self, q: Tensor<3>, kv: Tensor<3>, mask: Tensor<2>) -> Vec<usize> {
+        action_indices_to_usize(self.logits(q, kv, mask).argmax(1).into_data())
     }
 
     /// Deterministic action index (argmax of the logits) for a single
     /// observation. Panics if `q` has a batch size other than 1.
-    pub fn action(&self, q: Tensor<B, 3>, kv: Tensor<B, 3>, mask: Tensor<B, 2>) -> usize {
+    pub fn action(&self, q: Tensor<3>, kv: Tensor<3>, mask: Tensor<2>) -> usize {
         let batch = q.shape().dims::<3>()[0];
         assert_eq!(
             batch, 1,
@@ -173,15 +167,13 @@ impl<B: Backend> NextoModel<B> {
             }
 
             let q =
-                Tensor::<B, 3>::from_data(TensorData::new(q, [batch_size, 1, Q_LEN]), &self.device);
-            let kv = Tensor::<B, 3>::from_data(
+                Tensor::<3>::from_data(TensorData::new(q, [batch_size, 1, Q_LEN]), &self.device);
+            let kv = Tensor::<3>::from_data(
                 TensorData::new(kv, [batch_size, entities, KV_LEN]),
                 &self.device,
             );
-            let mask = Tensor::<B, 2>::from_data(
-                TensorData::new(mask, [batch_size, entities]),
-                &self.device,
-            );
+            let mask =
+                Tensor::<2>::from_data(TensorData::new(mask, [batch_size, entities]), &self.device);
 
             for (&index, action) in batch.iter().zip(self.actions(q, kv, mask)) {
                 actions[index] = action;
@@ -192,12 +184,31 @@ impl<B: Backend> NextoModel<B> {
     }
 }
 
-impl<B: Backend> Default for NextoModel<B>
-where
-    B::Device: Default,
-{
+fn action_indices_to_usize(data: TensorData) -> Vec<usize> {
+    data.try_into_vec_as::<i64>()
+        .expect("action indices must be readable as i64")
+        .into_iter()
+        .map(|value| usize::try_from(value).expect("action indices must be non-negative"))
+        .collect()
+}
+
+impl Default for NextoModel {
     /// Load the default (embedded) Nexto weights onto the default device.
     fn default() -> Self {
         Self::new(&Default::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_indices_convert_from_i32_and_i64() {
+        let i32_data = TensorData::new(vec![0_i32, 2, 7], [3]);
+        let i64_data = TensorData::new(vec![0_i64, 2, 7], [3]);
+
+        assert_eq!(action_indices_to_usize(i32_data), vec![0, 2, 7]);
+        assert_eq!(action_indices_to_usize(i64_data), vec![0, 2, 7]);
     }
 }

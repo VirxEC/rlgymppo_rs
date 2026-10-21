@@ -185,7 +185,7 @@ fn eval_opponents(
 }
 
 /// Uniformly random saved version, when any exist.
-fn random_version<B: Backend>(versions: &[PolicyVersion<B>]) -> Option<&PolicyVersion<B>> {
+fn random_version(versions: &[PolicyVersion]) -> Option<&PolicyVersion> {
     if versions.is_empty() {
         return None;
     }
@@ -233,13 +233,13 @@ pub(crate) struct SkillTrackerUpdate {
 }
 
 #[allow(clippy::large_enum_variant)]
-enum AsyncSkillTrackerJob<B: Backend> {
+enum AsyncSkillTrackerJob {
     Run {
         eval_id: u64,
-        current_model: Actic<B>,
+        current_model: Actic,
         /// The randomly selected saved version to play, when one exists or a
         /// Previous-phase continuation requires it.
-        old_version: Option<PolicyVersion<B>>,
+        old_version: Option<PolicyVersion>,
         cur_ratings: SkillRating,
     },
     Shutdown,
@@ -253,17 +253,17 @@ struct AsyncSkillTrackerResult {
     continuation: Option<SkillOpponentId>,
 }
 
-pub struct AsyncSkillTracker<B: Backend, OBS, ACT, SI>
+pub struct AsyncSkillTracker<OBS, ACT, SI>
 where
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
 {
     config: SkillTrackerConfig,
-    job_tx: SyncSender<AsyncSkillTrackerJob<B>>,
+    job_tx: SyncSender<AsyncSkillTrackerJob>,
     result_rx: Receiver<AsyncSkillTrackerResult>,
     worker: Option<thread::JoinHandle<()>>,
-    device: B::Device,
+    device: Device,
     pub cur_ratings: SkillRating,
     last_elapsed_secs: Option<f64>,
     iterations_since_ran: usize,
@@ -276,13 +276,13 @@ where
     /// Kept so a Previous-phase continuation can still re-dispatch the same
     /// model/ratings snapshot after `VersionManager` prunes the version from
     /// the live `versions` slice.
-    pending_old_version: Option<PolicyVersion<B>>,
+    pending_old_version: Option<PolicyVersion>,
     _phantom: PhantomData<(OBS, ACT, SI)>,
 }
 
 /// Runs skill-rating evaluation matches between the current policy, saved
 /// previous versions of the policy, and the fixed Nexto policy.
-pub struct SkillTracker<B: Backend, OBS, ACT, SI>
+pub struct SkillTracker<OBS, ACT, SI>
 where
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
@@ -310,10 +310,10 @@ where
     prev_new_team: usize,
     prev_total_ticks: u64,
 
-    device: B::Device,
+    device: Device,
     tick_skip: u8,
     /// Loaded on the skill tracker thread when `nexto_mmr` is set.
-    nexto_model: Option<NextoModel<B>>,
+    nexto_model: Option<NextoModel>,
 
     _phantom: PhantomData<(OBS, ACT, SI)>,
 }
@@ -434,15 +434,14 @@ fn send_skill_step<OBS, ACT, SI>(
         .unwrap();
 }
 
-impl<B, OBS, ACT, SI> SkillTracker<B, OBS, ACT, SI>
+impl<OBS, ACT, SI> SkillTracker<OBS, ACT, SI>
 where
-    B: Backend,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
 {
     /// Construct a skill tracker with one worker thread per arena.
-    pub fn new<F>(config: SkillTrackerConfig, create_arena: F, device: B::Device) -> Self
+    pub fn new<F>(config: SkillTrackerConfig, create_arena: F, device: Device) -> Self
     where
         F: Fn(usize) -> (Arena, OBS, ACT, SI) + Clone + Send + 'static,
     {
@@ -588,11 +587,7 @@ where
         model.actions_from_observations(&observations)
     }
 
-    fn run_matches(
-        &mut self,
-        current_model: &Actic<B>,
-        mut old_version: Option<&mut PolicyVersion<B>>,
-    ) {
+    fn run_matches(&mut self, current_model: &Actic, mut old_version: Option<&mut PolicyVersion>) {
         let num_arenas = self.config.num_arenas;
         let nexto_mmr = self.config.nexto_mmr;
         let rating_default = 0.0;
@@ -902,9 +897,8 @@ where
     }
 }
 
-impl<B, OBS, ACT, SI> Drop for SkillTracker<B, OBS, ACT, SI>
+impl<OBS, ACT, SI> Drop for SkillTracker<OBS, ACT, SI>
 where
-    B: Backend,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
@@ -920,9 +914,8 @@ where
     }
 }
 
-impl<B, OBS, ACT, SI> AsyncSkillTracker<B, OBS, ACT, SI>
+impl<OBS, ACT, SI> AsyncSkillTracker<OBS, ACT, SI>
 where
-    B: Backend + Send + 'static,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,
@@ -930,12 +923,12 @@ where
     pub fn new<F>(
         config: SkillTrackerConfig,
         create_arena: F,
-        device: B::Device,
+        device: Device,
         metric_tx: Sender<SkillTrackerUpdate>,
     ) -> Self
     where
         F: Fn(usize) -> (Arena, OBS, ACT, SI) + Clone + Send + 'static,
-        B::Device: Send,
+        Device: Send,
     {
         let (job_tx, job_rx) = sync_channel(1);
         let (result_tx, result_rx) = channel();
@@ -1001,8 +994,8 @@ where
 
     pub fn on_iteration(
         &mut self,
-        current_model: &Actic<B>,
-        versions: &mut [PolicyVersion<B>],
+        current_model: &Actic,
+        versions: &mut [PolicyVersion],
     ) -> Option<u64> {
         if !self.config.enabled || self.running_eval_id.is_some() {
             return None;
@@ -1085,7 +1078,7 @@ where
         }
     }
 
-    pub fn poll_updates(&mut self, versions: &mut [PolicyVersion<B>]) -> Vec<SkillTrackerUpdate> {
+    pub fn poll_updates(&mut self, versions: &mut [PolicyVersion]) -> Vec<SkillTrackerUpdate> {
         let mut updates = Vec::new();
 
         while let Ok(result) = self.result_rx.try_recv() {
@@ -1098,7 +1091,7 @@ where
     fn apply_result(
         &mut self,
         result: AsyncSkillTrackerResult,
-        versions: &mut [PolicyVersion<B>],
+        versions: &mut [PolicyVersion],
     ) -> SkillTrackerUpdate {
         self.cur_ratings = result.update.cur_ratings.clone();
         self.last_elapsed_secs = Some(result.update.elapsed_secs);
@@ -1153,7 +1146,7 @@ where
         }
     }
 
-    pub fn join(mut self, versions: &mut [PolicyVersion<B>]) -> SkillRating {
+    pub fn join(mut self, versions: &mut [PolicyVersion]) -> SkillRating {
         let _ = self.job_tx.send(AsyncSkillTrackerJob::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -1163,9 +1156,8 @@ where
     }
 }
 
-impl<B, OBS, ACT, SI> Drop for AsyncSkillTracker<B, OBS, ACT, SI>
+impl<OBS, ACT, SI> Drop for AsyncSkillTracker<OBS, ACT, SI>
 where
-    B: Backend,
     OBS: Obs<SI>,
     ACT: Action<SI, Input = usize>,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng,

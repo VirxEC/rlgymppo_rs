@@ -12,32 +12,32 @@ use crate::tensor::{
     to_state_tensor_2d_indexed, to_state_tensor_2d_indexed_flat,
 };
 
-pub struct PPOOutput<B: Backend> {
-    pub log_probs: Tensor<B, 2>,
-    pub values: Tensor<B, 2>,
+pub struct PPOOutput {
+    pub log_probs: Tensor<2>,
+    pub values: Tensor<2>,
 }
 
-impl<B: Backend> PPOOutput<B> {
-    pub fn new(log_probs: Tensor<B, 2>, values: Tensor<B, 2>) -> Self {
+impl PPOOutput {
+    pub fn new(log_probs: Tensor<2>, values: Tensor<2>) -> Self {
         Self { log_probs, values }
     }
 }
 
 #[derive(Module, Debug)]
-pub struct Net<B: Backend> {
-    linear_layers: Vec<Linear<B>>,
+pub struct Net {
+    linear_layers: Vec<Linear>,
     /// Normalization applied after each hidden linear layer (before activation).
     /// Empty when normalization is disabled.
-    layer_norms: Vec<Normalization<B>>,
+    layer_norms: Vec<Normalization>,
     /// Whether the last linear layer is a dedicated output layer (no norm, no activation).
     /// `false` for the shared head, whose last layer IS a hidden layer.
     #[module(skip)]
     has_output_layer: bool,
 }
 
-unsafe impl<B: Backend> Sync for Net<B> {}
+unsafe impl Sync for Net {}
 
-impl<B: Backend> Net<B> {
+impl Net {
     /// `add_output_layer`: when `true` (default), a final Linear(last_hidden, output_size)
     /// is appended.  When `false` the network ends after the last hidden layer; `output_size`
     /// is ignored (used for the shared head, which produces features not logits/values).
@@ -45,7 +45,7 @@ impl<B: Backend> Net<B> {
         input_size: usize,
         output_size: usize,
         layer_sizes: Vec<usize>,
-        device: &B::Device,
+        device: &Device,
         norm_config: Option<NormalizationConfig>,
         add_output_layer: bool,
     ) -> Self {
@@ -89,7 +89,7 @@ impl<B: Backend> Net<B> {
         if let Some(ref base_config) = norm_config {
             for &size in &layer_sizes {
                 let config = base_config.clone().with_num_features(size);
-                layer_norms.push(config.init::<B>(device));
+                layer_norms.push(config.init(device));
             }
         }
 
@@ -100,7 +100,7 @@ impl<B: Backend> Net<B> {
         }
     }
 
-    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, input: Tensor<2>) -> Tensor<2> {
         let mut output = input;
 
         let num_hidden = if self.has_output_layer {
@@ -132,7 +132,7 @@ impl<B: Backend> Net<B> {
     /// entries below `1e-3` mark dormant units. All rows sync in one
     /// transaction; any transient autodiff graph is dropped with the returned
     /// values.
-    pub fn hidden_dormancy(&self, input: Tensor<B, 2>) -> Vec<f32> {
+    pub fn hidden_dormancy(&self, input: Tensor<2>) -> Vec<f32> {
         let mut output = input;
 
         let num_hidden = if self.has_output_layer {
@@ -158,7 +158,7 @@ impl<B: Backend> Net<B> {
         }
         let mut out = Vec::new();
         for data in transaction.execute() {
-            out.extend(data.to_vec::<f32>().unwrap());
+            out.extend(data.try_to_vec::<f32>().unwrap());
         }
         out
     }
@@ -172,7 +172,7 @@ impl<B: Backend> Net<B> {
     /// initialization rather than freshly sampled weights. Normalization
     /// scales are shrunk without noise. Parameter IDs are preserved, so
     /// optimizer momentum state stays valid.
-    pub fn regen_step(&mut self, init: &Self, strength: f64, noise_std: f64, device: &B::Device) {
+    pub fn regen_step(&mut self, init: &Self, strength: f64, noise_std: f64, device: &Device) {
         assert!(
             (0.0..1.0).contains(&strength),
             "regen strength must be in [0, 1), got {strength}"
@@ -237,15 +237,15 @@ impl<B: Backend> Net<B> {
     }
     /// `mask` is an optional [N, n_actions] f32 tensor (1.0 = valid, 0.0 = invalid).
     /// Masks disabled actions by adding a large negative bias to their logits.
-    pub fn linear_layers(&self) -> &[Linear<B>] {
+    pub fn linear_layers(&self) -> &[Linear] {
         &self.linear_layers
     }
 
-    pub fn layer_norms(&self) -> &[Normalization<B>] {
+    pub fn layer_norms(&self) -> &[Normalization] {
         &self.layer_norms
     }
 
-    pub fn masked_logits(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+    pub fn masked_logits(&self, input: Tensor<2>, mask: Option<Tensor<2>>) -> Tensor<2> {
         let logits = self.forward(input);
         if let Some(mask) = mask {
             logits - (1.0 - mask) * 1e10_f32
@@ -254,11 +254,11 @@ impl<B: Backend> Net<B> {
         }
     }
 
-    pub fn log_probs(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+    pub fn log_probs(&self, input: Tensor<2>, mask: Option<Tensor<2>>) -> Tensor<2> {
         log_softmax(self.masked_logits(input, mask), 1)
     }
 
-    pub fn infer(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> Tensor<B, 2> {
+    pub fn infer(&self, input: Tensor<2>, mask: Option<Tensor<2>>) -> Tensor<2> {
         self.infer_with_temperature(input, mask, 1.0)
     }
 
@@ -269,10 +269,10 @@ impl<B: Backend> Net<B> {
     /// Must be positive and finite.
     pub fn infer_with_temperature(
         &self,
-        input: Tensor<B, 2>,
-        mask: Option<Tensor<B, 2>>,
+        input: Tensor<2>,
+        mask: Option<Tensor<2>>,
         temperature: f32,
-    ) -> Tensor<B, 2> {
+    ) -> Tensor<2> {
         Self::probs_with_temperature(self.masked_logits(input, mask), temperature)
     }
 
@@ -281,7 +281,7 @@ impl<B: Backend> Net<B> {
     /// Shared helper so callers can run the expensive forward once and derive
     /// both the tempered training distribution and the `T=1` deployment
     /// distribution from the same logits. Must be positive and finite.
-    pub fn probs_with_temperature(logits: Tensor<B, 2>, temperature: f32) -> Tensor<B, 2> {
+    pub fn probs_with_temperature(logits: Tensor<2>, temperature: f32) -> Tensor<2> {
         assert!(
             temperature > 0.0 && temperature.is_finite(),
             "temperature must be positive and finite, got {temperature}"
@@ -293,7 +293,7 @@ impl<B: Backend> Net<B> {
         &self,
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
-        device: &B::Device,
+        device: &Device,
     ) -> Vec<usize> {
         let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
         argmax_actions(self.masked_logits(to_state_tensor_2d(state, device), mask_tensor))
@@ -304,7 +304,7 @@ impl<B: Backend> Net<B> {
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
         indices: &[usize],
-        device: &B::Device,
+        device: &Device,
     ) -> Vec<usize> {
         let mask_tensor =
             (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
@@ -318,7 +318,7 @@ impl<B: Backend> Net<B> {
         &self,
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
-        device: &B::Device,
+        device: &Device,
     ) -> (Vec<usize>, Vec<f32>) {
         let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
         sample_actions_from_logits(
@@ -332,7 +332,7 @@ impl<B: Backend> Net<B> {
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
         indices: &[usize],
-        device: &B::Device,
+        device: &Device,
     ) -> (Vec<usize>, Vec<f32>) {
         let mask_tensor =
             (!masks.is_empty()).then(|| to_mask_tensor_2d_indexed(masks, indices, device));
@@ -349,13 +349,13 @@ impl<B: Backend> Net<B> {
 /// Blend one parameter tensor toward its initialization snapshot:
 /// `(1 - strength) * param + strength * init`, plus optional isotropic
 /// Gaussian noise. See [`Net::regen_step`].
-fn blend_param<B: Backend, const D: usize>(
-    param: &Param<Tensor<B, D>>,
-    init: &Param<Tensor<B, D>>,
+fn blend_param<const D: usize>(
+    param: &Param<Tensor<D>>,
+    init: &Param<Tensor<D>>,
     strength: f64,
     noise_std: f64,
-    device: &B::Device,
-) -> Tensor<B, D> {
+    device: &Device,
+) -> Tensor<D> {
     let blended = param
         .val()
         .clone()
@@ -375,26 +375,26 @@ fn blend_param<B: Backend, const D: usize>(
 
 /// Device-resident actor output. Calling [`Self::wait`] is the first point at
 /// which sampled actions and log probabilities are transferred back to the CPU.
-pub struct PendingActions<B: Backend> {
-    sampled: SampledActions<B>,
+pub struct PendingActions {
+    sampled: SampledActions,
 }
-impl<B: Backend> PendingActions<B> {
+impl PendingActions {
     pub fn wait(self) -> (Vec<usize>, Vec<f32>) {
         sampled_actions_to_vec(self.sampled)
     }
 }
 
 #[derive(Module, Debug)]
-pub struct Actic<B: Backend> {
+pub struct Actic {
     /// Optional feature extractor shared between the actor and critic.
     /// When present, raw observations flow through `shared_head` before
     /// being passed to both `actor` and `critic`.
-    pub shared_head: Option<Net<B>>,
-    pub actor: Net<B>,
-    pub critic: Net<B>,
+    pub shared_head: Option<Net>,
+    pub actor: Net,
+    pub critic: Net,
 }
 
-impl<B: Backend> Actic<B> {
+impl Actic {
     /// When `shared_head_layer_sizes` is non-empty, a shared feature extractor is
     /// created.  The actor and critic then take the shared head's last hidden size
     /// as their input dimension instead of `input_size`.
@@ -404,7 +404,7 @@ impl<B: Backend> Actic<B> {
         actor_layers: Vec<usize>,
         critic_layers: Vec<usize>,
         shared_head_layer_sizes: &[usize],
-        device: &B::Device,
+        device: &Device,
         norm_config: Option<NormalizationConfig>,
     ) -> Self {
         let (head, actor_input) = if shared_head_layer_sizes.is_empty() {
@@ -436,19 +436,19 @@ impl<B: Backend> Actic<B> {
         }
     }
 
-    pub fn apply_shared_head(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn apply_shared_head(&self, input: Tensor<2>) -> Tensor<2> {
         match self.shared_head {
             Some(ref head) => head.forward(input),
             None => input,
         }
     }
 
-    pub fn forward(&self, input: Tensor<B, 2>, mask: Option<Tensor<B, 2>>) -> PPOOutput<B> {
+    pub fn forward(&self, input: Tensor<2>, mask: Option<Tensor<2>>) -> PPOOutput {
         let features = self.apply_shared_head(input);
         let log_probs = self.actor.log_probs(features.clone(), mask);
         let values = self.critic.forward(features);
 
-        PPOOutput::<B>::new(log_probs, values)
+        PPOOutput::new(log_probs, values)
     }
 
     /// Dispatch stochastic action inference and retain the sampled output on
@@ -457,8 +457,8 @@ impl<B: Backend> Actic<B> {
         &self,
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
-        device: &B::Device,
-    ) -> PendingActions<B> {
+        device: &Device,
+    ) -> PendingActions {
         let input = to_state_tensor_2d(state, device);
         let features = self.apply_shared_head(input);
         let mask_tensor = (!masks.is_empty()).then(|| to_mask_tensor_2d(masks, device));
@@ -474,7 +474,7 @@ impl<B: Backend> Actic<B> {
         &self,
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
-        device: &B::Device,
+        device: &Device,
     ) -> (Vec<usize>, Vec<f32>) {
         self.submit_react(state, masks, device).wait()
     }
@@ -486,8 +486,8 @@ impl<B: Backend> Actic<B> {
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
         indices: &[usize],
-        device: &B::Device,
-    ) -> PendingActions<B> {
+        device: &Device,
+    ) -> PendingActions {
         let input = to_state_tensor_2d_indexed(state, indices, device);
         let features = self.apply_shared_head(input);
         let mask_tensor =
@@ -505,7 +505,7 @@ impl<B: Backend> Actic<B> {
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
         indices: &[usize],
-        device: &B::Device,
+        device: &Device,
     ) -> (Vec<usize>, Vec<f32>) {
         self.submit_react_indexed(state, masks, indices, device)
             .wait()
@@ -522,8 +522,8 @@ impl<B: Backend> Actic<B> {
         masks: &[bool],
         mask_width: usize,
         indices: &[usize],
-        device: &B::Device,
-    ) -> PendingActions<B> {
+        device: &Device,
+    ) -> PendingActions {
         let input = to_state_tensor_2d_indexed_flat(state, state_width, indices, device);
         let features = self.apply_shared_head(input);
         let mask_tensor = (mask_width > 0)
@@ -547,8 +547,8 @@ impl<B: Backend> Actic<B> {
         state_width: usize,
         masks: &[bool],
         mask_width: usize,
-        device: &B::Device,
-    ) -> PendingActions<B> {
+        device: &Device,
+    ) -> PendingActions {
         let input = to_state_tensor_2d_flat(state, rows, state_width, device);
         let features = self.apply_shared_head(input);
         let mask_tensor =
@@ -569,7 +569,7 @@ impl<B: Backend> Actic<B> {
         state_width: usize,
         masks: &[bool],
         mask_width: usize,
-        device: &B::Device,
+        device: &Device,
     ) -> (Vec<usize>, Vec<f32>) {
         self.submit_react_flat(state, rows, state_width, masks, mask_width, device)
             .wait()
@@ -579,7 +579,7 @@ impl<B: Backend> Actic<B> {
         &self,
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
-        device: &B::Device,
+        device: &Device,
     ) -> Vec<usize> {
         let input = to_state_tensor_2d(state, device);
         let features = self.apply_shared_head(input);
@@ -592,7 +592,7 @@ impl<B: Backend> Actic<B> {
         state: &[Vec<f32>],
         masks: &[Vec<bool>],
         indices: &[usize],
-        device: &B::Device,
+        device: &Device,
     ) -> Vec<usize> {
         let input = to_state_tensor_2d_indexed(state, indices, device);
         let features = self.apply_shared_head(input);
@@ -604,12 +604,10 @@ impl<B: Backend> Actic<B> {
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::Flex;
-    use burn::prelude::Backend;
 
     use super::*;
 
-    fn flat<B: Backend>(net: &Net<B>) -> Vec<f32> {
+    fn flat(net: &Net) -> Vec<f32> {
         let mut data = Vec::new();
         for layer in net.linear_layers() {
             data.extend(
@@ -618,7 +616,7 @@ mod tests {
                     .val()
                     .clone()
                     .into_data()
-                    .into_vec::<f32>()
+                    .try_into_vec::<f32>()
                     .unwrap(),
             );
         }
@@ -628,7 +626,7 @@ mod tests {
     #[test]
     fn regen_step_with_zero_strength_is_identity() {
         let device = Default::default();
-        let mut net = Net::<Flex>::new(4, 2, vec![8, 8], &device, None, true);
+        let mut net = Net::new(4, 2, vec![8, 8], &device, None, true);
         let init = net.clone();
         let before = flat(&net);
         net.regen_step(&init, 0.0, 0.0, &device);
@@ -638,7 +636,7 @@ mod tests {
     #[test]
     fn regen_step_pulls_toward_snapshot() {
         let device = Default::default();
-        let mut net = Net::<Flex>::new(4, 2, vec![8, 8], &device, None, true);
+        let mut net = Net::new(4, 2, vec![8, 8], &device, None, true);
         let init = net.clone();
         let init_flat = flat(&init);
 
@@ -656,8 +654,8 @@ mod tests {
     #[test]
     fn hidden_dormancy_reports_per_hidden_unit() {
         let device = Default::default();
-        let net = Net::<Flex>::new(4, 2, vec![8, 8], &device, None, true);
-        let input = Tensor::<Flex, 2>::zeros([16, 4], &device);
+        let net = Net::new(4, 2, vec![8, 8], &device, None, true);
+        let input = Tensor::<2>::zeros([16, 4], &device);
         let means = net.hidden_dormancy(input);
         // One entry per hidden unit flattened across layers (8 + 8), not one
         // per layer.
@@ -668,7 +666,7 @@ mod tests {
     #[test]
     fn hidden_dormancy_detects_partial_dead_units() {
         let device = Default::default();
-        let mut net = Net::<Flex>::new(2, 2, vec![4, 4], &device, None, true);
+        let mut net = Net::new(2, 2, vec![4, 4], &device, None, true);
         // Force a known pattern: zero weights so each hidden output is
         // `relu(bias)` broadcast over the batch. First hidden layer has two
         // dead units (negative bias) and two live units.
@@ -680,12 +678,12 @@ mod tests {
             layer.weight = Param::initialized(w_id, zero_w);
             if let Some(bias) = layer.bias.as_mut() {
                 let b_id = bias.id;
-                let b_tensor: Tensor<Flex, 1> =
+                let b_tensor: Tensor<1> =
                     Tensor::from_data(TensorData::new(bias_vals.to_vec(), [4]), &device);
                 *bias = Param::initialized(b_id, b_tensor);
             }
         }
-        let input = Tensor::<Flex, 2>::zeros([8, 2], &device);
+        let input = Tensor::<2>::zeros([8, 2], &device);
         let means = net.hidden_dormancy(input);
         assert_eq!(means.len(), 8);
         // First layer: [0, 0, 1, 1]; second layer sees only the live outputs
@@ -714,23 +712,23 @@ mod tests {
     #[test]
     fn temperature_one_matches_infer_and_softens() {
         let device = Default::default();
-        let net = Net::<Flex>::new(4, 3, vec![8], &device, None, true);
-        let input = Tensor::<Flex, 2>::ones([8, 4], &device);
+        let net = Net::new(4, 3, vec![8], &device, None, true);
+        let input = Tensor::<2>::ones([8, 4], &device);
         let base: Vec<f32> = net
             .infer(input.clone(), None)
             .into_data()
-            .into_vec()
+            .try_into_vec()
             .unwrap();
         let same: Vec<f32> = net
             .infer_with_temperature(input.clone(), None, 1.0)
             .into_data()
-            .into_vec()
+            .try_into_vec()
             .unwrap();
         assert_eq!(base, same);
         let soft: Vec<f32> = net
             .infer_with_temperature(input, None, 2.0)
             .into_data()
-            .into_vec()
+            .try_into_vec()
             .unwrap();
         let entropy =
             |probs: &[f32]| -probs.iter().map(|p| p * p.max(1e-11).ln()).sum::<f32>() / 8.0;

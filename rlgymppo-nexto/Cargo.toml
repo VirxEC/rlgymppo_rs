@@ -8,10 +8,10 @@ description = "Nexto (Necto) policy: pre-generated Burn model with variable enti
 license = "MIT"
 
 [dependencies]
-burn = { version = "0.21.0", default-features = false, features = ["std"] }
-burn-store = "0.21.0"
+burn = { version = "0.22.0", default-features = false, features = ["std"] }
+burn-store = "0.22.0"
 rlgym = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-burn = { version = "0.21.0", default-features = false, features = ["flex", "std"] }
+burn = { version = "0.22.0", default-features = false, features = ["flex", "std"] }

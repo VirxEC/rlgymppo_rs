@@ -6,7 +6,7 @@ Guidance for AI agents working in this repository.
 
 `rlgymppo-rs` is a Rust implementation of [GigaLearn](https://github.com/VirxEC/GigaLearn),
 a PPO trainer for Rocket League. It is built on RocketSim v3 + rocketsim_viewer via
-RLGym-rs, with neural networks and training written in [Burn](https://burn.dev) 0.21
+RLGym-rs, with neural networks and training written in [Burn](https://burn.dev) 0.22
 instead of PyTorch.
 
 ## Reference implementation
@@ -24,7 +24,7 @@ Nine crates, all Rust edition 2024:
 | Crate | Purpose |
 |---|---|
 | `rlgymppo` | Core PPO learner, multi-threaded environment runner, training loop. |
-| `rlgymppo-model` | Backend-generic policy/model definitions and checkpoint-compatible inference loading. |
+| `rlgymppo-model` | Runtime-device policy/model definitions and checkpoint-compatible inference loading. |
 | `rlgymppo-nexto` | Nexto model inference, observation builder, action table, and pre-generated model weights. |
 | `rlgymppo-rlbot` | RLBot v5 agent that runs trained policies (Burn Flex + RocketSim state enrichment). |
 | `rlgymppo-utils` | Reusable RLGym observation builders, action parsers, shared-info traits — no dependency on the learner. |
@@ -110,7 +110,7 @@ must stay in sync): `weighted_state![Type, weight; ...]`,
 ## Build & run
 
 Backends are mutually exclusive — enable **exactly one** feature: `torch`,
-`cuda`, `metal`, `rocm`, `wgpu`, `flex`, `candle`. `torch` is the most mature.
+`cuda`, `metal`, `rocm`, `wgpu`, `flex`. `torch` is the most mature.
 
 ```sh
 # train
@@ -148,8 +148,9 @@ cargo run -p rlgymppo-transfer --example transfer_learn --features torch
   `enabled` to `false` to disable all evaluations.
 - `rand` is 0.10 — note the newer API (e.g. `rand::seq::SliceRandom`,
   `Rng::random_range`).
-- Checkpoints are `NamedMpkGzFileRecorder` files (`actor.mpk.gz`, etc.) in
-  `checkpoints_folder` (default `./checkpoints`, gitignored).
+- Checkpoints use Burn 0.22 burnpack files (`actor.bpk`, etc.) in
+  `checkpoints_folder` (default `./checkpoints`, gitignored). Legacy `.mpk.gz`
+  weights need conversion with Burn 0.21. Legacy optimizer state is not compatible.
 - `checkpoints`, `wandb/`, `target/`, `collision_meshes/`, `rlviser*`,
   `GigaLearnCPP/`, `Cargo.lock` are all gitignored.
 - Keep `default = ["tui", "wandb"]` on `rlgymppo` unless a consumer explicitly
@@ -171,7 +172,8 @@ cargo run -p rlgymppo-transfer --example transfer_learn --features torch
 ## Conventions
 
 - Match the existing structure: one module per concern inside `rlgymppo/src/`,
-  generic over `B: AutodiffBackend` for backend-agnostic code.
+  with runtime `burn::tensor::Device` values and backend-free tensor/model types.
+  Enable autodiff on training devices. Use plain devices for inference.
 - Obs/action/shared-info traits used by the trainer live in `rlgymppo-utils`
   (`DefaultObs`, `AdvancedObs`, `DefaultAction`); the trainer re-exports them.
 - When adding reward/terminal logic to the trainer, keep the macro-based

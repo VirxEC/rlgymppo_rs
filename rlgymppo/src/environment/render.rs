@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use burn::prelude::*;
+use burn::module::Module;
+use burn::tensor::Device;
 use parking_lot::{Condvar, Mutex};
 use rlgym::rocketsim::consts;
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
@@ -11,14 +12,14 @@ use rlgymppo_utils::shared_info::SharedInfoReport;
 use super::sim::{GameInstance, RewardSamplingConfig, VisActionResult};
 use crate::agent::model::Actic;
 
-pub struct RendererControls<B: Backend> {
-    pub model: Option<Actic<B>>,
+pub struct RendererControls {
+    pub model: Option<Actic>,
     pub deterministic: bool,
     pub render: bool,
     pub quit: bool,
 }
 
-impl<B: Backend> RendererControls<B> {
+impl RendererControls {
     pub fn new(render: bool) -> Self {
         Self {
             model: None,
@@ -29,7 +30,7 @@ impl<B: Backend> RendererControls<B> {
     }
 }
 
-pub struct Renderer<B: Backend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+pub struct Renderer<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
     SI: SharedInfoProvider,
@@ -42,14 +43,13 @@ where
     game: GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
     last_obs: Vec<Vec<f32>>,
     last_masks: Vec<Vec<bool>>,
-    controller: Arc<(Mutex<RendererControls<B>>, Condvar)>,
-    device: B::Device,
+    controller: Arc<(Mutex<RendererControls>, Condvar)>,
+    device: Device,
     viewer_addr: Option<String>,
 }
 
-impl<B, SS, OBS, ACT, REW, TERM, TRUNC, SI> Renderer<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<SS, OBS, ACT, REW, TERM, TRUNC, SI> Renderer<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    B: Backend,
     SS: StateSetter<SI>,
     SI: SharedInfoProvider + SharedInfoReport,
     OBS: Obs<SI>,
@@ -60,8 +60,8 @@ where
 {
     pub fn new(
         env: Env<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
-        controller: Arc<(Mutex<RendererControls<B>>, Condvar)>,
-        device: B::Device,
+        controller: Arc<(Mutex<RendererControls>, Condvar)>,
+        device: Device,
         viewer_addr: Option<String>,
     ) -> Self {
         // The renderer doesn't track training metrics, so disable reward sampling.

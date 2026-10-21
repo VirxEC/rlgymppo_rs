@@ -19,8 +19,11 @@ the configured implementations when the policy is loaded.
 
 Set `RLGYMPPO_CHECKPOINT` to a checkpoint directory containing:
 
-- `actor.mpk.gz`
-- `shared_head.mpk.gz`
+- `actor.bpk`
+- `shared_head.bpk`
+
+These are Burn 0.22 burnpack files. Legacy `.mpk.gz` weights need conversion.
+See [checkpoint migration](../README.md#burn-022-checkpoints).
 
 If unset, the bot selects the newest numeric directory under `./checkpoints`
 (see `rlgymppo_rlbot::default_checkpoint_path`).
@@ -38,14 +41,14 @@ The bundled policy architecture matches `rlgymppo-trainer::default_config`:
 `PpoBotConfig` controls how the checkpoint is loaded. Override just the
 directory, or override `load_policy` entirely to load a checkpoint however you
 want (different file layout, embedded bytes, remote fetch, ...). The default
-`load_policy` loads `actor.mpk.gz` + `shared_head.mpk.gz` from
+`load_policy` loads `actor.bpk` + `shared_head.bpk` from
 `checkpoint_path` with `policy_config`:
 
 ```rust
 use std::path::PathBuf;
-use burn::backend::flex::FlexDevice;
+use burn::tensor::Device;
 use rlgymppo_model::{Policy, PolicyConfig};
-use rlgymppo_rlbot::{Backend, PpoBotConfig};
+use rlgymppo_rlbot::PpoBotConfig;
 
 struct MyConfig;
 
@@ -63,8 +66,8 @@ impl PpoBotConfig for MyConfig {
     // fn load_policy(
     //     input_size: usize,
     //     action_size: usize,
-    //     device: &FlexDevice,
-    // ) -> Policy<Backend> {
+    //     device: &Device,
+    // ) -> Policy {
     //     // ... load however you want ...
     // }
 }

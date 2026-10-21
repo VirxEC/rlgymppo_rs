@@ -12,15 +12,13 @@
 
 use std::sync::Once;
 
-use burn::backend::Flex;
+use burn::tensor::Device;
 use rlgym::GameState;
 use rlgym::rocketsim::{
     Arena, BallState, BoostPadState, CarBodyConfig, CarState, GameMode, Mat3A, PhysState, Team,
     Vec3A, consts, init,
 };
 use rlgymppo_nexto::{BOOST, DEMO, IS_BOOST, NextoAction, NextoModel, NextoObsBuilder};
-
-type Backend = Flex;
 
 /// Load collision meshes from the workspace root
 fn soccar_arena() -> Arena {
@@ -61,7 +59,7 @@ fn game_state(arena: &Arena) -> GameState {
 /// time, stopping early once `stop` accepts the state. Returns the final state.
 fn drive(
     arena: &mut Arena,
-    model: &NextoModel<Backend>,
+    model: &NextoModel,
     nexto_cars: &[usize],
     secs: f32,
     stop: impl Fn(&GameState) -> bool,
@@ -137,7 +135,7 @@ fn nexto_scores_on_an_empty_net() {
     );
     place_ball(&mut arena, Vec3A::new(0.0, -1000.0, 93.0));
 
-    let model = NextoModel::<Backend>::default();
+    let model = NextoModel::new(&Device::flex());
     let state = drive(&mut arena, &model, &[car], 10.0, blue_scored);
 
     assert!(
@@ -154,7 +152,7 @@ fn nexto_beats_an_idle_opponent() {
     let _idle = arena.add_car(Team::Orange, CarBodyConfig::OCTANE);
     arena.reset_to_random_kickoff(Some(6_741));
 
-    let model = NextoModel::<Backend>::default();
+    let model = NextoModel::new(&Device::flex());
     let state = drive(&mut arena, &model, &[nexto], 30.0, blue_scored);
 
     assert!(
@@ -174,7 +172,7 @@ fn obs_channels_stay_in_the_trained_range() {
     let _idle = arena.add_car(Team::Orange, CarBodyConfig::OCTANE);
     arena.reset_to_random_kickoff(Some(6_741));
 
-    let model = NextoModel::<Backend>::default();
+    let model = NextoModel::new(&Device::flex());
     drive(&mut arena, &model, &[nexto], 15.0, |_| false);
 
     // Put a couple of pads on cooldown so the availability channel is

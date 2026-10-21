@@ -8,14 +8,11 @@ pub mod transfer_learn;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use burn::module::AutodiffModule;
+use burn::module::Module;
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::nn::modules::norm::Normalization;
-use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{AdamW, GradientsAccumulator, GradientsParams, Optimizer};
+use burn::optim::{GradientsAccumulator, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
-use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder, Recorder, RecorderError};
-use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{DType, FloatDType, Transaction};
 use rand::Rng;
 use rand::seq::SliceRandom;
@@ -29,20 +26,20 @@ use crate::agent::model::{Actic, Net, PPOOutput};
 use crate::base::{Memory, TerminalState, get_batch_1d, get_states_batch_range};
 use crate::utils::running_stat::Stats;
 
-pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<AdamW, Net<B>, B>> {
+pub struct Ppo {
     config: PpoLearnerConfig,
-    policy_optimizer: O,
-    value_optimizer: O,
-    shared_head_optimizer: O,
+    policy_optimizer: ModuleOptimizer,
+    value_optimizer: ModuleOptimizer,
+    shared_head_optimizer: ModuleOptimizer,
     /// The model-aware factory is retained so optimizers can be rebuilt after
     /// loading a checkpoint with freshly-created model parameters.
-    make_optim: Option<Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O>>,
-    device: B::Device,
+    make_optim: Option<Box<dyn Fn(OptimizerNetwork, &Net) -> ModuleOptimizer>>,
+    device: Device,
     /// Fixed initialization anchor for regenerative regularization.
     /// Captured from the pre-update network on the first training call that
     /// enables `regen` (see `ensure_regen_snapshot`), then preserved across
     /// checkpoint save/load. `None` until needed.
-    init_snapshot: Option<InitSnapshot<B>>,
+    init_snapshot: Option<InitSnapshot>,
     /// Transfer-learning rounds completed; drives the LR schedule there.
     transfer_rounds: u64,
     /// EMA of the batch advantage spread for percentile scaling.
@@ -59,10 +56,10 @@ pub struct Ppo<B: AutodiffBackend, O: Optimizer<Net<B>, B> = OptimizerAdaptor<Ad
 
 /// Parameter snapshot used by regenerative regularization. Cloned device
 /// tensors, so enabling `regen` holds one extra copy of the parameters.
-struct InitSnapshot<B: Backend> {
-    actor: Net<B>,
-    critic: Net<B>,
-    head: Option<Net<B>>,
+struct InitSnapshot {
+    actor: Net,
+    critic: Net,
+    head: Option<Net>,
 }
 
 /// Plasticity diagnostics for one actor/critic pair. Cached on `Ppo` and
@@ -118,8 +115,12 @@ impl PolicyPlasticitySnapshot {
     }
 }
 
-impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
-    pub fn new(config: PpoLearnerConfig, device: B::Device, make_optim: impl Fn() -> O) -> Self {
+impl Ppo {
+    pub fn new(
+        config: PpoLearnerConfig,
+        device: Device,
+        make_optim: impl Fn() -> ModuleOptimizer,
+    ) -> Self {
         Self {
             policy_optimizer: make_optim(),
             value_optimizer: make_optim(),
@@ -137,11 +138,12 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
     pub fn new_with_model(
         config: PpoLearnerConfig,
-        device: B::Device,
-        model: &Actic<B>,
-        make_optim: impl Fn(OptimizerNetwork, &Net<B>) -> O + 'static,
+        device: Device,
+        model: &Actic,
+        make_optim: impl Fn(OptimizerNetwork, &Net) -> ModuleOptimizer + 'static,
     ) -> Self {
-        let make_optim: Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O> = Box::new(make_optim);
+        let make_optim: Box<dyn Fn(OptimizerNetwork, &Net) -> ModuleOptimizer> =
+            Box::new(make_optim);
         let shared_head = model.shared_head.as_ref().unwrap_or(&model.actor);
         Self {
             policy_optimizer: make_optim(OptimizerNetwork::Policy, &model.actor),
@@ -164,7 +166,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     /// restore the original anchor from the checkpoint folder (legacy
     /// checkpoints without anchor files fall back to the loaded weights with
     /// a warning when `regen` is enabled).
-    pub fn reinit_optimizers(&mut self, model: &Actic<B>) {
+    pub fn reinit_optimizers(&mut self, model: &Actic) {
         let Some(make_optim) = self.make_optim.as_ref() else {
             return;
         };
@@ -181,28 +183,17 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
     /// Save the optimizer states (momentum/velocity buffers) to a checkpoint folder.
     pub fn save_optimizers(&self, folder: &Path) {
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-
         #[cfg(not(feature = "tui"))]
         println!("Saving optimizer states...");
 
-        recorder
-            .record(
-                self.policy_optimizer.to_record(),
-                folder.join("policy_optimizer"),
-            )
+        self.policy_optimizer
+            .save(folder.join("policy_optimizer.bpk"))
             .unwrap();
-        recorder
-            .record(
-                self.value_optimizer.to_record(),
-                folder.join("value_optimizer"),
-            )
+        self.value_optimizer
+            .save(folder.join("value_optimizer.bpk"))
             .unwrap();
-        recorder
-            .record(
-                self.shared_head_optimizer.to_record(),
-                folder.join("shared_head_optimizer"),
-            )
+        self.shared_head_optimizer
+            .save(folder.join("shared_head_optimizer.bpk"))
             .unwrap();
 
         #[cfg(not(feature = "tui"))]
@@ -238,14 +229,14 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     /// Capture the regen anchor from the pre-update network when `regen` is
     /// enabled and no anchor exists yet. Must run before the first optimizer
     /// step so the anchor is the true initialization, not post-update weights.
-    pub fn ensure_regen_snapshot(&mut self, net: &Actic<B>, regen: Option<RegenConfig>) {
+    pub fn ensure_regen_snapshot(&mut self, net: &Actic, regen: Option<RegenConfig>) {
         if regen.is_none() || self.init_snapshot.is_some() {
             return;
         }
         self.init_snapshot = Some(InitSnapshot {
-            actor: net.actor.clone(),
-            critic: net.critic.clone(),
-            head: net.shared_head.clone(),
+            actor: net.actor.valid(),
+            critic: net.critic.valid(),
+            head: net.shared_head.as_ref().map(|head| head.valid()),
         });
     }
 
@@ -256,20 +247,19 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let Some(snapshot) = self.init_snapshot.as_ref() else {
             return;
         };
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
         snapshot
             .actor
             .clone()
-            .save_file(folder.join("actor_init"), &recorder)
+            .save_file(folder.join("actor_init.bpk"))
             .unwrap();
         snapshot
             .critic
             .clone()
-            .save_file(folder.join("critic_init"), &recorder)
+            .save_file(folder.join("critic_init.bpk"))
             .unwrap();
         if let Some(head) = snapshot.head.as_ref() {
             head.clone()
-                .save_file(folder.join("shared_head_init"), &recorder)
+                .save_file(folder.join("shared_head_init.bpk"))
                 .unwrap();
         }
     }
@@ -278,15 +268,23 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     /// legacy checkpoints without anchor files (caller warns and falls back
     /// to the loaded weights when `regen` is enabled). Never fails on
     /// missing files; mismatched architectures fall back with a warning.
-    pub fn load_regen_snapshot(&mut self, folder: &Path, model: &Actic<B>) {
-        if !folder.join("actor_init.mpk.gz").is_file() {
+    pub fn load_regen_snapshot(&mut self, folder: &Path, model: &Actic) {
+        for component in ["actor_init", "critic_init", "shared_head_init"] {
+            let legacy = folder.join(format!("{component}.mpk.gz"));
+            if legacy.is_file() && !folder.join(format!("{component}.bpk")).is_file() {
+                panic!(
+                    "Found legacy regen checkpoint {}. Burn 0.22 cannot load .mpk.gz; convert it with Burn 0.21 before resuming.",
+                    legacy.display()
+                );
+            }
+        }
+        if !folder.join("actor_init.bpk").is_file() {
             return;
         }
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
         let actor = model
             .actor
             .clone()
-            .load_file(folder.join("actor_init"), &recorder, &self.device)
+            .try_load_file(folder.join("actor_init.bpk"))
             .unwrap_or_else(|e| {
                 eprintln!(
                     "Warning: failed to load regen actor anchor ({e}); using loaded weights."
@@ -296,7 +294,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let critic = model
             .critic
             .clone()
-            .load_file(folder.join("critic_init"), &recorder, &self.device)
+            .try_load_file(folder.join("critic_init.bpk"))
             .unwrap_or_else(|e| {
                 eprintln!(
                     "Warning: failed to load regen critic anchor ({e}); using loaded weights."
@@ -305,11 +303,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             });
         let head = match (
             model.shared_head.clone(),
-            folder.join("shared_head_init.mpk.gz").is_file(),
+            folder.join("shared_head_init.bpk").is_file(),
         ) {
             (Some(template), true) => Some(
                 template
-                    .load_file(folder.join("shared_head_init"), &recorder, &self.device)
+                    .try_load_file(folder.join("shared_head_init.bpk"))
                     .unwrap_or_else(|e| {
                         eprintln!(
                             "Warning: failed to load regen head anchor ({e}); using loaded weights."
@@ -335,50 +333,47 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
     /// Load the optimizer states from a checkpoint folder.
     pub fn load_optimizers(&mut self, folder: &Path) {
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-
         #[cfg(not(feature = "tui"))]
         println!("Loading optimizer states...");
 
-        let try_load_optim = |name: &str, target: &mut O| -> Result<(), RecorderError> {
-            let record = recorder.load(folder.join(name), &self.device)?;
-            *target = target.clone().load_record(record);
-            Ok(())
-        };
-
-        let _ =
-            try_load_optim("policy_optimizer", &mut self.policy_optimizer).inspect_err(
-                |e| match e {
-                    RecorderError::FileNotFound(_) => {}
-                    e => panic!("Failed to load policy optimizer: {e}"),
-                },
-            );
-        let _ =
-            try_load_optim("value_optimizer", &mut self.value_optimizer).inspect_err(|e| match e {
-                RecorderError::FileNotFound(_) => {}
-                e => panic!("Failed to load value optimizer: {e}"),
-            });
-        let _ = try_load_optim("shared_head_optimizer", &mut self.shared_head_optimizer)
-            .inspect_err(|e| match e {
-                RecorderError::FileNotFound(_) => {}
-                e => panic!("Failed to load shared-head optimizer: {e}"),
-            });
+        for (name, optimizer) in [
+            ("policy_optimizer", &mut self.policy_optimizer),
+            ("value_optimizer", &mut self.value_optimizer),
+            ("shared_head_optimizer", &mut self.shared_head_optimizer),
+        ] {
+            let path = folder.join(format!("{name}.bpk"));
+            let legacy = folder.join(format!("{name}.mpk.gz"));
+            if legacy.is_file() && !path.is_file() {
+                panic!(
+                    "Found legacy optimizer checkpoint at {}. Burn 0.22 cannot load MessagePack optimizer state. Move this file aside to resume from model weights with fresh optimizer state, or use a separate custom optimizer-state migration tool; Burn provides no built-in conversion.",
+                    legacy.display()
+                );
+            }
+            if path.is_file() {
+                *optimizer = optimizer.clone().load(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "Failed to load optimizer checkpoint {}: {error}",
+                        path.display()
+                    )
+                });
+            }
+        }
 
         #[cfg(not(feature = "tui"))]
         println!("Loaded optimizer states from: {folder:?}");
     }
 }
 
-impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
+impl Ppo {
     pub fn learn<R: Rng>(
         &mut self,
-        mut net: Actic<B>,
+        mut net: Actic,
         memory: &Memory,
         rng: &mut R,
         metrics: &mut Report,
         stats: &mut Stats,
         is_first_iteration: bool,
-    ) -> (Actic<B>, usize) {
+    ) -> (Actic, usize) {
         // Overbatching uses the complete bounded rollout, including the final
         // trajectory prefix that extends beyond `timesteps_per_iteration`.
         let rollout_size =
@@ -432,7 +427,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         // instead of once per phase, at half the bytes. Timed as staging
         // work (including the parallel `f32` to `f16` conversion).
         let resident_start = Instant::now();
-        let resident_states = get_states_batch_range::<B::InnerBackend>(
+        let resident_states = get_states_batch_range(
             memory.states(),
             memory.state_width(),
             0,
@@ -507,14 +502,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 let mut transaction = Transaction::default();
                 for start in (0..window_truncations).step_by(mb) {
                     let end = (start + mb).min(window_truncations);
-                    let batch = get_states_batch_range::<B::InnerBackend>(
-                        states,
-                        width,
-                        start,
-                        end,
-                        &self.device,
-                    )
-                    .cast(DType::F32);
+                    let batch = get_states_batch_range(states, width, start, end, &self.device)
+                        .cast(DType::F32);
 
                     let features = nodiff_net.apply_shared_head(batch);
                     transaction = transaction.register(nodiff_net.critic.forward(features));
@@ -640,7 +629,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         // Wrap the resident states for the autodiff backend once (no copy:
         // the training graph references the same device storage). Batches
         // gather their states from it on the GPU.
-        let resident_b = Tensor::<B, 2>::from_inner(resident_states);
+        let resident_b = resident_states;
 
         // Shuffle the full rollout up front so the RNG stream matches the
         // serial implementation exactly.
@@ -700,7 +689,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 let upload_start = Instant::now();
                 // One index build plus upload per batch, shared by the state
                 // gather; the small fields arrive already gathered.
-                let index = Tensor::<B, 1, Int>::from_data(
+                let index = Tensor::<1, Int>::from_data(
                     TensorData::new(
                         batch_indices.iter().map(|&i| i as i64).collect::<Vec<_>>(),
                         [batch_indices.len()],
@@ -761,11 +750,11 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
             .try_into()
             .expect("Correct amount of tensor data");
 
-        let mean_entropy = entropy_data.to_vec::<f32>().unwrap()[0] / batch_iters;
-        let mean_divergence = kl_data.to_vec::<f32>().unwrap()[0] / batch_iters;
-        let mean_clip_fraction = clip_data.to_vec::<f32>().unwrap()[0] / batch_iters;
-        let mean_policy_loss = policy_data.to_vec::<f32>().unwrap()[0] / batch_iters;
-        let mean_val_loss = critic_data.to_vec::<f32>().unwrap()[0] / batch_iters;
+        let mean_entropy = entropy_data.try_to_vec::<f32>().unwrap()[0] / batch_iters;
+        let mean_divergence = kl_data.try_to_vec::<f32>().unwrap()[0] / batch_iters;
+        let mean_clip_fraction = clip_data.try_to_vec::<f32>().unwrap()[0] / batch_iters;
+        let mean_policy_loss = policy_data.try_to_vec::<f32>().unwrap()[0] / batch_iters;
+        let mean_val_loss = critic_data.try_to_vec::<f32>().unwrap()[0] / batch_iters;
         assert!(
             !mean_val_loss.is_nan(),
             "Value loss is NaN: {mean_val_loss}"
@@ -804,9 +793,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     /// zero-copy `narrow` view: no index build, no upload, no gather.
     fn train_gpu_batch(
         &mut self,
-        net: &mut Actic<B>,
-        batch: &GpuBatch<B>,
-        metric_totals: &mut MetricTotals<B>,
+        net: &mut Actic,
+        batch: &GpuBatch,
+        metric_totals: &mut MetricTotals,
         optim_time: &mut Duration,
         lr_scale: f64,
     ) {
@@ -858,19 +847,19 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     #[allow(clippy::too_many_arguments)]
     fn train_mini_batch(
         &self,
-        net: &Actic<B>,
-        state_batch: Tensor<B, 2>,
-        action_batch: Tensor<B, 2, Int>,
-        old_log_probs_batch: Tensor<B, 2>,
-        advantage_batch: Tensor<B, 2>,
-        target_vals_batch: Tensor<B, 2>,
-        mask_batch: Option<Tensor<B, 2>>,
-        clip_eps_batch: Tensor<B, 2>,
+        net: &Actic,
+        state_batch: Tensor<2>,
+        action_batch: Tensor<2, Int>,
+        old_log_probs_batch: Tensor<2>,
+        advantage_batch: Tensor<2>,
+        target_vals_batch: Tensor<2>,
+        mask_batch: Option<Tensor<2>>,
+        clip_eps_batch: Tensor<2>,
         mini_batch_weight: f32,
-        actor_gradients: &mut GradientsAccumulator<Net<B>>,
-        critic_gradients: &mut GradientsAccumulator<Net<B>>,
-        shared_head_gradients: &mut GradientsAccumulator<Net<B>>,
-        metric_totals: &mut MetricTotals<B>,
+        actor_gradients: &mut GradientsAccumulator<Net>,
+        critic_gradients: &mut GradientsAccumulator<Net>,
+        shared_head_gradients: &mut GradientsAccumulator<Net>,
+        metric_totals: &mut MetricTotals,
     ) {
         let PPOOutput {
             log_probs: log_prob,
@@ -940,10 +929,10 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
     fn step_optimizers(
         &mut self,
-        net: &mut Actic<B>,
-        mut actor_gradients: GradientsAccumulator<Net<B>>,
-        mut critic_gradients: GradientsAccumulator<Net<B>>,
-        mut shared_head_gradients: GradientsAccumulator<Net<B>>,
+        net: &mut Actic,
+        mut actor_gradients: GradientsAccumulator<Net>,
+        mut critic_gradients: GradientsAccumulator<Net>,
+        mut shared_head_gradients: GradientsAccumulator<Net>,
         lr_scale: f64,
     ) {
         let base_actor_lr = self
@@ -958,17 +947,19 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let critic_lr = (f64::from(base_critic_lr) * lr_scale) as f32;
         let shared_head_lr = actor_lr.min(critic_lr);
 
-        net.actor =
-            self.policy_optimizer
-                .step(actor_lr.into(), net.actor.clone(), actor_gradients.grads());
+        net.actor = self.policy_optimizer.step(
+            f64::from(actor_lr),
+            net.actor.clone(),
+            actor_gradients.grads(),
+        );
         net.critic = self.value_optimizer.step(
-            critic_lr.into(),
+            f64::from(critic_lr),
             net.critic.clone(),
             critic_gradients.grads(),
         );
         if let Some(head) = net.shared_head.take() {
             net.shared_head = Some(self.shared_head_optimizer.step(
-                shared_head_lr.into(),
+                f64::from(shared_head_lr),
                 head,
                 shared_head_gradients.grads(),
             ));
@@ -985,10 +976,10 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     fn maybe_log_plasticity(
         &mut self,
         update_index: u64,
-        actor: &Net<B>,
-        critic: &Net<B>,
-        head: Option<&Net<B>>,
-        sample_states: Tensor<B, 2>,
+        actor: &Net,
+        critic: &Net,
+        head: Option<&Net>,
+        sample_states: Tensor<2>,
         metrics: &mut Report,
     ) {
         let interval = match self.config.plasticity_log_interval {
@@ -1012,9 +1003,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     fn maybe_log_transfer_plasticity(
         &mut self,
         round: u64,
-        actor: &Net<B>,
-        head: Option<&Net<B>>,
-        sample_states: Tensor<B, 2>,
+        actor: &Net,
+        head: Option<&Net>,
+        sample_states: Tensor<2>,
         metrics: &mut Report,
     ) {
         let interval = match self.config.plasticity_log_interval {
@@ -1036,12 +1027,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     /// below only covers regen enabled mid-run after updates. Distillation
     /// passes its own config and `include_critic: false` to preserve its
     /// critic-untouched invariant.
-    fn apply_regen(
-        &mut self,
-        net: &mut Actic<B>,
-        regen: Option<RegenConfig>,
-        include_critic: bool,
-    ) {
+    fn apply_regen(&mut self, net: &mut Actic, regen: Option<RegenConfig>, include_critic: bool) {
         let Some(regen) = regen else {
             return;
         };
@@ -1065,25 +1051,28 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         let noise = f64::from(regen.noise_std);
         net.actor
             .regen_step(&snapshot.actor, strength, noise, &self.device);
+        net.actor = net.actor.clone().valid().unfreeze().train();
         if include_critic {
             net.critic
                 .regen_step(&snapshot.critic, strength, noise, &self.device);
+            net.critic = net.critic.clone().valid().unfreeze().train();
         }
         if let (Some(head), Some(init_head)) = (net.shared_head.as_mut(), snapshot.head.as_ref()) {
             head.regen_step(init_head, strength, noise, &self.device);
+            *head = head.clone().valid().unfreeze().train();
         }
     }
 }
 
-struct GpuBatch<B: Backend> {
-    states: Tensor<B, 2>,
-    actions: Tensor<B, 2, Int>,
-    old_log_probs: Tensor<B, 2>,
-    advantages: Tensor<B, 2>,
-    target_vals: Tensor<B, 2>,
-    action_masks: Option<Tensor<B, 2>>,
+struct GpuBatch {
+    states: Tensor<2>,
+    actions: Tensor<2, Int>,
+    old_log_probs: Tensor<2>,
+    advantages: Tensor<2>,
+    target_vals: Tensor<2>,
+    action_masks: Option<Tensor<2>>,
     /// Per-row PPO clip bound (fixed `clip_range` unless adaptive clipping).
-    clip_eps: Tensor<B, 2>,
+    clip_eps: Tensor<2>,
 }
 
 /// One batch of rollout rows gathered on the CPU staging thread, ready to
@@ -1176,10 +1165,10 @@ impl StagedBatch {
     }
 }
 
-impl<B: Backend> GpuBatch<B> {
+impl GpuBatch {
     /// Combine GPU-gathered states with one staged small-field batch. The
     /// staging `Vec`s move into `TensorData` with no further copy on host.
-    fn from_staged(states: Tensor<B, 2>, staged: StagedBatch, device: &B::Device) -> Self {
+    fn from_staged(states: Tensor<2>, staged: StagedBatch, device: &Device) -> Self {
         let rows = staged.rows;
         Self {
             states,
@@ -1189,7 +1178,7 @@ impl<B: Backend> GpuBatch<B> {
             target_vals: Tensor::from_data(TensorData::new(staged.target_vals, [rows, 1]), device),
             clip_eps: Tensor::from_data(TensorData::new(staged.clip_eps, [rows, 1]), device),
             action_masks: (!staged.masks.is_empty()).then(|| {
-                Tensor::<B, 2, Int>::from_data(
+                Tensor::<2, Int>::from_data(
                     TensorData::new(staged.masks, [rows, staged.mask_width]),
                     device,
                 )
@@ -1219,16 +1208,16 @@ impl<B: Backend> GpuBatch<B> {
     }
 }
 
-struct MetricTotals<B: Backend> {
-    entropy: Tensor<B, 1>,
-    value_loss: Tensor<B, 1>,
-    clip_fraction: Tensor<B, 1>,
-    policy_loss: Tensor<B, 1>,
-    divergence: Tensor<B, 1>,
+struct MetricTotals {
+    entropy: Tensor<1>,
+    value_loss: Tensor<1>,
+    clip_fraction: Tensor<1>,
+    policy_loss: Tensor<1>,
+    divergence: Tensor<1>,
 }
 
-impl<B: Backend> MetricTotals<B> {
-    fn new(device: &B::Device) -> Self {
+impl MetricTotals {
+    fn new(device: &Device) -> Self {
         Self {
             entropy: Tensor::zeros([1], device),
             value_loss: Tensor::zeros([1], device),
@@ -1240,11 +1229,11 @@ impl<B: Backend> MetricTotals<B> {
 
     fn add_weighted(
         &mut self,
-        entropy: Tensor<B, 1>,
-        divergence: Tensor<B, 1>,
-        clip_fraction: Tensor<B, 1>,
-        policy_loss: Tensor<B, 1>,
-        value_loss: Tensor<B, 1>,
+        entropy: Tensor<1>,
+        divergence: Tensor<1>,
+        clip_fraction: Tensor<1>,
+        policy_loss: Tensor<1>,
+        value_loss: Tensor<1>,
         weight: f32,
     ) {
         self.entropy = self.entropy.clone() + entropy * weight;
@@ -1257,7 +1246,7 @@ impl<B: Backend> MetricTotals<B> {
 
 /// Flatten all trainable parameters of a `Net` into a single `Vec<f32>`.
 /// Used to compute the L2 norm of parameter updates across a training iteration.
-fn flatten_net<B: Backend>(net: &Net<B>) -> Vec<f32> {
+fn flatten_net(net: &Net) -> Vec<f32> {
     let mut data = Vec::new();
     for layer in net.linear_layers() {
         data.extend(
@@ -1266,11 +1255,17 @@ fn flatten_net<B: Backend>(net: &Net<B>) -> Vec<f32> {
                 .val()
                 .clone()
                 .into_data()
-                .into_vec::<f32>()
+                .try_into_vec::<f32>()
                 .unwrap(),
         );
         if let Some(bias) = &layer.bias {
-            data.extend(bias.val().clone().into_data().into_vec::<f32>().unwrap());
+            data.extend(
+                bias.val()
+                    .clone()
+                    .into_data()
+                    .try_into_vec::<f32>()
+                    .unwrap(),
+            );
         }
     }
     for norm in net.layer_norms() {
@@ -1281,11 +1276,17 @@ fn flatten_net<B: Backend>(net: &Net<B>) -> Vec<f32> {
                         .val()
                         .clone()
                         .into_data()
-                        .into_vec::<f32>()
+                        .try_into_vec::<f32>()
                         .unwrap(),
                 );
                 if let Some(beta) = &ln.beta {
-                    data.extend(beta.val().clone().into_data().into_vec::<f32>().unwrap());
+                    data.extend(
+                        beta.val()
+                            .clone()
+                            .into_data()
+                            .try_into_vec::<f32>()
+                            .unwrap(),
+                    );
                 }
             }
             Normalization::Rms(rms) => {
@@ -1294,7 +1295,7 @@ fn flatten_net<B: Backend>(net: &Net<B>) -> Vec<f32> {
                         .val()
                         .clone()
                         .into_data()
-                        .into_vec::<f32>()
+                        .try_into_vec::<f32>()
                         .unwrap(),
                 );
                 // RmsNorm has no beta parameter.
@@ -1417,7 +1418,7 @@ fn top_singular_value(matrix: &[f32], rows: usize, cols: usize) -> f32 {
 
 /// Mean stable rank (`||W||_F^2 / sigma_max^2`) over a `Net`'s hidden linear
 /// layers. Low rank (near 1) with many units signals representation collapse.
-fn mean_stable_rank<B: Backend>(net: &Net<B>) -> f64 {
+fn mean_stable_rank(net: &Net) -> f64 {
     let hidden = if net.layer_norms().is_empty() {
         net.linear_layers().len()
     } else {
@@ -1431,7 +1432,7 @@ fn mean_stable_rank<B: Backend>(net: &Net<B>) -> f64 {
             .val()
             .clone()
             .into_data()
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .unwrap();
         let [rows, cols] = layer.weight.val().shape().dims::<2>();
         let frob_sq: f32 = data.iter().map(|x| x * x).sum();
@@ -1448,11 +1449,11 @@ fn mean_stable_rank<B: Backend>(net: &Net<B>) -> f64 {
 /// When a shared feature head is present, `sample_states` are raw
 /// observations and are passed through it first so dormancy is measured on
 /// each net's true inputs.
-fn plasticity_snapshot<B: Backend>(
-    actor: &Net<B>,
-    critic: &Net<B>,
-    head: Option<&Net<B>>,
-    sample_states: Tensor<B, 2>,
+fn plasticity_snapshot(
+    actor: &Net,
+    critic: &Net,
+    head: Option<&Net>,
+    sample_states: Tensor<2>,
 ) -> PlasticitySnapshot {
     const DORMANT_THRESHOLD: f32 = 1e-3;
 
@@ -1494,10 +1495,10 @@ fn plasticity_snapshot<B: Backend>(
 /// actor is measured on head-transformed features while the head itself is
 /// measured on the raw inputs. A missing head yields `None` head fields so
 /// [`PolicyPlasticitySnapshot::emit`] skips those keys.
-fn policy_plasticity_snapshot<B: Backend>(
-    actor: &Net<B>,
-    head: Option<&Net<B>>,
-    sample_states: Tensor<B, 2>,
+fn policy_plasticity_snapshot(
+    actor: &Net,
+    head: Option<&Net>,
+    sample_states: Tensor<2>,
 ) -> PolicyPlasticitySnapshot {
     const DORMANT_THRESHOLD: f32 = 1e-3;
 
@@ -1537,5 +1538,297 @@ fn policy_plasticity_snapshot<B: Backend>(
         head_norm,
         head_rank,
         head_dormant,
+    }
+}
+
+#[cfg(all(test, any(feature = "flex", feature = "torch")))]
+mod runtime_device_tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use burn::optim::AdamWConfig;
+
+    use super::*;
+
+    fn gradients(
+        net: &Actic,
+        device: &Device,
+    ) -> (
+        GradientsAccumulator<Net>,
+        GradientsAccumulator<Net>,
+        GradientsAccumulator<Net>,
+    ) {
+        let output = net.forward(Tensor::<2>::ones([2, 3], device), None);
+        let mut gradients = (output.log_probs.sum() + output.values.sum()).backward();
+        let mut actor_gradients = GradientsAccumulator::new();
+        let mut critic_gradients = GradientsAccumulator::new();
+        let mut shared_head_gradients = GradientsAccumulator::new();
+        actor_gradients.accumulate(
+            &net.actor,
+            GradientsParams::from_module(&mut gradients, &net.actor),
+        );
+        critic_gradients.accumulate(
+            &net.critic,
+            GradientsParams::from_module(&mut gradients, &net.critic),
+        );
+        if let Some(head) = net.shared_head.as_ref() {
+            shared_head_gradients
+                .accumulate(head, GradientsParams::from_module(&mut gradients, head));
+        }
+        (actor_gradients, critic_gradients, shared_head_gradients)
+    }
+
+    fn exercise_full_learn(device: Device) {
+        let config = PpoLearnerConfig {
+            epochs: 1,
+            timesteps_per_iteration: 4,
+            batch_size: 4,
+            mini_batch_size: 2,
+            gpu_timestep_buffer_size: 4,
+            truncation_value_batch_size: 1,
+            standardize_returns: false,
+            standardize_advantages: false,
+            ..Default::default()
+        };
+        let mut net = Actic::new(3, 2, vec![4], vec![4], &[4], &device, None);
+        let actor_before = flatten_net(&net.actor);
+        let critic_before = flatten_net(&net.critic);
+        let mut memory = Memory::with_capacity(4);
+        memory.push_player(
+            vec![
+                0.1, 0.2, 0.3, 0.2, 0.1, -0.1, -0.2, 0.3, 0.1, 0.4, -0.1, 0.2,
+            ],
+            3,
+            vec![0, 0, 0, 1],
+            vec![-0.69; 4],
+            vec![0.2, -0.1, 0.4, 1.0],
+            vec![
+                TerminalState::None,
+                TerminalState::Truncated,
+                TerminalState::None,
+                TerminalState::Normal,
+            ],
+            vec![1, 1, 1, 0, 1, 1, 1, 1],
+            2,
+            Vec::new(),
+            0,
+            Some(vec![0.3, 0.2, -0.1]),
+        );
+
+        let mut ppo = Ppo::new(config, device, || AdamWConfig::new().init());
+        let mut rng = rand::rng();
+        let mut metrics = Report::default();
+        let mut stats = Stats::default();
+        for iteration in 0..2 {
+            (net, _) = ppo.learn(
+                net,
+                &memory,
+                &mut rng,
+                &mut metrics,
+                &mut stats,
+                iteration == 0,
+            );
+            let flat_metrics = metrics.to_flat_map();
+            assert!(
+                flat_metrics.values().all(|value| value.is_finite()),
+                "iteration {iteration} emitted non-finite metrics: {flat_metrics:?}"
+            );
+        }
+        assert_ne!(
+            flatten_net(&net.actor),
+            actor_before,
+            "actor did not update"
+        );
+        assert_ne!(
+            flatten_net(&net.critic),
+            critic_before,
+            "critic did not update"
+        );
+        assert_eq!(stats.cumulative_model_updates, 2);
+        assert_eq!(stats.cumulative_epochs, 2);
+        assert_eq!(stats.cumulative_timesteps, 8);
+    }
+
+    fn exercise_regen_and_optimizer_state_round_trip(device: Device) {
+        let mut net = Actic::new(3, 2, vec![4], vec![4], &[4], &device, None);
+        let actor_before = flatten_net(&net.actor);
+        let param_ids = net
+            .actor
+            .linear_layers()
+            .iter()
+            .map(|layer| layer.weight.id)
+            .collect::<Vec<_>>();
+        let regen = RegenConfig {
+            strength: 0.05,
+            noise_std: 0.0,
+        };
+        let mut ppo = Ppo::new(
+            PpoLearnerConfig {
+                regen: Some(regen),
+                ..Default::default()
+            },
+            device.clone(),
+            || AdamWConfig::new().init(),
+        );
+        ppo.ensure_regen_snapshot(&net, Some(regen));
+
+        let mut previous_weights = actor_before;
+        for update in 1..=2 {
+            let (actor_gradients, critic_gradients, shared_head_gradients) =
+                gradients(&net, &device);
+            ppo.step_optimizers(
+                &mut net,
+                actor_gradients,
+                critic_gradients,
+                shared_head_gradients,
+                1.0,
+            );
+
+            let actor_after = flatten_net(&net.actor);
+            assert_ne!(
+                actor_after, previous_weights,
+                "update {update} changed no actor weights"
+            );
+            assert!(
+                net.actor
+                    .linear_layers()
+                    .iter()
+                    .all(|layer| layer.weight.val().is_require_grad()),
+                "regen left actor parameters without gradient tracking after update {update}"
+            );
+            assert_eq!(
+                net.actor
+                    .linear_layers()
+                    .iter()
+                    .map(|layer| layer.weight.id)
+                    .collect::<Vec<_>>(),
+                param_ids,
+                "regen changed actor parameter IDs"
+            );
+            previous_weights = actor_after;
+        }
+
+        let folder = std::env::temp_dir().join(format!(
+            "rlgymppo-optimizer-bpk-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        net.actor
+            .clone()
+            .save_file(folder.join("actor.bpk"))
+            .unwrap();
+        net.critic
+            .clone()
+            .save_file(folder.join("critic.bpk"))
+            .unwrap();
+        net.shared_head
+            .as_ref()
+            .unwrap()
+            .clone()
+            .save_file(folder.join("shared_head.bpk"))
+            .unwrap();
+        ppo.save_optimizers(&folder);
+        ppo.save_regen_snapshot(&folder);
+
+        let mut resumed_net = Actic::new(3, 2, vec![4], vec![4], &[4], &device, None);
+        resumed_net.actor = resumed_net
+            .actor
+            .clone()
+            .try_load_file(folder.join("actor.bpk"))
+            .unwrap();
+        resumed_net.critic = resumed_net
+            .critic
+            .clone()
+            .try_load_file(folder.join("critic.bpk"))
+            .unwrap();
+        resumed_net.shared_head = Some(
+            resumed_net
+                .shared_head
+                .as_ref()
+                .unwrap()
+                .clone()
+                .try_load_file(folder.join("shared_head.bpk"))
+                .unwrap(),
+        );
+        let mut resumed = Ppo::new(
+            PpoLearnerConfig {
+                regen: Some(regen),
+                ..Default::default()
+            },
+            device.clone(),
+            || AdamWConfig::new().init(),
+        );
+        resumed.reinit_optimizers(&resumed_net);
+        resumed.load_optimizers(&folder);
+        resumed.load_regen_snapshot(&folder, &resumed_net);
+        assert!(
+            resumed.has_regen_snapshot(),
+            "regen anchor was not restored"
+        );
+
+        let (actor_gradients, critic_gradients, shared_head_gradients) = gradients(&net, &device);
+        ppo.step_optimizers(
+            &mut net,
+            actor_gradients,
+            critic_gradients,
+            shared_head_gradients,
+            1.0,
+        );
+        let (actor_gradients, critic_gradients, shared_head_gradients) =
+            gradients(&resumed_net, &device);
+        resumed.step_optimizers(
+            &mut resumed_net,
+            actor_gradients,
+            critic_gradients,
+            shared_head_gradients,
+            1.0,
+        );
+
+        for (component, original, restored) in [
+            (
+                "actor",
+                flatten_net(&net.actor),
+                flatten_net(&resumed_net.actor),
+            ),
+            (
+                "critic",
+                flatten_net(&net.critic),
+                flatten_net(&resumed_net.critic),
+            ),
+            (
+                "shared head",
+                flatten_net(net.shared_head.as_ref().unwrap()),
+                flatten_net(resumed_net.shared_head.as_ref().unwrap()),
+            ),
+        ] {
+            assert_eq!(original.len(), restored.len());
+            for (index, (original, restored)) in original.iter().zip(&restored).enumerate() {
+                assert!(
+                    (original - restored).abs() <= 1e-6,
+                    "{component} weight {index} differs after resumed update: {original} vs {restored}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[cfg(feature = "flex")]
+    #[test]
+    fn flex_regen_keeps_parameters_trainable_across_updates_and_optimizer_state_round_trips() {
+        let device = Device::flex().autodiff();
+        exercise_regen_and_optimizer_state_round_trip(device.clone());
+        exercise_full_learn(device);
+    }
+
+    #[cfg(feature = "torch")]
+    #[test]
+    #[allow(deprecated)]
+    fn torch_regen_keeps_parameters_trainable_across_updates_and_optimizer_state_round_trips() {
+        let device = Device::libtorch().autodiff();
+        exercise_regen_and_optimizer_state_round_trip(device.clone());
+        exercise_full_learn(device);
     }
 }

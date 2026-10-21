@@ -5,10 +5,9 @@ edition = "2024"
 
 [dependencies]
 arrayvec = { workspace = true }
-burn = { version = "0.21.0", features = ["autodiff"] }
+burn = { version = "0.22.0", features = ["autodiff"] }
 crossterm = { workspace = true, optional = true }
 hashbrown = "0.16.1"
-itertools = "0.15.0"
 parking_lot = "0.12.4"
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -31,7 +30,6 @@ wandb = ["dep:rlgymppo-wandb"]
 fusion = ["burn/fusion"]
 
 # backends
-candle = ["burn/candle"]
 cuda = ["burn/cuda"]
 flex = ["burn/flex"]
 metal = ["burn/metal"]

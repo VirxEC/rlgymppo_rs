@@ -27,8 +27,7 @@
     feature = "metal",
     feature = "rocm",
     feature = "wgpu",
-    feature = "flex",
-    feature = "candle"
+    feature = "flex"
 )))]
 compile_error!(
     "enable exactly one backend feature to run this example, e.g. `cargo run -p rlgymppo-transfer --example transfer_learn --features torch`"
@@ -42,8 +41,7 @@ compile_error!(
             feature = "metal",
             feature = "rocm",
             feature = "wgpu",
-            feature = "flex",
-            feature = "candle"
+            feature = "flex"
         )
     ),
     all(
@@ -52,118 +50,59 @@ compile_error!(
             feature = "metal",
             feature = "rocm",
             feature = "wgpu",
-            feature = "flex",
-            feature = "candle"
+            feature = "flex"
         )
     ),
     all(
         feature = "metal",
-        any(
-            feature = "rocm",
-            feature = "wgpu",
-            feature = "flex",
-            feature = "candle"
-        )
+        any(feature = "rocm", feature = "wgpu", feature = "flex")
     ),
-    all(
-        feature = "rocm",
-        any(feature = "wgpu", feature = "flex", feature = "candle")
-    ),
-    all(feature = "wgpu", any(feature = "flex", feature = "candle")),
-    all(feature = "flex", feature = "candle"),
+    all(feature = "rocm", any(feature = "wgpu", feature = "flex")),
+    all(feature = "wgpu", feature = "flex"),
 ))]
 compile_error!(
     "enable only one backend feature to run this example; backend features are mutually exclusive"
 );
 
 fn main() {
-    #[cfg(feature = "torch")]
-    {
-        use burn::backend::libtorch::LibTorchDevice;
-        use burn::backend::{Autodiff, LibTorch};
+    use burn::tensor::Device;
 
-        rlgymppo_transfer::transfer_learn::<Autodiff<LibTorch>>(
-            LibTorchDevice::Cuda(0),
-            LibTorchDevice::Cpu,
-            Some(LibTorchDevice::Cpu),
+    #[cfg(feature = "torch")]
+    #[allow(
+        deprecated,
+        reason = "Keep burn-tch support until a later backend migration."
+    )]
+    {
+        rlgymppo_transfer::transfer_learn(
+            Device::libtorch_cuda(0).autodiff(),
+            Device::libtorch(),
+            Some(Device::libtorch()),
             true,
         );
     }
 
     #[cfg(feature = "cuda")]
-    {
-        use burn::backend::cuda::CudaDevice;
-        use burn::backend::{Autodiff, Cuda};
-
-        rlgymppo_transfer::transfer_learn::<Autodiff<Cuda>>(
-            CudaDevice::new(0),
-            CudaDevice::default(),
-            None,
-            false,
-        );
-    }
+    rlgymppo_transfer::transfer_learn(Device::cuda(0).autodiff(), Device::cuda(0), None, false);
 
     #[cfg(feature = "metal")]
-    {
-        use burn::backend::wgpu::WgpuDevice;
-        use burn::backend::{Autodiff, Metal};
-
-        rlgymppo_transfer::transfer_learn::<Autodiff<Metal>>(
-            WgpuDevice::default(),
-            WgpuDevice::default(),
-            None,
-            false,
-        );
-    }
+    rlgymppo_transfer::transfer_learn(
+        Device::metal(Default::default()).autodiff(),
+        Device::metal(Default::default()),
+        None,
+        false,
+    );
 
     #[cfg(feature = "rocm")]
-    {
-        use burn::backend::rocm::RocmDevice;
-        use burn::backend::{Autodiff, Rocm};
-
-        rlgymppo_transfer::transfer_learn::<Autodiff<Rocm>>(
-            RocmDevice::new(0),
-            RocmDevice::default(),
-            None,
-            false,
-        );
-    }
+    rlgymppo_transfer::transfer_learn(Device::rocm(0).autodiff(), Device::rocm(0), None, false);
 
     #[cfg(feature = "wgpu")]
-    {
-        use burn::backend::wgpu::WgpuDevice;
-        use burn::backend::{Autodiff, Wgpu};
-
-        rlgymppo_transfer::transfer_learn::<Autodiff<Wgpu>>(
-            WgpuDevice::default(),
-            WgpuDevice::default(),
-            Some(WgpuDevice::Cpu),
-            true,
-        );
-    }
+    rlgymppo_transfer::transfer_learn(
+        Device::wgpu(Default::default()).autodiff(),
+        Device::wgpu(Default::default()),
+        Some(Device::wgpu(burn::tensor::DeviceKind::Cpu)),
+        true,
+    );
 
     #[cfg(feature = "flex")]
-    {
-        use burn::backend::{Autodiff, Flex};
-
-        rlgymppo_transfer::transfer_learn::<Autodiff<Flex>>(
-            Default::default(),
-            Default::default(),
-            None,
-            true,
-        );
-    }
-
-    #[cfg(feature = "candle")]
-    {
-        use burn::backend::candle::CandleDevice;
-        use burn::backend::{Autodiff, Candle};
-
-        rlgymppo_transfer::transfer_learn::<Autodiff<Candle>>(
-            CandleDevice::default(),
-            CandleDevice::default(),
-            Some(CandleDevice::Cpu),
-            true,
-        );
-    }
+    rlgymppo_transfer::transfer_learn(Device::flex().autodiff(), Device::flex(), None, true);
 }

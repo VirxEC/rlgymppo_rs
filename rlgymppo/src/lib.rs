@@ -29,12 +29,11 @@ use agent::skill_tracker::{AsyncSkillTracker, SkillTrackerUpdate, report_skill_r
 pub use agent::transfer_learn::{TeacherConfig, TransferLearnConfig};
 use base::{Memory, TerminalState};
 pub use burn;
-use burn::module::{AutodiffModule, Module, Quantizer};
+use burn::module::{Module, Quantizer};
 use burn::nn::modules::norm::NormalizationConfig;
 use burn::nn::{LayerNormConfig, RmsNormConfig};
-use burn::optim::adaptor::OptimizerAdaptor;
-use burn::optim::{Adam, AdamConfig, AdamW, AdamWConfig, Optimizer};
-use burn::tensor::backend::AutodiffBackend;
+use burn::optim::{AdamConfig, AdamWConfig, ModuleOptimizer};
+use burn::tensor::Device;
 use environment::render::{Renderer, RendererControls};
 use environment::sim::RewardSamplingConfig;
 use environment::thread_sim::ThreadSim;
@@ -51,8 +50,7 @@ use rlgymppo_utils::shared_info::{SharedInfoReport, SharedInfoRng};
 pub use rlgymppo_utils::{any_terminal, combined_rewards, weighted_state};
 use utils::running_stat::Stats;
 use utils::serde::{
-    latest_checkpoint_folder, load_latest_model, resolve_model_folder,
-    save_checkpoint as save_checkpoint_files,
+    load_latest_model, resolve_model_folder, save_checkpoint as save_checkpoint_files,
 };
 
 #[derive(Clone, Copy)]
@@ -97,9 +95,9 @@ impl TuiNotifier {
 }
 
 #[cfg(feature = "tui")]
-fn stdin_reader<B: burn::prelude::Backend>(
+fn stdin_reader(
     s: Sender<HumanInput>,
-    renderer_controls: Arc<(Mutex<RendererControls<B>>, Condvar)>,
+    renderer_controls: Arc<(Mutex<RendererControls>, Condvar)>,
     tui_notifier: Option<TuiNotifier>,
 ) {
     use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind, read};
@@ -135,9 +133,9 @@ fn stdin_reader<B: burn::prelude::Backend>(
 }
 
 #[cfg(not(feature = "tui"))]
-fn stdin_reader<B: burn::prelude::Backend>(
+fn stdin_reader(
     s: Sender<HumanInput>,
-    renderer_controls: Arc<(Mutex<RendererControls<B>>, Condvar)>,
+    renderer_controls: Arc<(Mutex<RendererControls>, Condvar)>,
     tui_notifier: Option<TuiNotifier>,
 ) {
     let mut buffer = [0; 1];
@@ -153,10 +151,10 @@ fn stdin_reader<B: burn::prelude::Backend>(
     }
 }
 
-fn handle_input_char<B: burn::prelude::Backend>(
+fn handle_input_char(
     ch: char,
     s: &Sender<HumanInput>,
-    renderer_controls: &Arc<(Mutex<RendererControls<B>>, Condvar)>,
+    renderer_controls: &Arc<(Mutex<RendererControls>, Condvar)>,
     tui_notifier: Option<&TuiNotifier>,
 ) -> bool {
     match ch.to_ascii_lowercase() {
@@ -447,11 +445,11 @@ pub enum NormSelection {
     RmsNorm,
 }
 
-/// Optimizer adaptor used by the default AdamW configuration.
-pub type AdamWOptimizer<B> = OptimizerAdaptor<AdamW, Net<B>, B>;
+/// Runtime module optimizer used by the default AdamW configuration.
+pub type AdamWOptimizer = ModuleOptimizer;
 
-/// Optimizer adaptor used by the default Adam configuration.
-pub type AdamOptimizer<B> = OptimizerAdaptor<Adam, Net<B>, B>;
+/// Runtime module optimizer used by the default Adam configuration.
+pub type AdamOptimizer = ModuleOptimizer;
 
 /// Identifies the network being optimized by a model-aware optimizer factory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -468,30 +466,28 @@ pub enum OptimizerNetwork {
 ///
 /// The closure is called three times during `init()` (once per sub-network)
 /// and must return a freshly created optimizer each time.
-pub type MakeOptim<O> = Box<dyn Fn() -> O>;
+pub type MakeOptim = Box<dyn Fn() -> ModuleOptimizer>;
 
 /// A model-aware optimizer factory. The closure receives the network and its
 /// role, allowing parameter IDs to be grouped differently for output heads.
-pub type MakeOptimForNet<B, O> = Box<dyn Fn(OptimizerNetwork, &Net<B>) -> O>;
+pub type MakeOptimForNet = Box<dyn Fn(OptimizerNetwork, &Net) -> ModuleOptimizer>;
 
 /// Called after a checkpoint's model, statistics, and optimizer files have been saved.
 ///
 /// The callback receives the path to the newly-created checkpoint folder.
 pub type CheckpointCallback = Box<dyn Fn(&Path)>;
 
-/// Returns a factory for the default Adam optimizer used by the previous
-/// `LearnerConfig::<B, AdamOptimizer<B>>::default()`.
-pub fn default_adam_optimizer<B: AutodiffBackend>() -> MakeOptim<AdamOptimizer<B>> {
+/// Returns a factory for the default Adam optimizer.
+pub fn default_adam_optimizer() -> MakeOptim {
     Box::new(|| AdamConfig::new().with_epsilon(1e-8).init())
 }
 
-/// Returns a factory for the default AdamW optimizer used by the previous
-/// `LearnerConfig::<B, AdamWOptimizer<B>>::default()`.
-pub fn default_adamw_optimizer<B: AutodiffBackend>() -> MakeOptim<AdamWOptimizer<B>> {
+/// Returns a factory for the default AdamW optimizer.
+pub fn default_adamw_optimizer() -> MakeOptim {
     Box::new(|| AdamWConfig::new().with_epsilon(1e-8).init())
 }
 
-pub struct LearnerConfig<B: AutodiffBackend> {
+pub struct LearnerConfig {
     /// Hyperparameters for the PPO learner.
     pub ppo: PpoLearnerConfig,
     /// Where to load/save checkpoints.
@@ -499,16 +495,16 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// If the path does not exist, it will be created.
     pub checkpoints_folder: PathBuf,
     /// The device to use for training.
-    /// Will default to the default device from the given backend.
-    pub device: B::Device,
+    /// Defaults to the runtime default device with autodiff enabled.
+    pub device: Device,
     pub quantizer: Option<Quantizer>,
     /// The device to use for rendering.
-    /// Will default to the default device from the given backend.
-    pub render_device: B::Device,
+    /// Defaults to the runtime default device without autodiff.
+    pub render_device: Device,
     /// The device to use for skill-tracker inference.
-    /// When `None`, uses the training device. Set this to another device from
-    /// the same backend, for example a CPU device while training on GPU.
-    pub skill_tracker_device: Option<B::Device>,
+    /// When `None`, uses the training device without autodiff. Set this to
+    /// another device, for example a CPU device while training on a GPU.
+    pub skill_tracker_device: Option<Device>,
     /// The layer sizes for the policy network.
     pub policy_layer_sizes: Vec<usize>,
     /// The layer sizes for the critic network.
@@ -572,14 +568,14 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     pub metrics_jsonl: Option<PathBuf>,
 }
 
-impl<B: AutodiffBackend> Default for LearnerConfig<B> {
+impl Default for LearnerConfig {
     fn default() -> Self {
         Self {
             ppo: PpoLearnerConfig::default(),
             checkpoints_folder: PathBuf::from("checkpoints"),
-            device: B::Device::default(),
+            device: Device::default().autodiff(),
             quantizer: None,
-            render_device: B::Device::default(),
+            render_device: Device::default(),
             skill_tracker_device: None,
             policy_layer_sizes: vec![256; 3],
             critic_layer_sizes: vec![256; 3],
@@ -604,18 +600,17 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
     }
 }
 
-impl<B: AutodiffBackend> LearnerConfig<B> {
+impl LearnerConfig {
     /// Initialize a [`Learner`] with a simple optimizer factory.
     ///
     /// The `make_optim` closure is called three times (once per sub-network)
     /// and must return a freshly created optimizer each time.
-    pub fn init<O, F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+    pub fn init<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         self,
         create_env: F,
-        make_optim: MakeOptim<O>,
-    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+        make_optim: MakeOptim,
+    ) -> Learner<SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
-        O: Optimizer<Net<B>, B>,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         SS: StateSetter<SI> + Send,
         SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send + 'static,
@@ -640,14 +635,13 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     /// The builder runs in lockstep with the env's own obs builder so transfer
     /// learning can distill a teacher trained on a *different* observation
     /// space; everything else (actions, rewards, shared info) must match.
-    pub fn init_with_old_obs<O, F, FO, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+    pub fn init_with_old_obs<F, FO, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         self,
         create_env: F,
-        make_optim: MakeOptim<O>,
+        make_optim: MakeOptim,
         make_old_obs: FO,
-    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+    ) -> Learner<SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
-        O: Optimizer<Net<B>, B>,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         FO: Fn() -> Box<dyn Obs<SI> + Send> + Clone + Send + 'static,
         SS: StateSetter<SI> + Send,
@@ -668,13 +662,12 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     /// The factory receives each sub-network identifier and the corresponding
     /// [`Net`], allowing parameter-group optimizers such as Muon/AdamW hybrids
     /// to select parameters by ID.
-    pub fn init_with_model<O, F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+    pub fn init_with_model<F, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         self,
         create_env: F,
-        make_optim: MakeOptimForNet<B, O>,
-    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+        make_optim: MakeOptimForNet,
+    ) -> Learner<SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
-        O: Optimizer<Net<B>, B> + 'static,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         SS: StateSetter<SI> + Send,
         SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send + 'static,
@@ -693,14 +686,13 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
 
     /// Initialize a [`Learner`] with a model-aware optimizer factory and an
     /// old (teacher) observation builder. See [`Self::init_with_old_obs`].
-    pub fn init_with_model_and_old_obs<O, F, FO, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+    pub fn init_with_model_and_old_obs<F, FO, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         self,
         create_env: F,
-        make_optim: MakeOptimForNet<B, O>,
+        make_optim: MakeOptimForNet,
         make_old_obs: FO,
-    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+    ) -> Learner<SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
-        O: Optimizer<Net<B>, B> + 'static,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         FO: Fn() -> Box<dyn Obs<SI> + Send> + Clone + Send + 'static,
         SS: StateSetter<SI> + Send,
@@ -716,14 +708,13 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         })
     }
 
-    fn init_internal<O, F, FO, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
-        self,
+    fn init_internal<F, FO, SS, OBS, ACT, REW, TERM, TRUNC, SI>(
+        mut self,
         create_env: F,
         make_old_obs: Option<FO>,
-        build_ppo: impl FnOnce(B::Device, PpoLearnerConfig, &Actic<B>) -> Ppo<B, O>,
-    ) -> Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+        build_ppo: impl FnOnce(Device, PpoLearnerConfig, &Actic) -> Ppo,
+    ) -> Learner<SS, OBS, ACT, REW, TERM, TRUNC, SI>
     where
-        O: Optimizer<Net<B>, B>,
         F: Fn(Option<usize>) -> Env<SS, OBS, ACT, REW, TERM, TRUNC, SI> + Clone + Send + 'static,
         FO: Fn() -> Box<dyn Obs<SI> + Send> + Clone + Send + 'static,
         SS: StateSetter<SI> + Send,
@@ -734,6 +725,11 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
         TERM: Terminal<SI> + Send,
         TRUNC: Truncate<SI> + Send,
     {
+        self.device = self.device.autodiff();
+        self.render_device = self.render_device.without_autodiff();
+        self.skill_tracker_device = self
+            .skill_tracker_device
+            .map(|device| device.without_autodiff());
         self.ppo.validate_batching();
         assert!(
             self.num_threads_per_pool > 0,
@@ -780,7 +776,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             NormSelection::RmsNorm => Some(NormalizationConfig::Rms(RmsNormConfig::new(0))),
         };
 
-        let model = Actic::<B>::new(
+        let model = Actic::new(
             obs_space,
             action_space,
             self.policy_layer_sizes,
@@ -841,7 +837,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             let skill_tracker_device = self
                 .skill_tracker_device
                 .clone()
-                .unwrap_or_else(|| self.device.clone());
+                .unwrap_or_else(|| self.device.clone().without_autodiff());
 
             Some(AsyncSkillTracker::new(
                 self.skill_tracker.clone(),
@@ -912,7 +908,7 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
     }
 }
 
-pub struct Learner<B: AutodiffBackend, O: Optimizer<Net<B>, B>, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+pub struct Learner<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI> + Send,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send,
@@ -922,12 +918,12 @@ where
     TERM: Terminal<SI> + Send,
     TRUNC: Truncate<SI> + Send,
 {
-    ppo: Ppo<B, O>,
+    ppo: Ppo,
     rng: SmallRng,
     stats: Stats,
-    device: B::Device,
+    device: Device,
     quantizer: Option<Quantizer>,
-    model: Actic<B>,
+    model: Actic,
     /// Raw observation-space size (needed to construct the teacher policy
     /// during transfer learning).
     obs_space: usize,
@@ -949,20 +945,19 @@ where
     checkpoint_callback: Option<CheckpointCallback>,
     last_save_timestep: u64,
     num_additional_iterations: Option<u64>,
-    renderer_controls: Arc<(Mutex<RendererControls<B::InnerBackend>>, Condvar)>,
+    renderer_controls: Arc<(Mutex<RendererControls>, Condvar)>,
     renderer: thread::JoinHandle<()>,
     // ── Self‑Play ──────────────────────────────────────────────────
     self_play_config: SelfPlayConfig,
-    version_mgr: VersionManager<B::InnerBackend>,
+    version_mgr: VersionManager,
     // ── Skill Tracker ────────────────────────────────────────────
-    skill_tracker: Option<AsyncSkillTracker<B::InnerBackend, OBS, ACT, SI>>,
+    skill_tracker: Option<AsyncSkillTracker<OBS, ACT, SI>>,
     skill_metric_rx: Option<Receiver<SkillTrackerUpdate>>,
 
-    collector: ThreadSim<B::InnerBackend, SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+    collector: ThreadSim<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
 }
 
-impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>, SS, OBS, ACT, REW, TERM, TRUNC, SI>
-    Learner<B, O, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<SS, OBS, ACT, REW, TERM, TRUNC, SI> Learner<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI> + Send,
     SI: SharedInfoProvider + SharedInfoReport + SharedInfoRng + Send,
@@ -973,7 +968,7 @@ where
     TRUNC: Truncate<SI> + Send,
 {
     /// Load the previously saved model, training stats, and optimizer state.
-    /// Does nothing if the model can't be loaded, this is safe to call unconditionally.
+    /// Does nothing if no checkpoint exists. Invalid or legacy checkpoints cause a panic.
     ///
     /// Restores the transfer-round count (`Stats::transfer_rounds`) into the
     /// PPO schedule state and the regen anchor (`*_init` files) when present.
@@ -989,7 +984,7 @@ where
 
         self.ppo.reinit_optimizers(&self.model);
 
-        if let Some(latest_folder) = latest_checkpoint_folder(&self.checkpoints_folder) {
+        if let Some(latest_folder) = resolve_model_folder(&self.checkpoints_folder) {
             self.ppo.load_optimizers(&latest_folder);
             self.ppo.load_regen_snapshot(&latest_folder, &self.model);
             self.ppo.set_transfer_rounds(self.stats.transfer_rounds);
@@ -1007,7 +1002,7 @@ where
             let template = self.model.valid();
             self.version_mgr.load_versions(
                 &template,
-                &self.device,
+                &self.device.clone().without_autodiff(),
                 self.stats.cumulative_timesteps,
             );
         }
@@ -1417,11 +1412,12 @@ where
                 NormSelection::RmsNorm => TeacherNormSelection::RmsNorm,
             },
         };
-        let teacher =
-            TeacherPolicy::<B::InnerBackend>::load(&teacher_folder, &teacher_config, &self.device)
-                .unwrap_or_else(|e| {
-                    panic!("Failed to load teacher policy from {teacher_folder:?}: {e}")
-                });
+        let teacher = TeacherPolicy::load(
+            &teacher_folder,
+            &teacher_config,
+            &self.device.clone().without_autodiff(),
+        )
+        .unwrap_or_else(|e| panic!("Failed to load teacher policy from {teacher_folder:?}: {e}"));
         let teacher_params = teacher.actor.num_params()
             + teacher
                 .shared_head

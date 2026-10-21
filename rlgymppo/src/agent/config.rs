@@ -1,6 +1,6 @@
 use burn::grad_clipping::GradientClippingConfig;
-use burn::optim::{AdamWConfig, Optimizer};
-use burn::tensor::backend::AutodiffBackend;
+use burn::optim::{AdamWConfig, ModuleOptimizer};
+use burn::tensor::Device;
 
 use super::Ppo;
 use super::model::{Actic, Net};
@@ -259,11 +259,11 @@ impl Default for PpoLearnerConfig {
 
 impl PpoLearnerConfig {
     /// Initialize with the default AdamW optimizer.
-    pub fn init<B: AutodiffBackend>(self, device: B::Device) -> Ppo<B> {
+    pub fn init(self, device: Device) -> Ppo {
         self.validate_batching();
 
         let clip_grad = self.clip_grad.clone();
-        Ppo::new(self, device, || {
+        Ppo::new(self, device.autodiff(), || {
             let mut cfg = AdamWConfig::new().with_epsilon(1e-8);
             if let Some(ref clip) = clip_grad {
                 cfg = cfg.with_grad_clipping(Some(clip.clone()));
@@ -276,14 +276,10 @@ impl PpoLearnerConfig {
     ///
     /// The `make_optim` closure is called three times (once per sub-network)
     /// and must return a freshly created optimizer each time.
-    pub fn init_with<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
-        self,
-        device: B::Device,
-        make_optim: impl Fn() -> O,
-    ) -> Ppo<B, O> {
+    pub fn init_with(self, device: Device, make_optim: impl Fn() -> ModuleOptimizer) -> Ppo {
         self.validate_batching();
 
-        Ppo::new(self, device, make_optim)
+        Ppo::new(self, device.autodiff(), make_optim)
     }
 
     pub(crate) fn validate_batching(&self) {
@@ -340,15 +336,15 @@ impl PpoLearnerConfig {
     ///
     /// The factory is called once for the actor, critic, and shared head. This
     /// allows optimizers such as Muon/AdamW hybrids to select parameters by ID.
-    pub fn init_with_model<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
+    pub fn init_with_model(
         self,
-        device: B::Device,
-        model: &Actic<B>,
-        make_optim: impl Fn(OptimizerNetwork, &Net<B>) -> O + 'static,
-    ) -> Ppo<B, O> {
+        device: Device,
+        model: &Actic,
+        make_optim: impl Fn(OptimizerNetwork, &Net) -> ModuleOptimizer + 'static,
+    ) -> Ppo {
         self.validate_batching();
 
-        Ppo::new_with_model(self, device, model, make_optim)
+        Ppo::new_with_model(self, device.autodiff(), model, make_optim)
     }
 }
 

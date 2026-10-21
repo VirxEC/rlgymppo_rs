@@ -2,7 +2,7 @@
 
 use std::thread::available_parallelism;
 
-use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::Device;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng, rng};
 use rlgymppo::rlgym::{Env, GameState, SharedInfoProvider};
@@ -130,12 +130,12 @@ pub fn create_env(
     )
 }
 
-pub fn default_config<B: AutodiffBackend>(
-    device: B::Device,
-    render_device: B::Device,
-    skill_tracker_device: Option<B::Device>,
+pub fn default_config(
+    device: Device,
+    render_device: Device,
+    skill_tracker_device: Option<Device>,
     async_skill_tracker: bool,
-) -> LearnerConfig<B> {
+) -> LearnerConfig {
     // Samples collected before each PPO update. Larger values reduce per-update
     // overhead but use more CPU memory and make policy updates less frequent.
     let timesteps_per_iteration = 100_000;
@@ -201,21 +201,21 @@ pub fn default_config<B: AutodiffBackend>(
     }
 }
 
-pub fn run<B: AutodiffBackend>(
-    device: B::Device,
-    render_device: B::Device,
-    skill_tracker_device: Option<B::Device>,
+pub fn run(
+    device: Device,
+    render_device: Device,
+    skill_tracker_device: Option<Device>,
     async_skill_tracker: bool,
 ) {
     init_from_default(cfg!(not(debug_assertions))).unwrap();
 
-    let mut learner = default_config::<B>(
+    let mut learner = default_config(
         device,
         render_device,
         skill_tracker_device,
         async_skill_tracker,
     )
-    .init(create_env, default_adamw_optimizer::<B>());
+    .init(create_env, default_adamw_optimizer());
     learner.load();
     learner.learn();
 }

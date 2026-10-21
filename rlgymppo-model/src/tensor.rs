@@ -1,12 +1,8 @@
 use burn::prelude::*;
 use burn::tensor::activation::log_softmax;
-use burn::tensor::cast::ToElement;
 use burn::tensor::{Distribution, Transaction};
 
-pub(crate) fn to_mask_tensor_2d<B: Backend>(
-    masks: &[Vec<bool>],
-    device: &B::Device,
-) -> Tensor<B, 2> {
+pub(crate) fn to_mask_tensor_2d(masks: &[Vec<bool>], device: &Device) -> Tensor<2> {
     let shape = [masks.len(), masks[0].len()];
     let data: Vec<f32> = masks
         .iter()
@@ -15,11 +11,11 @@ pub(crate) fn to_mask_tensor_2d<B: Backend>(
     Tensor::from_data(TensorData::new(data, shape), device)
 }
 
-pub(crate) fn to_mask_tensor_2d_indexed<B: Backend>(
+pub(crate) fn to_mask_tensor_2d_indexed(
     masks: &[Vec<bool>],
     indices: &[usize],
-    device: &B::Device,
-) -> Tensor<B, 2> {
+    device: &Device,
+) -> Tensor<2> {
     let columns = masks[indices[0]].len();
     let mut data = Vec::with_capacity(indices.len() * columns);
     for &index in indices {
@@ -32,10 +28,7 @@ pub(crate) fn to_mask_tensor_2d_indexed<B: Backend>(
     Tensor::from_data(TensorData::new(data, [indices.len(), columns]), device)
 }
 
-pub(crate) fn to_state_tensor_2d<B: Backend>(
-    state: &[Vec<f32>],
-    device: &B::Device,
-) -> Tensor<B, 2> {
+pub(crate) fn to_state_tensor_2d(state: &[Vec<f32>], device: &Device) -> Tensor<2> {
     let mut data: Vec<f32> = Vec::with_capacity(state.len() * state[0].len());
     for row in state {
         data.extend(row);
@@ -43,11 +36,11 @@ pub(crate) fn to_state_tensor_2d<B: Backend>(
     Tensor::from_data(TensorData::new(data, [state.len(), state[0].len()]), device)
 }
 
-pub(crate) fn to_state_tensor_2d_indexed<B: Backend>(
+pub(crate) fn to_state_tensor_2d_indexed(
     state: &[Vec<f32>],
     indices: &[usize],
-    device: &B::Device,
-) -> Tensor<B, 2> {
+    device: &Device,
+) -> Tensor<2> {
     let columns = state[indices[0]].len();
     let mut data: Vec<f32> = Vec::with_capacity(indices.len() * columns);
     for &index in indices {
@@ -56,21 +49,21 @@ pub(crate) fn to_state_tensor_2d_indexed<B: Backend>(
     Tensor::from_data(TensorData::new(data, [indices.len(), columns]), device)
 }
 
-pub(crate) fn to_state_tensor_2d_flat<B: Backend>(
+pub(crate) fn to_state_tensor_2d_flat(
     state: &[f32],
     rows: usize,
     columns: usize,
-    device: &B::Device,
-) -> Tensor<B, 2> {
+    device: &Device,
+) -> Tensor<2> {
     Tensor::from_data(TensorData::new(state.to_vec(), [rows, columns]), device)
 }
 
-pub(crate) fn to_mask_tensor_2d_flat<B: Backend>(
+pub(crate) fn to_mask_tensor_2d_flat(
     masks: &[bool],
     rows: usize,
     columns: usize,
-    device: &B::Device,
-) -> Tensor<B, 2> {
+    device: &Device,
+) -> Tensor<2> {
     // NOTE: stays `f32` on purpose. The `u8` + device-cast variant saves
     // 64KB per submit but adds a kernel launch on this launch-bound path
     // (measured net negative). The learner-side batch uploads stay `u8`.
@@ -78,12 +71,12 @@ pub(crate) fn to_mask_tensor_2d_flat<B: Backend>(
     Tensor::from_data(TensorData::new(data, [rows, columns]), device)
 }
 
-pub(crate) fn to_state_tensor_2d_indexed_flat<B: Backend>(
+pub(crate) fn to_state_tensor_2d_indexed_flat(
     state: &[f32],
     columns: usize,
     indices: &[usize],
-    device: &B::Device,
-) -> Tensor<B, 2> {
+    device: &Device,
+) -> Tensor<2> {
     let mut data: Vec<f32> = Vec::with_capacity(indices.len() * columns);
     for &index in indices {
         data.extend_from_slice(&state[index * columns..(index + 1) * columns]);
@@ -91,12 +84,12 @@ pub(crate) fn to_state_tensor_2d_indexed_flat<B: Backend>(
     Tensor::from_data(TensorData::new(data, [indices.len(), columns]), device)
 }
 
-pub(crate) fn to_mask_tensor_2d_indexed_flat<B: Backend>(
+pub(crate) fn to_mask_tensor_2d_indexed_flat(
     masks: &[bool],
     columns: usize,
     indices: &[usize],
-    device: &B::Device,
-) -> Tensor<B, 2> {
+    device: &Device,
+) -> Tensor<2> {
     let mut data: Vec<f32> = Vec::with_capacity(indices.len() * columns);
     for &index in indices {
         data.extend(
@@ -108,18 +101,18 @@ pub(crate) fn to_mask_tensor_2d_indexed_flat<B: Backend>(
     Tensor::from_data(TensorData::new(data, [indices.len(), columns]), device)
 }
 
-pub(crate) struct SampledActions<B: Backend> {
-    pub actions: Tensor<B, 2, Int>,
-    pub log_probs: Tensor<B, 2>,
+pub(crate) struct SampledActions {
+    pub actions: Tensor<2, Int>,
+    pub log_probs: Tensor<2>,
 }
 
-pub(crate) fn sample_actions_from_logits_tensor<B: Backend>(
-    logits: Tensor<B, 2>,
-    device: &B::Device,
-) -> SampledActions<B> {
+pub(crate) fn sample_actions_from_logits_tensor(
+    logits: Tensor<2>,
+    device: &Device,
+) -> SampledActions {
     let shape = logits.shape();
     let log_probs = log_softmax(logits.clone(), 1);
-    let uniform = Tensor::<B, 2>::random(shape, Distribution::Default, device);
+    let uniform = Tensor::<2>::random(shape, Distribution::Default, device);
     let gumbel = uniform.log().neg().log().neg();
     let actions = (logits + gumbel).argmax(1);
     let log_probs = log_probs.gather(1, actions.clone());
@@ -127,35 +120,47 @@ pub(crate) fn sample_actions_from_logits_tensor<B: Backend>(
     SampledActions { actions, log_probs }
 }
 
-pub(crate) fn sampled_actions_to_vec<B: Backend>(
-    sampled: SampledActions<B>,
-) -> (Vec<usize>, Vec<f32>) {
+fn action_indices_to_usize(data: TensorData) -> Vec<usize> {
+    data.try_into_vec_as::<i64>()
+        .expect("action indices must be readable as i64")
+        .into_iter()
+        .map(|value| usize::try_from(value).expect("action indices must be non-negative"))
+        .collect()
+}
+
+pub(crate) fn sampled_actions_to_vec(sampled: SampledActions) -> (Vec<usize>, Vec<f32>) {
     let transaction = Transaction::default()
         .register(sampled.log_probs)
         .register(sampled.actions)
         .execute();
 
     (
-        transaction[1]
-            .iter::<B::IntElem>()
-            .map(|value| value.to_usize())
-            .collect(),
-        transaction[0].to_vec().unwrap(),
+        action_indices_to_usize(transaction[1].clone()),
+        transaction[0].try_to_vec::<f32>().unwrap(),
     )
 }
 
-pub(crate) fn sample_actions_from_logits<B: Backend>(
-    logits: Tensor<B, 2>,
-    device: &B::Device,
+pub(crate) fn sample_actions_from_logits(
+    logits: Tensor<2>,
+    device: &Device,
 ) -> (Vec<usize>, Vec<f32>) {
     sampled_actions_to_vec(sample_actions_from_logits_tensor(logits, device))
 }
 
-pub(crate) fn argmax_actions<B: Backend>(output: Tensor<B, 2>) -> Vec<usize> {
-    output
-        .argmax(1)
-        .into_data()
-        .iter::<B::IntElem>()
-        .map(|value| value.to_usize())
-        .collect()
+pub(crate) fn argmax_actions(output: Tensor<2>) -> Vec<usize> {
+    action_indices_to_usize(output.argmax(1).into_data())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_indices_convert_from_i32_and_i64() {
+        let i32_data = TensorData::new(vec![0_i32, 2, 7], [3]);
+        let i64_data = TensorData::new(vec![0_i64, 2, 7], [3]);
+
+        assert_eq!(action_indices_to_usize(i32_data), vec![0, 2, 7]);
+        assert_eq!(action_indices_to_usize(i64_data), vec![0, 2, 7]);
+    }
 }

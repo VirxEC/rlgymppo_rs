@@ -3,7 +3,6 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use burn::prelude::*;
 use rayon::ThreadPool;
 use rlgym::{
     Action, Env, FullObs, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate,
@@ -504,7 +503,7 @@ fn step_game<SS, OBS, ACT, REW, TERM, TRUNC, SI>(
 
 /// One collection batch: the game instances, the flat obs buffers, and
 /// the per-player trajectory buffers.
-pub struct BatchSim<B: Backend, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+pub struct BatchSim<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
     SI: SharedInfoProvider,
@@ -535,7 +534,7 @@ where
     overflow_trajs: VecDeque<(PlayerTraj, Option<Vec<f32>>)>,
     retain_overflow_episodes: bool,
     metrics: Report,
-    device: B::Device,
+    device: burn::tensor::Device,
     max_episode_length: Option<usize>,
     /// When enabled, only complete trajectories are returned. Incomplete
     /// buffers carry over and continue accumulating across collections
@@ -556,9 +555,8 @@ where
     self_play_log_probs: Vec<f32>,
 }
 
-impl<B, SS, OBS, ACT, REW, TERM, TRUNC, SI> BatchSim<B, SS, OBS, ACT, REW, TERM, TRUNC, SI>
+impl<SS, OBS, ACT, REW, TERM, TRUNC, SI> BatchSim<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
-    B: Backend,
     SS: StateSetter<SI>,
     SI: SharedInfoProvider + SharedInfoReport,
     OBS: Obs<SI>,
@@ -575,7 +573,7 @@ where
         make_old_obs: Option<FO>,
         thread_num: usize,
         num_games: usize,
-        device: B::Device,
+        device: burn::tensor::Device,
         reward_sampling: RewardSamplingConfig,
         trajectory_capacity_hint: usize,
         max_episode_length: Option<usize>,
@@ -710,11 +708,11 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn run_with_budget(
         &mut self,
-        model: &Actic<B>,
+        model: &Actic,
         remaining_steps: &AtomicUsize,
         memory_capacity_hint: usize,
         rollout_budget: usize,
-        self_play: Option<(&Actic<B>, usize)>,
+        self_play: Option<(&Actic, usize)>,
         overbatching: bool,
         pool: Option<&ThreadPool>,
     ) -> (Memory, Report)
@@ -747,10 +745,10 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn run_into_shard(
         &mut self,
-        model: &Actic<B>,
+        model: &Actic,
         remaining_steps: &AtomicUsize,
         rollout_budget: usize,
-        self_play: Option<(&Actic<B>, usize)>,
+        self_play: Option<(&Actic, usize)>,
         overbatching: bool,
         pool: Option<&ThreadPool>,
         shard: &mut MemoryShard,
@@ -804,10 +802,10 @@ where
     #[allow(clippy::too_many_arguments)]
     fn run_inner(
         &mut self,
-        model: &Actic<B>,
+        model: &Actic,
         remaining_steps: &AtomicUsize,
         rollout_budget: usize,
-        self_play: Option<(&Actic<B>, usize)>,
+        self_play: Option<(&Actic, usize)>,
         overbatching: bool,
         pool: Option<&ThreadPool>,
         target: &mut impl ClaimTarget,
@@ -1775,7 +1773,7 @@ mod phase3_tests {
     mod flex_gated {
         use std::iter::repeat_n;
 
-        use burn::backend::Flex;
+        use burn::tensor::Device;
 
         use super::*;
 
@@ -1792,7 +1790,6 @@ mod phase3_tests {
             TestSharedInfo,
         >;
         type BatchSimType = BatchSim<
-            Flex,
             StateSetter,
             DefaultObs<1>,
             Action,
@@ -1826,7 +1823,7 @@ mod phase3_tests {
                 None::<fn() -> Box<dyn Obs<TestSharedInfo> + Send>>,
                 1,
                 3,
-                Default::default(),
+                Device::flex(),
                 RewardSamplingConfig::default(),
                 100,
                 None,

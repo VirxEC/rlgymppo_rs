@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use burn::optim::{GradientsAccumulator, GradientsParams, Optimizer};
+use burn::optim::{GradientsAccumulator, GradientsParams};
 use burn::prelude::*;
-use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{DType, FloatDType, Transaction};
 use rlgymppo_model::Policy;
 use rlgymppo_utils::Report;
@@ -28,7 +27,7 @@ use crate::base::{Memory, get_states_batch_range};
 pub struct TeacherConfig {
     /// Path to the directory containing the teacher model checkpoint(s).
     ///
-    /// May point directly at a checkpoint folder containing `actor.mpk.gz`, or
+    /// May point directly at a checkpoint folder containing `actor.bpk`, or
     /// at a parent directory of timestamped checkpoints (the latest one is
     /// used). Do not point this at the directory this run saves its own
     /// checkpoints to, or a later run may pick the student up as the teacher.
@@ -172,14 +171,14 @@ impl TransferLearnConfig {
 ///
 /// Masked-out actions contribute ~`0` on both sides (same masks), so the KL
 /// stays nonnegative and finite there.
-pub(crate) fn distillation_loss<B: AutodiffBackend>(
-    teacher: Tensor<B, 2>,
-    student: Tensor<B, 2>,
+pub(crate) fn distillation_loss(
+    teacher: Tensor<2>,
+    student: Tensor<2>,
     use_kl_div: bool,
     loss_scale: f32,
     loss_exponent: f32,
     temperature: f32,
-) -> Tensor<B, 1> {
+) -> Tensor<1> {
     if use_kl_div {
         let per_state = (teacher.clone() * (teacher.log() - student.log()))
             .sum_dim(1)
@@ -200,7 +199,7 @@ pub(crate) fn distillation_loss<B: AutodiffBackend>(
     }
 }
 
-impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
+impl Ppo {
     /// Distill the frozen teacher policy's action distribution into the
     /// student `net`.
     ///
@@ -218,12 +217,12 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     /// Returns the updated network and the number of timesteps consumed.
     pub fn transfer_learn(
         &mut self,
-        mut net: Actic<B>,
-        teacher: &Policy<B::InnerBackend>,
+        mut net: Actic,
+        teacher: &Policy,
         memory: &Memory,
         tl: &TransferLearnConfig,
         metrics: &mut Report,
-    ) -> (Actic<B>, usize) {
+    ) -> (Actic, usize) {
         let n = memory.len();
         assert!(n > 0, "Cannot distill from an empty memory");
         tl.validate();
@@ -261,45 +260,34 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         // `u8` upload for the masks. Everything below slices these with
         // `narrow`: no per-chunk and no per-epoch re-upload.
         let resident_start = Instant::now();
-        let resident_teacher = get_states_batch_range::<B::InnerBackend>(
-            teacher_states,
-            teacher_width,
-            0,
-            n,
-            &self.device,
-        );
-        // Same obs space: share the teacher storage for the student (no copy,
-        // half the VRAM). Different spaces: upload the student buffer too.
-        let resident_student_inner = if memory.old_state_width() > 0 {
-            get_states_batch_range::<B::InnerBackend>(
-                memory.states(),
-                memory.state_width(),
-                0,
-                n,
-                &self.device,
-            )
-        } else {
-            resident_teacher.clone()
-        };
+        let teacher_device = self.device.clone().without_autodiff();
+        let resident_teacher =
+            get_states_batch_range(teacher_states, teacher_width, 0, n, &teacher_device);
+        let resident_student =
+            get_states_batch_range(memory.states(), memory.state_width(), 0, n, &self.device);
         let mask_width = memory.action_mask_width();
-        let resident_masks_inner = if memory.action_masks().is_empty() {
+        let resident_masks_teacher = if memory.action_masks().is_empty() {
             None
         } else {
-            let masks: Vec<u8> = memory.action_masks().to_vec();
-            Some(Tensor::<B::InnerBackend, 2, Int>::from_data(
-                TensorData::new(masks, [n, mask_width]),
+            Some(Tensor::<2, Int>::from_data(
+                TensorData::new(memory.action_masks().to_vec(), [n, mask_width]),
+                &teacher_device,
+            ))
+        };
+        let resident_masks = if memory.action_masks().is_empty() {
+            None
+        } else {
+            Some(Tensor::<2, Int>::from_data(
+                TensorData::new(memory.action_masks().to_vec(), [n, mask_width]),
                 &self.device,
             ))
         };
-        // Wrap once for the autodiff backend (no copy: the training graph
-        // references the same device storage). Chunks narrow these views.
-        let resident_student = Tensor::<B, 2>::from_inner(resident_student_inner);
-        let resident_masks = resident_masks_inner
-            .as_ref()
-            .map(|masks| Tensor::<B, 2, Int>::from_inner(masks.clone()));
+        // Teacher tensors use a plain device. Student tensors use the
+        // autodiff device. These contexts cannot share tensor handles.
         metrics["Transfer/batch staging time"] = resident_start.elapsed().as_secs_f64().into();
 
         // ── Teacher probabilities (no gradients) ──────────────────────
+        let teacher = teacher.valid();
         // One masked-logit forward per chunk; both the tempered training
         // targets and the `T=1` entropy baseline derive from those logits via
         // `probs_with_temperature` (no second forward). Targets are stored
@@ -309,8 +297,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
         // (`Transfer/teacher target entropy`) is logged alongside.
         let teacher_start = Instant::now();
         let mut teacher_chunks = Vec::with_capacity(n.div_ceil(mb));
-        let mut teacher_entropy: Option<Tensor<B::InnerBackend, 1>> = None;
-        let mut teacher_target_entropy: Option<Tensor<B::InnerBackend, 1>> = None;
+        let mut teacher_entropy: Option<Tensor<1>> = None;
+        let mut teacher_target_entropy: Option<Tensor<1>> = None;
         let temp = tl.teacher_temperature;
         for start in (0..n).step_by(mb) {
             let chunk_len = (start + mb).min(n) - start;
@@ -319,14 +307,14 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 .clone()
                 .narrow(0, start, chunk_len)
                 .cast(DType::F32);
-            let masks = resident_masks_inner.as_ref().map(|masks| {
+            let masks = resident_masks_teacher.as_ref().map(|masks| {
                 masks
                     .clone()
                     .narrow(0, start, chunk_len)
                     .cast(FloatDType::F32)
             });
             let logits = teacher.masked_logits(states, masks);
-            let probs_target = Net::<B::InnerBackend>::probs_with_temperature(logits.clone(), temp);
+            let probs_target = Net::probs_with_temperature(logits.clone(), temp);
             let chunk_target_entropy = -(probs_target.clone() * probs_target.clone().log())
                 .sum_dim(1)
                 .mean();
@@ -342,7 +330,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     .sum_dim(1)
                     .mean()
             } else {
-                let probs_plain = Net::<B::InnerBackend>::probs_with_temperature(logits, 1.0);
+                let probs_plain = Net::probs_with_temperature(logits, 1.0);
                 -(probs_plain.clone() * probs_plain.clone().log())
                     .sum_dim(1)
                     .mean()
@@ -364,9 +352,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     .expect("teacher entropy transaction"),
                 _ => unreachable!("non-empty memory always fills teacher entropies"),
             };
-        let teacher_entropy_sum = teacher_entropy_sum.to_vec::<f32>().unwrap()[0] as f64;
+        let teacher_entropy_sum = teacher_entropy_sum.try_to_vec::<f32>().unwrap()[0] as f64;
         let teacher_target_entropy_sum =
-            teacher_target_entropy_sum.to_vec::<f32>().unwrap()[0] as f64;
+            teacher_target_entropy_sum.try_to_vec::<f32>().unwrap()[0] as f64;
         metrics["Timing/teacher inference"] = teacher_start.elapsed().as_secs_f64().into();
         metrics["Transfer/teacher entropy"] = teacher_entropy_sum.into();
         metrics["Transfer/teacher target entropy"] = teacher_target_entropy_sum.into();
@@ -376,9 +364,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
 
         // First-epoch metrics accumulate on the GPU: one readback at the end
         // instead of one sync per chunk.
-        let mut loss_acc: Option<Tensor<B, 1>> = None;
-        let mut accuracy_acc: Option<Tensor<B, 1>> = None;
-        let mut entropy_acc: Option<Tensor<B, 1>> = None;
+        let mut loss_acc: Option<Tensor<1>> = None;
+        let mut accuracy_acc: Option<Tensor<1>> = None;
+        let mut entropy_acc: Option<Tensor<1>> = None;
 
         let mut upload_time = Duration::ZERO;
         let mut optim_time = Duration::ZERO;
@@ -408,8 +396,8 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 // the teacher targets; deployment/entropy stays at T=1. One
                 // masked-logit forward serves both (no second forward).
                 let student_logits = net.actor.masked_logits(features, masks);
-                let student_target = Net::<B>::probs_with_temperature(student_logits.clone(), temp);
-                let teacher_probs = Tensor::<B, 2>::from_inner(teacher_chunk.clone());
+                let student_target = Net::probs_with_temperature(student_logits.clone(), temp);
+                let teacher_probs = teacher_chunk.clone();
 
                 let loss = distillation_loss(
                     teacher_probs.clone(),
@@ -427,7 +415,7 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                     let student_plain = if temp == 1.0 {
                         student_target.clone()
                     } else {
-                        Net::<B>::probs_with_temperature(student_logits, 1.0)
+                        Net::probs_with_temperature(student_logits, 1.0)
                     };
                     let matches = student_plain
                         .clone()
@@ -497,9 +485,9 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
                 .expect("Correct amount of tensor data"),
             _ => unreachable!("epochs > 0 always fills the metric accumulators"),
         };
-        let loss_sum = loss_sum.to_vec::<f32>().unwrap()[0] as f64;
-        let accuracy_sum = accuracy_sum.to_vec::<f32>().unwrap()[0] as f64;
-        let entropy_sum = entropy_sum.to_vec::<f32>().unwrap()[0] as f64;
+        let loss_sum = loss_sum.try_to_vec::<f32>().unwrap()[0] as f64;
+        let accuracy_sum = accuracy_sum.try_to_vec::<f32>().unwrap()[0] as f64;
+        let entropy_sum = entropy_sum.try_to_vec::<f32>().unwrap()[0] as f64;
 
         metrics["Timing/distillation"] = training_start.elapsed().as_secs_f64().into();
         metrics["Transfer/upload time"] = upload_time.as_secs_f64().into();
@@ -546,19 +534,14 @@ impl<B: AutodiffBackend, O: Optimizer<Net<B>, B>> Ppo<B, O> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "flex"))]
 mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use burn::backend::{Autodiff, Flex};
-    use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
-
     use super::*;
     use crate::agent::config::PpoLearnerConfig;
     use crate::base::TerminalState;
-
-    type B = Autodiff<Flex>;
 
     fn memory_batch(n: usize, width: usize, old_width: usize, n_actions: usize) -> Memory {
         let mut memory = Memory::with_capacity(n);
@@ -588,14 +571,13 @@ mod tests {
 
     #[test]
     fn distillation_trains_student_policy_towards_teacher() {
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 8;
         let n_actions = 5;
         let n = 64;
 
         // Teacher: larger network with a shared head.
-        let teacher =
-            Actic::<Flex>::new(obs, n_actions, vec![16, 16], vec![16], &[16], &device, None);
+        let teacher = Actic::new(obs, n_actions, vec![16, 16], vec![16], &[16], &device, None);
 
         // Persist the teacher, then load it back as a `Policy` (the same path
         // `Learner::transfer_learn` takes).
@@ -608,20 +590,19 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
         teacher
             .actor
             .clone()
-            .save_file(root.join("actor"), &recorder)
+            .save_file(root.join("actor.bpk"))
             .unwrap();
         teacher
             .shared_head
             .as_ref()
             .unwrap()
             .clone()
-            .save_file(root.join("shared_head"), &recorder)
+            .save_file(root.join("shared_head.bpk"))
             .unwrap();
-        let teacher = Policy::<Flex>::load(
+        let teacher = Policy::load(
             &root,
             &rlgymppo_model::PolicyConfig {
                 input_size: obs,
@@ -630,13 +611,12 @@ mod tests {
                 shared_head_layer_sizes: vec![16],
                 norm: rlgymppo_model::NormSelection::None,
             },
-            &device,
+            &device.clone().without_autodiff(),
         )
         .unwrap();
-        fs::remove_dir_all(&root).unwrap();
 
         // Student: smaller network.
-        let mut net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let mut net = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
 
         let memory = memory_batch(n, obs, 0, n_actions);
         let tl = TransferLearnConfig {
@@ -652,7 +632,7 @@ mod tests {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
 
         // Critic must stay untouched by distillation.
         let critic_before = flatten_net(&net.critic);
@@ -692,18 +672,19 @@ mod tests {
                 && metrics["Transfer/entropy"].as_float().is_finite(),
             "entropy metrics should be finite"
         );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn distillation_supports_different_teacher_obs_space() {
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let n = 64;
         let n_actions = 5;
         let student_obs = 5;
         let teacher_obs = 8;
 
         // Teacher consumes the *old* (larger) observation space.
-        let teacher = Actic::<Flex>::new(
+        let teacher = Actic::new(
             teacher_obs,
             n_actions,
             vec![16, 16],
@@ -721,20 +702,19 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
         teacher
             .actor
             .clone()
-            .save_file(root.join("actor"), &recorder)
+            .save_file(root.join("actor.bpk"))
             .unwrap();
         teacher
             .shared_head
             .as_ref()
             .unwrap()
             .clone()
-            .save_file(root.join("shared_head"), &recorder)
+            .save_file(root.join("shared_head.bpk"))
             .unwrap();
-        let teacher = Policy::<Flex>::load(
+        let teacher = Policy::load(
             &root,
             &rlgymppo_model::PolicyConfig {
                 input_size: teacher_obs,
@@ -743,13 +723,12 @@ mod tests {
                 shared_head_layer_sizes: vec![16],
                 norm: rlgymppo_model::NormSelection::None,
             },
-            &device,
+            &device.clone().without_autodiff(),
         )
         .unwrap();
-        fs::remove_dir_all(&root).unwrap();
 
         // Student consumes the *new* (smaller) observation space.
-        let mut net = Actic::<B>::new(
+        let mut net = Actic::new(
             student_obs,
             n_actions,
             vec![8],
@@ -778,7 +757,7 @@ mod tests {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
 
         let critic_before = flatten_net(&net.critic);
         let mut metrics = Report::default();
@@ -802,18 +781,19 @@ mod tests {
             critic_before,
             "distillation must not touch the critic"
         );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn distillation_supports_schedule_regen_and_plasticity_logging() {
         use crate::agent::config::{LrSchedule, RegenConfig};
 
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 8;
         let n_actions = 5;
         let n = 64;
 
-        let teacher = Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let teacher = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
         let root = std::env::temp_dir().join(format!(
             "rlgymppo-transfer-regen-{}-{}",
             std::process::id(),
@@ -823,20 +803,19 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
         teacher
             .actor
             .clone()
-            .save_file(root.join("actor"), &recorder)
+            .save_file(root.join("actor.bpk"))
             .unwrap();
         teacher
             .shared_head
             .as_ref()
             .unwrap()
             .clone()
-            .save_file(root.join("shared_head"), &recorder)
+            .save_file(root.join("shared_head.bpk"))
             .unwrap();
-        let teacher = Policy::<Flex>::load(
+        let teacher = Policy::load(
             &root,
             &rlgymppo_model::PolicyConfig {
                 input_size: obs,
@@ -845,12 +824,11 @@ mod tests {
                 shared_head_layer_sizes: vec![8],
                 norm: rlgymppo_model::NormSelection::None,
             },
-            &device,
+            &device.clone().without_autodiff(),
         )
         .unwrap();
-        fs::remove_dir_all(&root).unwrap();
 
-        let mut net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let mut net = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
         let memory = memory_batch(n, obs, 0, n_actions);
         let tl = TransferLearnConfig {
             lr: 0.05,
@@ -873,7 +851,7 @@ mod tests {
             plasticity_log_interval: Some(1),
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
 
         let critic_before = flatten_net(&net.critic);
         let mut metrics = Report::default();
@@ -957,16 +935,17 @@ mod tests {
                 "frozen critic metric {key} must not be emitted in transfer mode"
             );
         }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn distillation_softens_teacher_targets_with_temperature() {
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 8;
         let n_actions = 5;
         let n = 64;
 
-        let teacher = Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let teacher = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
         let root = std::env::temp_dir().join(format!(
             "rlgymppo-transfer-temp-{}-{}",
             std::process::id(),
@@ -976,20 +955,19 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
         teacher
             .actor
             .clone()
-            .save_file(root.join("actor"), &recorder)
+            .save_file(root.join("actor.bpk"))
             .unwrap();
         teacher
             .shared_head
             .as_ref()
             .unwrap()
             .clone()
-            .save_file(root.join("shared_head"), &recorder)
+            .save_file(root.join("shared_head.bpk"))
             .unwrap();
-        let teacher = Policy::<Flex>::load(
+        let teacher = Policy::load(
             &root,
             &rlgymppo_model::PolicyConfig {
                 input_size: obs,
@@ -998,12 +976,11 @@ mod tests {
                 shared_head_layer_sizes: vec![8],
                 norm: rlgymppo_model::NormSelection::None,
             },
-            &device,
+            &device.clone().without_autodiff(),
         )
         .unwrap();
-        fs::remove_dir_all(&root).unwrap();
 
-        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let net = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
         let memory = memory_batch(n, obs, 0, n_actions);
         let base_tl = TransferLearnConfig {
             lr: 0.05,
@@ -1014,11 +991,11 @@ mod tests {
             ..Default::default()
         };
 
-        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
 
         let mut metrics = Report::default();
         ppo.transfer_learn(net.clone(), &teacher, &memory, &base_tl, &mut metrics);
@@ -1051,20 +1028,21 @@ mod tests {
             hot_target >= hot_entropy,
             "higher temperature should not sharpen the targets ({hot_entropy} -> {hot_target})"
         );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn kl_loss_is_true_forward_kl() {
         use burn::tensor::TensorData;
 
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         // Known distributions: row0 q=[0.9, 0.1] vs p=[0.5, 0.5], row1 equal.
         let teacher_data = vec![0.9_f32, 0.1, 0.5, 0.5];
         let student_data = vec![0.5_f32, 0.5, 0.5, 0.5];
-        let teacher = Tensor::<B, 2>::from_data(TensorData::new(teacher_data, [2, 2]), &device);
-        let student = Tensor::<B, 2>::from_data(TensorData::new(student_data, [2, 2]), &device);
-        let loss = distillation_loss::<B>(teacher, student, true, 1.0, 1.0, 1.0);
-        let loss_val: Vec<f32> = loss.into_data().into_vec().unwrap();
+        let teacher = Tensor::<2>::from_data(TensorData::new(teacher_data, [2, 2]), &device);
+        let student = Tensor::<2>::from_data(TensorData::new(student_data, [2, 2]), &device);
+        let loss = distillation_loss(teacher, student, true, 1.0, 1.0, 1.0);
+        let loss_val: Vec<f32> = loss.into_data().try_into_vec::<f32>().unwrap();
         let kl0 = 0.9_f32 * (0.9_f32 / 0.5_f32).ln() + 0.1_f32 * (0.1_f32 / 0.5_f32).ln();
         let expected = (kl0 + 0.0) / 2.0;
         assert!(
@@ -1086,18 +1064,18 @@ mod tests {
     fn kl_loss_zero_equal_nonnegative_masked_and_scaled() {
         use burn::tensor::TensorData;
 
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         // Zero when equal (both L1 and KL, T=1 and T>1 with same inputs).
         for use_kl in [false, true] {
             for temp in [1.0_f32, 2.0] {
                 let probs = vec![0.7_f32, 0.2, 0.1, 0.4, 0.4, 0.2];
                 let teacher =
-                    Tensor::<B, 2>::from_data(TensorData::new(probs.clone(), [2, 3]), &device);
-                let student = Tensor::<B, 2>::from_data(TensorData::new(probs, [2, 3]), &device);
+                    Tensor::<2>::from_data(TensorData::new(probs.clone(), [2, 3]), &device);
+                let student = Tensor::<2>::from_data(TensorData::new(probs, [2, 3]), &device);
                 // KL at T>1 scales by T^2 even when inputs are identical
                 // (still zero); L1 ignores temperature.
-                let loss = distillation_loss::<B>(teacher, student, use_kl, 1.0, 1.0, temp);
-                let val: Vec<f32> = loss.into_data().into_vec().unwrap();
+                let loss = distillation_loss(teacher, student, use_kl, 1.0, 1.0, temp);
+                let val: Vec<f32> = loss.into_data().try_into_vec::<f32>().unwrap();
                 assert!(
                     val[0].abs() < 1e-6,
                     "equal distributions should give zero KD (use_kl={use_kl}, T={temp}), got {}",
@@ -1106,34 +1084,34 @@ mod tests {
             }
         }
         // Nonnegative, finite with masked actions (~1e-11 on both sides).
-        let teacher = Tensor::<B, 2>::from_data(
+        let teacher = Tensor::<2>::from_data(
             TensorData::new(vec![0.6_f32, 0.4, 1e-11, 0.5, 0.5, 1e-11], [2, 3]),
             &device,
         );
-        let student = Tensor::<B, 2>::from_data(
+        let student = Tensor::<2>::from_data(
             TensorData::new(vec![0.5_f32, 0.5, 1e-11, 0.7, 0.3, 1e-11], [2, 3]),
             &device,
         );
-        let loss = distillation_loss::<B>(teacher, student, true, 1.0, 1.0, 1.0);
-        let val: Vec<f32> = loss.into_data().into_vec().unwrap();
+        let loss = distillation_loss(teacher, student, true, 1.0, 1.0, 1.0);
+        let val: Vec<f32> = loss.into_data().try_into_vec::<f32>().unwrap();
         assert!(
             val[0].is_finite() && val[0] >= -1e-6,
             "masked KL should be nonnegative finite, got {}",
             val[0]
         );
         // loss_exponent applies per state: mean of squared KLs.
-        let teacher2 = Tensor::<B, 2>::from_data(
+        let teacher2 = Tensor::<2>::from_data(
             TensorData::new(vec![0.9_f32, 0.1, 0.5, 0.5], [2, 2]),
             &device,
         );
-        let student2 = Tensor::<B, 2>::from_data(
+        let student2 = Tensor::<2>::from_data(
             TensorData::new(vec![0.5_f32, 0.5, 0.5, 0.5], [2, 2]),
             &device,
         );
-        let loss1 = distillation_loss::<B>(teacher2.clone(), student2.clone(), true, 1.0, 1.0, 1.0);
-        let loss2 = distillation_loss::<B>(teacher2, student2, true, 1.0, 2.0, 1.0);
-        let v1: Vec<f32> = loss1.into_data().into_vec().unwrap();
-        let v2: Vec<f32> = loss2.into_data().into_vec().unwrap();
+        let loss1 = distillation_loss(teacher2.clone(), student2.clone(), true, 1.0, 1.0, 1.0);
+        let loss2 = distillation_loss(teacher2, student2, true, 1.0, 2.0, 1.0);
+        let v1: Vec<f32> = loss1.into_data().try_into_vec::<f32>().unwrap();
+        let v2: Vec<f32> = loss2.into_data().try_into_vec::<f32>().unwrap();
         let kl0 = 0.9_f32 * (0.9_f32 / 0.5_f32).ln() + 0.1_f32 * (0.1_f32 / 0.5_f32).ln();
         let expected_sq = (kl0 * kl0) / 2.0;
         assert!(
@@ -1143,19 +1121,16 @@ mod tests {
         );
         assert!(v1[0] > 0.0 && v2[0] > 0.0);
         // T^2 scaling for KL only; L1 ignores temperature.
-        let teacher3 =
-            Tensor::<B, 2>::from_data(TensorData::new(vec![0.9_f32, 0.1], [1, 2]), &device);
-        let student3 =
-            Tensor::<B, 2>::from_data(TensorData::new(vec![0.5_f32, 0.5], [1, 2]), &device);
-        let kl_t1 = distillation_loss::<B>(teacher3.clone(), student3.clone(), true, 1.0, 1.0, 1.0);
-        let kl_t2 = distillation_loss::<B>(teacher3.clone(), student3.clone(), true, 1.0, 1.0, 2.0);
-        let l1_t1 =
-            distillation_loss::<B>(teacher3.clone(), student3.clone(), false, 1.0, 1.0, 1.0);
-        let l1_t2 = distillation_loss::<B>(teacher3, student3, false, 1.0, 1.0, 2.0);
-        let kl_t1: Vec<f32> = kl_t1.into_data().into_vec().unwrap();
-        let kl_t2: Vec<f32> = kl_t2.into_data().into_vec().unwrap();
-        let l1_t1: Vec<f32> = l1_t1.into_data().into_vec().unwrap();
-        let l1_t2: Vec<f32> = l1_t2.into_data().into_vec().unwrap();
+        let teacher3 = Tensor::<2>::from_data(TensorData::new(vec![0.9_f32, 0.1], [1, 2]), &device);
+        let student3 = Tensor::<2>::from_data(TensorData::new(vec![0.5_f32, 0.5], [1, 2]), &device);
+        let kl_t1 = distillation_loss(teacher3.clone(), student3.clone(), true, 1.0, 1.0, 1.0);
+        let kl_t2 = distillation_loss(teacher3.clone(), student3.clone(), true, 1.0, 1.0, 2.0);
+        let l1_t1 = distillation_loss(teacher3.clone(), student3.clone(), false, 1.0, 1.0, 1.0);
+        let l1_t2 = distillation_loss(teacher3, student3, false, 1.0, 1.0, 2.0);
+        let kl_t1: Vec<f32> = kl_t1.into_data().try_into_vec::<f32>().unwrap();
+        let kl_t2: Vec<f32> = kl_t2.into_data().try_into_vec::<f32>().unwrap();
+        let l1_t1: Vec<f32> = l1_t1.into_data().try_into_vec::<f32>().unwrap();
+        let l1_t2: Vec<f32> = l1_t2.into_data().try_into_vec::<f32>().unwrap();
         assert!(
             (kl_t2[0] - 4.0 * kl_t1[0]).abs() < 1e-5,
             "KL should scale by T^2 ({} vs {})",
@@ -1170,16 +1145,16 @@ mod tests {
         );
         // Near-equal distributions with a fractional exponent stay finite
         // (clamped per-state KL cannot go slightly negative into `NaN`).
-        let teacher4 = Tensor::<B, 2>::from_data(
+        let teacher4 = Tensor::<2>::from_data(
             TensorData::new(vec![0.500001_f32, 0.499999, 0.5, 0.5], [2, 2]),
             &device,
         );
-        let student4 = Tensor::<B, 2>::from_data(
+        let student4 = Tensor::<2>::from_data(
             TensorData::new(vec![0.5_f32, 0.5, 0.5, 0.5], [2, 2]),
             &device,
         );
-        let frac = distillation_loss::<B>(teacher4, student4, true, 1.0, 0.5, 1.0);
-        let frac: Vec<f32> = frac.into_data().into_vec().unwrap();
+        let frac = distillation_loss(teacher4, student4, true, 1.0, 0.5, 1.0);
+        let frac: Vec<f32> = frac.into_data().try_into_vec::<f32>().unwrap();
         assert!(
             frac[0].is_finite() && frac[0] >= 0.0,
             "fractional-exponent KL must be finite nonnegative, got {}",
@@ -1189,18 +1164,18 @@ mod tests {
 
     #[test]
     fn temperature_applies_to_both_sides_and_metrics_stay_t1() {
-        use burn::module::AutodiffModule;
+        use burn::module::Module;
 
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 6;
         let n_actions = 4;
         let n = 32;
         let memory = memory_batch(n, obs, 0, n_actions);
-        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
         let base_tl = TransferLearnConfig {
             lr: 0.05,
             batch_size: n,
@@ -1210,9 +1185,9 @@ mod tests {
             ..Default::default()
         };
         // Identical teacher/student via `.valid()`: no checkpoint roundtrip.
-        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let net = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
         let valid = net.valid();
-        let teacher = Policy::<Flex> {
+        let teacher = Policy {
             actor: valid.actor.clone(),
             shared_head: valid.shared_head.clone(),
         };
@@ -1240,10 +1215,7 @@ mod tests {
             );
         }
         // Normal inference still defaults to T=1 (deployment distribution).
-        let _ = teacher.infer(
-            burn::tensor::Tensor::<Flex, 2>::zeros([2, obs], &device),
-            None,
-        );
+        let _ = teacher.infer(burn::tensor::Tensor::<2>::zeros([2, obs], &device), None);
     }
 
     #[test]
@@ -1268,13 +1240,12 @@ mod tests {
         let legacy: Stats = toml::from_str(&legacy_toml).unwrap();
         assert_eq!(legacy.transfer_rounds, 0);
         // Schedule continuation across a simulated restart.
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 6;
         let n_actions = 4;
         let n = 32;
-        let teacher_actic =
-            Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
-        let teacher = Policy::<Flex> {
+        let teacher_actic = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let teacher = Policy {
             actor: teacher_actic.actor.clone(),
             shared_head: teacher_actic.shared_head.clone(),
         };
@@ -1291,13 +1262,13 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
         assert_eq!(ppo.transfer_rounds(), 0);
-        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let net = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
         let mut metrics = Report::default();
         let (net, _) = ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
         let lr0 = metrics["Transfer/lr"].as_float();
@@ -1313,11 +1284,11 @@ mod tests {
         };
         let toml_str = toml::to_string(&saved).unwrap();
         let restored: Stats = toml::from_str(&toml_str).unwrap();
-        let mut ppo2: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo2: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
         ppo2.set_transfer_rounds(restored.transfer_rounds);
         let mut metrics2 = Report::default();
         ppo2.transfer_learn(net, &teacher, &memory, &tl, &mut metrics2);
@@ -1340,13 +1311,12 @@ mod tests {
     fn regen_anchor_is_pre_update_and_survives_save_load() {
         use crate::agent::config::RegenConfig;
 
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 6;
         let n_actions = 4;
         let n = 32;
-        let teacher_actic =
-            Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
-        let teacher = Policy::<Flex> {
+        let teacher_actic = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let teacher = Policy {
             actor: teacher_actic.actor.clone(),
             shared_head: teacher_actic.shared_head.clone(),
         };
@@ -1363,13 +1333,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
         assert!(!ppo.has_regen_snapshot());
-        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let net = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
         let before_actor = super::flatten_net(&net.actor);
         let before_head = net.shared_head.as_ref().map(super::flatten_net);
         let (net_after, _) =
@@ -1388,12 +1358,11 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         ppo.save_regen_snapshot(&dir);
-        assert!(dir.join("actor_init.mpk.gz").is_file());
-        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+        assert!(dir.join("actor_init.bpk").is_file());
         let loaded_actor = net_after
             .actor
             .clone()
-            .load_file(dir.join("actor_init"), &recorder, &device)
+            .try_load_file(dir.join("actor_init.bpk"))
             .unwrap();
         let loaded_flat = super::flatten_net(&loaded_actor);
         assert_eq!(
@@ -1403,16 +1372,16 @@ mod tests {
         if let Some(before_h) = before_head {
             let template = net_after.shared_head.clone().unwrap();
             let loaded_head = template
-                .load_file(dir.join("shared_head_init"), &recorder, &device)
+                .try_load_file(dir.join("shared_head_init.bpk"))
                 .unwrap();
             assert_eq!(super::flatten_net(&loaded_head), before_h);
         }
         // Save/resume identity: a fresh PPO loading the same folder keeps it.
-        let mut ppo2: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo2: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
         assert!(!ppo2.has_regen_snapshot());
         ppo2.load_regen_snapshot(&dir, &net_after);
         assert!(ppo2.has_regen_snapshot());
@@ -1429,7 +1398,7 @@ mod tests {
         let reloaded = net_after
             .actor
             .clone()
-            .load_file(dir2.join("actor_init"), &recorder, &device)
+            .try_load_file(dir2.join("actor_init.bpk"))
             .unwrap();
         assert_eq!(super::flatten_net(&reloaded), before_actor);
         fs::remove_dir_all(&dir).unwrap();
@@ -1444,11 +1413,11 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&empty).unwrap();
-        let mut ppo3: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo3: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
         ppo3.load_regen_snapshot(&empty, &net_after);
         assert!(!ppo3.has_regen_snapshot());
         fs::remove_dir_all(&empty).unwrap();
@@ -1460,13 +1429,12 @@ mod tests {
 
     #[test]
     fn update_magnitude_includes_shared_head() {
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 6;
         let n_actions = 4;
         let n = 32;
-        let teacher_actic =
-            Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
-        let teacher = Policy::<Flex> {
+        let teacher_actic = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let teacher = Policy {
             actor: teacher_actic.actor.clone(),
             shared_head: teacher_actic.shared_head.clone(),
         };
@@ -1479,12 +1447,12 @@ mod tests {
             loss_scale: 1.0,
             ..Default::default()
         };
-        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             ..Default::default()
         }
-        .init(device);
-        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        .init(device.clone());
+        let net = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
         let mut metrics = Report::default();
         ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
         let total = metrics["Transfer/update magnitude"].as_float();
@@ -1504,13 +1472,12 @@ mod tests {
 
     #[test]
     fn transfer_plasticity_reports_actor_and_head_not_critic() {
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 6;
         let n_actions = 4;
         let n = 32;
-        let teacher_actic =
-            Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
-        let teacher = Policy::<Flex> {
+        let teacher_actic = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        let teacher = Policy {
             actor: teacher_actic.actor.clone(),
             shared_head: teacher_actic.shared_head.clone(),
         };
@@ -1523,13 +1490,13 @@ mod tests {
             loss_scale: 1.0,
             ..Default::default()
         };
-        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             plasticity_log_interval: Some(1),
             ..Default::default()
         }
-        .init(device);
-        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
+        .init(device.clone());
+        let net = Actic::new(obs, n_actions, vec![8], vec![8], &[8], &device, None);
 
         let mut metrics = Report::default();
         let (net, _) = ppo.transfer_learn(net, &teacher, &memory, &tl, &mut metrics);
@@ -1597,17 +1564,16 @@ mod tests {
 
     #[test]
     fn transfer_plasticity_omits_head_when_absent() {
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 6;
         let n_actions = 4;
         let n = 32;
-        let teacher_actic =
-            Actic::<Flex>::new(obs, n_actions, vec![8], vec![8], &[], &device, None);
+        let teacher_actic = Actic::new(obs, n_actions, vec![8], vec![8], &[], &device, None);
         assert!(
             teacher_actic.shared_head.is_none(),
             "teacher fixture must have no shared head"
         );
-        let teacher = Policy::<Flex> {
+        let teacher = Policy {
             actor: teacher_actic.actor.clone(),
             shared_head: None,
         };
@@ -1620,13 +1586,13 @@ mod tests {
             loss_scale: 1.0,
             ..Default::default()
         };
-        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let mut ppo: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             plasticity_log_interval: Some(1),
             ..Default::default()
         }
-        .init(device);
-        let net = Actic::<B>::new(obs, n_actions, vec![8], vec![8], &[], &device, None);
+        .init(device.clone());
+        let net = Actic::new(obs, n_actions, vec![8], vec![8], &[], &device, None);
         assert!(
             net.shared_head.is_none(),
             "student fixture must have no shared head"
@@ -1663,18 +1629,18 @@ mod tests {
     fn ppo_plasticity_still_reports_actor_and_critic() {
         use burn::tensor::TensorData;
 
-        let device = Default::default();
+        let device = Device::flex().autodiff();
         let obs = 6;
-        let net = Actic::<B>::new(obs, 4, vec![8], vec![8], &[8], &device, None);
+        let net = Actic::new(obs, 4, vec![8], vec![8], &[8], &device, None);
         // Varied sample rows so dormancy is measured on non-constant inputs.
         let states: Vec<f32> = (0..8 * obs).map(|i| ((i % 7) as f32) / 7.0 - 0.5).collect();
-        let sample = Tensor::<B, 2>::from_data(TensorData::new(states, [8, obs]), &device);
-        let mut ppo: crate::agent::Ppo<B> = PpoLearnerConfig {
+        let sample = Tensor::<2>::from_data(TensorData::new(states, [8, obs]), &device);
+        let mut ppo: crate::agent::Ppo = PpoLearnerConfig {
             learning_rate: 0.05,
             plasticity_log_interval: Some(1),
             ..Default::default()
         }
-        .init(device);
+        .init(device.clone());
         let mut metrics = Report::default();
         ppo.maybe_log_plasticity(
             0,

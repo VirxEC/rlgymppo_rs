@@ -10,45 +10,45 @@ use burn_store::BurnpackStore;
 use burn_store::ModuleSnapshot;
 
 #[derive(Module, Debug)]
-pub struct Model<B: Backend> {
-    linear1: Linear<B>,
-    linear2: Linear<B>,
-    linear3: Linear<B>,
-    linear4: Linear<B>,
-    layernormalization1: LayerNorm<B>,
-    layernormalization2: LayerNorm<B>,
-    linear5: Linear<B>,
-    linear6: Linear<B>,
-    linear7: Linear<B>,
-    constant76: burn::module::Param<Tensor<B, 1, Int>>,
-    constant77: burn::module::Param<Tensor<B, 1, Int>>,
-    constant81: burn::module::Param<Tensor<B, 1>>,
-    linear8: Linear<B>,
-    constant89: burn::module::Param<Tensor<B, 1>>,
-    layernormalization3: LayerNorm<B>,
-    linear9: Linear<B>,
-    linear10: Linear<B>,
-    layernormalization4: LayerNorm<B>,
-    layernormalization5: LayerNorm<B>,
-    linear11: Linear<B>,
-    linear12: Linear<B>,
-    linear13: Linear<B>,
-    constant111: burn::module::Param<Tensor<B, 1, Int>>,
-    constant112: burn::module::Param<Tensor<B, 1, Int>>,
-    constant116: burn::module::Param<Tensor<B, 1>>,
-    linear14: Linear<B>,
-    constant124: burn::module::Param<Tensor<B, 1>>,
-    layernormalization6: LayerNorm<B>,
-    linear15: Linear<B>,
-    linear16: Linear<B>,
-    linear17: Linear<B>,
-    constant125: burn::module::Param<Tensor<B, 2>>,
-    linear18: Linear<B>,
-    linear19: Linear<B>,
-    linear20: Linear<B>,
-    phantom: core::marker::PhantomData<B>,
+pub struct Model {
+    linear1: Linear,
+    linear2: Linear,
+    linear3: Linear,
+    linear4: Linear,
+    layernormalization1: LayerNorm,
+    layernormalization2: LayerNorm,
+    linear5: Linear,
+    linear6: Linear,
+    linear7: Linear,
+    constant76: burn::module::Param<Tensor<1, Int>>,
+    constant77: burn::module::Param<Tensor<1, Int>>,
+    constant81: burn::module::Param<Tensor<1>>,
+    linear8: Linear,
+    constant89: burn::module::Param<Tensor<1>>,
+    layernormalization3: LayerNorm,
+    linear9: Linear,
+    linear10: Linear,
+    layernormalization4: LayerNorm,
+    layernormalization5: LayerNorm,
+    linear11: Linear,
+    linear12: Linear,
+    linear13: Linear,
+    constant111: burn::module::Param<Tensor<1, Int>>,
+    constant112: burn::module::Param<Tensor<1, Int>>,
+    constant116: burn::module::Param<Tensor<1>>,
+    linear14: Linear,
+    constant124: burn::module::Param<Tensor<1>>,
+    layernormalization6: LayerNorm,
+    linear15: Linear,
+    linear16: Linear,
+    linear17: Linear,
+    constant125: burn::module::Param<Tensor<2>>,
+    linear18: Linear,
+    linear19: Linear,
+    linear20: Linear,
+    phantom: core::marker::PhantomData<()>,
     #[module(skip)]
-    device: B::Device,
+    device: burn::tensor::Device,
 }
 
 #[repr(C, align(256))]
@@ -56,13 +56,13 @@ struct Aligned256([u8; 1786496usize]);
 static ALIGNED_DATA: Aligned256 = Aligned256(*include_bytes!("nexto-model.bpk"));
 static EMBEDDED_STATES: &[u8] = &ALIGNED_DATA.0;
 
-impl<B: Backend> Default for Model<B> {
+impl Default for Model {
     fn default() -> Self {
         Self::from_embedded(&Default::default())
     }
 }
 
-impl<B: Backend> Model<B> {
+impl Model {
     /// Load model weights from embedded burnpack data (zero-copy at store level).
     ///
     /// The embedded data stays in the binary's .rodata section without heap allocation.
@@ -72,7 +72,7 @@ impl<B: Backend> Model<B> {
     /// See <https://github.com/tracel-ai/burn/issues/4153> for true backend zero-copy.
     ///
     /// See <https://github.com/tracel-ai/burn/issues/4123>
-    pub fn from_embedded(device: &B::Device) -> Self {
+    pub fn from_embedded(device: &burn::tensor::Device) -> Self {
         let mut model = Self::new(device);
         let mut store = BurnpackStore::from_static(EMBEDDED_STATES);
         model
@@ -84,7 +84,7 @@ impl<B: Backend> Model<B> {
     /// Load model weights from in-memory bytes.
     ///
     /// The bytes must be the contents of a `.bpk` file.
-    pub fn from_bytes(bytes: Bytes, device: &B::Device) -> Self {
+    pub fn from_bytes(bytes: Bytes, device: &burn::tensor::Device) -> Self {
         let mut model = Self::new(device);
         let mut store = BurnpackStore::from_bytes(Some(bytes));
         model
@@ -94,9 +94,9 @@ impl<B: Backend> Model<B> {
     }
 }
 
-impl<B: Backend> Model<B> {
+impl Model {
     #[allow(unused_variables)]
-    pub fn new(device: &B::Device) -> Self {
+    pub fn new(device: &burn::tensor::Device) -> Self {
         let linear1 = LinearConfig::new(32, 128).with_bias(true).init(device);
         let linear2 = LinearConfig::new(128, 128).with_bias(true).init(device);
         let linear3 = LinearConfig::new(24, 128).with_bias(true).init(device);
@@ -112,28 +112,28 @@ impl<B: Backend> Model<B> {
         let linear5 = LinearConfig::new(128, 128).with_bias(true).init(device);
         let linear6 = LinearConfig::new(128, 128).with_bias(true).init(device);
         let linear7 = LinearConfig::new(128, 128).with_bias(true).init(device);
-        let constant76: burn::module::Param<Tensor<B, 1, Int>> = burn::module::Param::uninitialized(
+        let constant76: burn::module::Param<Tensor<1, Int>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| {
-                Tensor::<B, 1, Int>::zeros([4], (device, burn::tensor::DType::I64))
+                Tensor::<1, Int>::zeros([4], (device, burn::tensor::DType::I64))
             },
             device.clone(),
             false,
             [4].into(),
         );
-        let constant77: burn::module::Param<Tensor<B, 1, Int>> = burn::module::Param::uninitialized(
+        let constant77: burn::module::Param<Tensor<1, Int>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| {
-                Tensor::<B, 1, Int>::zeros([4], (device, burn::tensor::DType::I64))
+                Tensor::<1, Int>::zeros([4], (device, burn::tensor::DType::I64))
             },
             device.clone(),
             false,
             [4].into(),
         );
-        let constant81: burn::module::Param<Tensor<B, 1>> = burn::module::Param::uninitialized(
+        let constant81: burn::module::Param<Tensor<1>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| {
-                Tensor::<B, 1>::from_data(
+                Tensor::<1>::from_data(
                     burn::tensor::TensorData::from([5.656854152679443f64]),
                     (device, burn::tensor::DType::F32),
                 )
@@ -143,10 +143,10 @@ impl<B: Backend> Model<B> {
             [1].into(),
         );
         let linear8 = LinearConfig::new(128, 128).with_bias(true).init(device);
-        let constant89: burn::module::Param<Tensor<B, 1>> = burn::module::Param::uninitialized(
+        let constant89: burn::module::Param<Tensor<1>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| {
-                Tensor::<B, 1>::from_data(
+                Tensor::<1>::from_data(
                     burn::tensor::TensorData::from([4f64]),
                     (device, burn::tensor::DType::F32),
                 )
@@ -172,30 +172,30 @@ impl<B: Backend> Model<B> {
         let linear11 = LinearConfig::new(128, 128).with_bias(true).init(device);
         let linear12 = LinearConfig::new(128, 128).with_bias(true).init(device);
         let linear13 = LinearConfig::new(128, 128).with_bias(true).init(device);
-        let constant111: burn::module::Param<Tensor<B, 1, Int>> =
+        let constant111: burn::module::Param<Tensor<1, Int>> =
             burn::module::Param::uninitialized(
                 burn::module::ParamId::new(),
                 move |device, _require_grad| {
-                    Tensor::<B, 1, Int>::zeros([4], (device, burn::tensor::DType::I64))
+                    Tensor::<1, Int>::zeros([4], (device, burn::tensor::DType::I64))
                 },
                 device.clone(),
                 false,
                 [4].into(),
             );
-        let constant112: burn::module::Param<Tensor<B, 1, Int>> =
+        let constant112: burn::module::Param<Tensor<1, Int>> =
             burn::module::Param::uninitialized(
                 burn::module::ParamId::new(),
                 move |device, _require_grad| {
-                    Tensor::<B, 1, Int>::zeros([4], (device, burn::tensor::DType::I64))
+                    Tensor::<1, Int>::zeros([4], (device, burn::tensor::DType::I64))
                 },
                 device.clone(),
                 false,
                 [4].into(),
             );
-        let constant116: burn::module::Param<Tensor<B, 1>> = burn::module::Param::uninitialized(
+        let constant116: burn::module::Param<Tensor<1>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| {
-                Tensor::<B, 1>::from_data(
+                Tensor::<1>::from_data(
                     burn::tensor::TensorData::from([5.656854152679443f64]),
                     (device, burn::tensor::DType::F32),
                 )
@@ -205,10 +205,10 @@ impl<B: Backend> Model<B> {
             [1].into(),
         );
         let linear14 = LinearConfig::new(128, 128).with_bias(true).init(device);
-        let constant124: burn::module::Param<Tensor<B, 1>> = burn::module::Param::uninitialized(
+        let constant124: burn::module::Param<Tensor<1>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| {
-                Tensor::<B, 1>::from_data(
+                Tensor::<1>::from_data(
                     burn::tensor::TensorData::from([4f64]),
                     (device, burn::tensor::DType::F32),
                 )
@@ -224,10 +224,10 @@ impl<B: Backend> Model<B> {
         let linear15 = LinearConfig::new(128, 512).with_bias(true).init(device);
         let linear16 = LinearConfig::new(512, 128).with_bias(true).init(device);
         let linear17 = LinearConfig::new(128, 32).with_bias(true).init(device);
-        let constant125: burn::module::Param<Tensor<B, 2>> = burn::module::Param::uninitialized(
+        let constant125: burn::module::Param<Tensor<2>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| {
-                Tensor::<B, 2>::zeros([90, 8], (device, burn::tensor::DType::F32))
+                Tensor::<2>::zeros([90, 8], (device, burn::tensor::DType::F32))
             },
             device.clone(),
             false,
@@ -289,10 +289,10 @@ impl<B: Backend> Model<B> {
     #[allow(clippy::let_and_return, clippy::approx_constant)]
     pub fn forward(
         &self,
-        q: Tensor<B, 3>,
-        kv: Tensor<B, 3>,
-        mask: Tensor<B, 2>,
-    ) -> (Tensor<B, 2>, Tensor<B, 3>, Tensor<B, 3>) {
+        q: Tensor<3>,
+        kv: Tensor<3>,
+        mask: Tensor<2>,
+    ) -> (Tensor<2>, Tensor<3>, Tensor<3>) {
         let linear1_out1 = self.linear1.forward(q);
         let relu1_out1 = burn::tensor::activation::relu(linear1_out1);
         let linear2_out1 = self.linear2.forward(relu1_out1);
@@ -407,7 +407,7 @@ impl<B: Backend> Model<B> {
         };
         let constant76_out1 = self.constant76.val();
         let equal1_out1 = {
-            let shape_tensor = Tensor::<B, 1, Int>::from_data(
+            let shape_tensor = Tensor::<1, Int>::from_data(
                 burn::tensor::TensorData::from(mul2_out1.as_slice()),
                 (&self.device, burn::tensor::DType::I64),
             );
@@ -416,7 +416,7 @@ impl<B: Backend> Model<B> {
         let constant77_out1 = self.constant77.val();
         let where1_out1 = constant77_out1.mask_where(
             equal1_out1,
-            Tensor::<B, 1, burn::tensor::Int>::from_data(
+            Tensor::<1, burn::tensor::Int>::from_data(
                 burn::tensor::TensorData::from(&constantofshape1_out1 as &[i64]),
                 (&self.device, burn::tensor::DType::I64),
             ),
@@ -605,7 +605,7 @@ impl<B: Backend> Model<B> {
         };
         let constant111_out1 = self.constant111.val();
         let equal2_out1 = {
-            let shape_tensor = Tensor::<B, 1, Int>::from_data(
+            let shape_tensor = Tensor::<1, Int>::from_data(
                 burn::tensor::TensorData::from(mul4_out1.as_slice()),
                 (&self.device, burn::tensor::DType::I64),
             );
@@ -614,7 +614,7 @@ impl<B: Backend> Model<B> {
         let constant112_out1 = self.constant112.val();
         let where2_out1 = constant112_out1.mask_where(
             equal2_out1,
-            Tensor::<B, 1, burn::tensor::Int>::from_data(
+            Tensor::<1, burn::tensor::Int>::from_data(
                 burn::tensor::TensorData::from(&constantofshape2_out1 as &[i64]),
                 (&self.device, burn::tensor::DType::I64),
             ),
@@ -711,14 +711,14 @@ impl<B: Backend> Model<B> {
             let einsum_rhs = linear17_out1.permute([2usize, 0usize, 1usize]);
             let einsum_lhs_shape = einsum_lhs.dims();
             let einsum_rhs_shape = einsum_rhs.dims();
-            let einsum_lhs_3d: Tensor<B, 3> =
+            let einsum_lhs_3d: Tensor<3> =
                 einsum_lhs.reshape([1usize, einsum_lhs_shape[0usize], einsum_lhs_shape[1usize]]);
-            let einsum_rhs_3d: Tensor<B, 3> = einsum_rhs.reshape([
+            let einsum_rhs_3d: Tensor<3> = einsum_rhs.reshape([
                 1usize,
                 einsum_lhs_shape[1usize],
                 einsum_rhs_shape[1usize] * einsum_rhs_shape[2usize],
             ]);
-            let einsum_result: Tensor<B, 3> = einsum_lhs_3d.matmul(einsum_rhs_3d).reshape([
+            let einsum_result: Tensor<3> = einsum_lhs_3d.matmul(einsum_rhs_3d).reshape([
                 einsum_lhs_shape[0usize],
                 einsum_rhs_shape[1usize],
                 einsum_rhs_shape[2usize],

@@ -542,9 +542,11 @@ pub struct LearnerConfig<B: AutodiffBackend> {
     /// exiting after that.
     /// `None` means run indefinitely.
     pub num_additional_iterations: Option<u64>,
-    /// If true, one extra instance will be launched to visualize training.
-    /// RocketSim's built-in renderer is used for visualization.
+    /// If true, one extra environment will visualize training in rocketsim_viewer.
     pub render: bool,
+    /// Numeric `IP:port` of a manually started viewer.
+    /// If `None`, start or reuse the viewer at the default local address.
+    pub render_viewer_addr: Option<String>,
 
     /// Configuration for saving old policy versions and occasionally
     /// training against them (self-play).
@@ -591,6 +593,7 @@ impl<B: AutodiffBackend> Default for LearnerConfig<B> {
             num_games_per_pool: 64,
             num_additional_iterations: None,
             render: false,
+            render_viewer_addr: None,
             self_play: SelfPlayConfig::default(),
             skill_tracker: SkillTrackerConfig::default(),
             wandb_project_name: None,
@@ -803,7 +806,13 @@ impl<B: AutodiffBackend> LearnerConfig<B> {
             let renderer_controls = renderer_controls.clone();
 
             thread::spawn(move || {
-                Renderer::new((create_env)(None), renderer_controls, self.render_device).run();
+                Renderer::new(
+                    (create_env)(None),
+                    renderer_controls,
+                    self.render_device,
+                    self.render_viewer_addr,
+                )
+                .run();
             })
         };
 

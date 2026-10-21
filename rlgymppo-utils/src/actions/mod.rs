@@ -153,7 +153,7 @@ impl<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8, const ACTION_DELAY: u8>
         let mut result = vec![false; num_actions];
 
         // Ground or air mask
-        if car_state.is_on_ground {
+        if car_state.is_on_ground() {
             for (r, &m) in result.iter_mut().zip(self.ground_mask.iter()) {
                 *r |= m;
             }
@@ -171,7 +171,7 @@ impl<const MAX_NUM_AGENTS: usize, const TICK_SKIP: u8, const ACTION_DELAY: u8>
         }
 
         // Enable jump actions when the car can still jump/flip or is turtled
-        let is_turtled = car_state.world_contact_normal.is_some_and(|n| n.z > 0.9);
+        let is_turtled = car_state.world_contact_normal().is_some_and(|n| n.z > 0.9);
         if car_state.has_flip_or_jump() || is_turtled {
             for (r, &m) in result.iter_mut().zip(self.jump_mask.iter()) {
                 *r |= m;

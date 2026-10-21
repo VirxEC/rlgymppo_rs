@@ -10,7 +10,7 @@ path = "examples/rlbot/main.rs"
 [dependencies]
 burn = { version = "0.21.0", default-features = false, features = ["flex", "std"] }
 rand = { workspace = true }
-rlbot-rocketsim = "0.1.0"
+rlbot-rocketsim = "0.2.0"
 rlgymppo-model = { path = "../rlgymppo-model" }
 rlgymppo-utils = { path = "../rlgymppo-utils" }
 rustc-hash = { workspace = true }

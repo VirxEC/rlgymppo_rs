@@ -56,7 +56,7 @@ impl<const MAX_TEAM_PLAYERS: usize> DefaultObs<MAX_TEAM_PLAYERS> {
             obs.extend((phys.ang_vel * Self::ANG_VEL_COEF).to_array());
             // Scalar state (7) – last field is the demo respawn timer
             obs.push(car.boost * Self::BOOST_COEF);
-            obs.push(f32::from(car.is_on_ground));
+            obs.push(f32::from(car.is_on_ground()));
             obs.push(f32::from(car.has_flip_or_jump()));
             obs.push(f32::from(car.is_auto_flipping));
             obs.push(car.air_time_since_jump);

@@ -2,7 +2,7 @@
 
 A Rust implementation of Proximal Policy Optimization (PPO) for Rocket League
 training, built on [RocketSim v3](https://github.com/ZealanL/RocketSim/tree/v3-rust) +
-[RLViser](https://github.com/VirxEC/rlviser) via
+[rocketsim_viewer](https://crates.io/crates/rocketsim_viewer) via
 [RLGym-rs](https://github.com/VirxEC/rlgym_rs).
 
 ### Project structure
@@ -112,6 +112,44 @@ The `rlgymppo-nexto` crate contains the Rust observation and action functions
 and a pre-generated Burn model. The generated model source and BurnPack
 weights are committed in `rlgymppo-nexto/nexto/`. Normal builds do not run
 model conversion or code generation and do not need the original model files.
+
+### Viewer setup
+
+Visualization uses `rocketsim_vis` through RLGym's default-enabled `vis`
+feature. The viewer runs as a separate process. Install the matching viewer
+release and make `rocketsim-viewer` available on `PATH`:
+
+```sh
+cargo install --locked rocketsim_viewer --version 0.3.1
+```
+
+For local training, the renderer starts or reuses the viewer. You can set
+`ROCKETSIM_VIEWER` to its executable path.
+
+For Docker training, install and start the viewer on the host instead:
+
+```sh
+rocketsim-viewer --bind 0.0.0.0 39201
+```
+
+Set `LearnerConfig::render_viewer_addr` to the host's numeric `IP:port` as
+seen from the container. For the supplied devcontainer, which uses host
+networking, use:
+
+```rust
+render: true,
+render_viewer_addr: Some("127.0.0.1:39201".into()),
+```
+
+This setting connects through TCP with `Env::set_net_vis`. It does not start
+a viewer inside the container. With bridge networking, use a reachable host
+IP and allow TCP port `39201` through the firewall. Expose or forward the port
+if the viewer runs in a separate container. Bind to a specific interface when
+possible. Do not expose the viewer port to untrusted networks.
+
+The renderer applies viewer car controls and reset, dribble, and ball launch
+requests. It runs at real-time speed. The old RLViser pause and speed controls
+are not available in the new RLGym API.
 
 ### Training controls
 

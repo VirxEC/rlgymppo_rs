@@ -5,7 +5,7 @@ Guidance for AI agents working in this repository.
 ## Project overview
 
 `rlgymppo-rs` is a Rust implementation of [GigaLearn](https://github.com/VirxEC/GigaLearn),
-a PPO trainer for Rocket League. It is built on RocketSim v3 + RLViser via
+a PPO trainer for Rocket League. It is built on RocketSim v3 + rocketsim_viewer via
 RLGym-rs, with neural networks and training written in [Burn](https://burn.dev) 0.21
 instead of PyTorch.
 
@@ -37,7 +37,7 @@ Key modules inside `rlgymppo`:
 
 - `src/agent/` — PPO (`config.rs`, `gae.rs`, `model.rs`), self-play (`self_play.rs`), skill tracking (`skill_tracker.rs`), transfer learning (`transfer_learn.rs`)
 - `src/base/` — rollout memory (`memory.rs`)
-- `src/environment/` — game simulation: `sim.rs` (single game), `thread_sim.rs` (worker threads), `batch_sim.rs` (batch stepping), `render.rs` (RLViser renderer)
+- `src/environment/` — game simulation: `sim.rs` (single game), `thread_sim.rs` (worker threads), `batch_sim.rs` (batch stepping), `render.rs` (rocketsim_vis renderer)
 - `src/utils/` — observations, rewards, terminal conditions, state setters, `running_stat.rs` (running stats), `avg_tracker.rs`, `report.rs` (metric reporting)
 
 - Entry points: `LearnerConfig` + `Learner` in `rlgymppo/src/lib.rs`.

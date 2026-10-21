@@ -282,7 +282,7 @@ impl NextoObsBuilder {
             set_vec3(row, ANG_VEL, car.phys.ang_vel);
             row[BOOST] = car.boost / consts::car::boost::MAX;
             row[DEMO] = f32::from(car.is_demoed);
-            row[ON_GROUND] = f32::from(car.is_on_ground);
+            row[ON_GROUND] = f32::from(car.is_on_ground());
             row[HAS_FLIP] = f32::from(car.has_flip_or_jump());
         }
 
@@ -425,16 +425,14 @@ mod tests {
             team,
             ..CarInfo::default()
         };
-        let state = CarState {
-            phys: PhysState {
-                pos,
-                rot_mat: Mat3A::from_rotation_z(yaw),
-                vel: Vec3A::ZERO,
-                ang_vel: Vec3A::ZERO,
-            },
-            boost,
-            ..CarState::DEFAULT
+        let mut state = CarState::DEFAULT;
+        state.phys = PhysState {
+            pos,
+            rot_mat: Mat3A::from_rotation_z(yaw),
+            vel: Vec3A::ZERO,
+            ang_vel: Vec3A::ZERO,
         };
+        state.boost = boost;
         (info, state)
     }
 

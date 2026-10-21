@@ -120,7 +120,7 @@ impl<
             car_state.phys.rot_mat = euler_to_mat3(yaw, pitch, roll);
             car_state.boost = rng.random_range(0.0..100.0);
 
-            arena.set_car_state(car_idx, car_state);
+            arena.set_car_state(car_idx, car_state.core());
         }
     }
 }

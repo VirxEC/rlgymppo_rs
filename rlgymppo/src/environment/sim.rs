@@ -48,6 +48,79 @@ impl RewardSamplingConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VisActionResult {
+    Reset,
+    StateChanged,
+    Unchanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisActionRequests {
+    reset: bool,
+    dribble: bool,
+    launch: bool,
+}
+
+impl VisActionRequests {
+    fn from_bits(bits: u8) -> Self {
+        Self {
+            reset: bits & 1 != 0,
+            dribble: bits & 2 != 0,
+            launch: bits & 4 != 0,
+        }
+    }
+}
+
+fn apply_vis_controls(
+    arena: &mut rlgym::rocketsim::Arena,
+    controls: Option<(usize, CarControls)>,
+) -> bool {
+    let Some((car_index, controls)) = controls.filter(|(index, _)| *index < arena.num_cars())
+    else {
+        return false;
+    };
+    arena.set_car_controls(car_index, controls);
+    true
+}
+
+fn apply_vis_requests(
+    arena: &mut rlgym::rocketsim::Arena,
+    action_bits: u8,
+    selected_car: Option<(usize, CarControls)>,
+) -> VisActionResult {
+    let requests = VisActionRequests::from_bits(action_bits);
+    if requests.reset {
+        return VisActionResult::Reset;
+    }
+
+    let mut changed = false;
+    if requests.dribble
+        && let Some((car_idx, _)) = selected_car.filter(|(index, _)| *index < arena.num_cars())
+    {
+        let car = arena.get_car_state(car_idx);
+        let pos = car.phys.pos + rlgym::rocketsim::Vec3A::Z * 150.0;
+        let vel = car.phys.vel;
+        arena.edit_ball_state(|ball| {
+            ball.phys.pos = pos;
+            ball.phys.vel = vel;
+        });
+        changed = true;
+    }
+    if requests.launch {
+        arena.edit_ball_state(|ball| {
+            ball.phys.vel += rlgym::rocketsim::Vec3A::Z * 1000.0;
+        });
+        changed = true;
+    }
+
+    if changed {
+        VisActionResult::StateChanged
+    } else {
+        VisActionResult::Unchanged
+    }
+}
+
 pub struct GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>
 where
     SS: StateSetter<SI>,
@@ -101,20 +174,22 @@ where
         }
     }
 
-    pub fn set_rlviser_enabled(&mut self, enabled: bool) {
-        self.env.set_rlviser_enabled(enabled)
+    pub fn set_vis_enabled(&mut self, enabled: bool) -> std::io::Result<()> {
+        self.env.set_vis_enabled(enabled)
     }
 
-    pub fn handle_rlviser_messages(&mut self) -> std::io::Result<()> {
-        self.env.handle_rlviser_messages()
+    pub fn set_net_vis(&mut self, addr: Option<&str>) -> std::io::Result<()> {
+        self.env.set_net_vis(addr)
     }
 
-    pub fn rlviser_paused(&self) -> bool {
-        self.env.rlviser_paused()
-    }
-
-    pub fn rlviser_speed(&self) -> f32 {
-        self.env.rlviser_speed()
+    /// Apply viewer requests and report the required renderer update.
+    pub(super) fn apply_vis_actions(&mut self) -> VisActionResult {
+        let controls = self
+            .env
+            .latest_vis_controls()
+            .map(|message| (message.car_index as usize, message.controls));
+        let action_bits = self.env.take_vis_actions();
+        apply_vis_requests(&mut self.env.arena, action_bits, controls)
     }
 
     pub fn num_players(&self) -> usize {
@@ -150,6 +225,19 @@ where
 
     pub fn step(&mut self, actions: &[ACT::Input]) -> StepResult {
         self.env.pre_step(&self.last_state, actions);
+        self.env.step_physics(ACT::get_tick_skip());
+        self.finish_step()
+    }
+
+    /// Step the renderer game and let fresh viewer controls override policy
+    /// controls for the selected car. Training steps must use [`Self::step`].
+    pub fn step_vis(&mut self, actions: &[ACT::Input]) -> StepResult {
+        self.env.pre_step(&self.last_state, actions);
+        let controls = self
+            .env
+            .latest_vis_controls()
+            .map(|message| (message.car_index as usize, message.controls));
+        apply_vis_controls(&mut self.env.arena, controls);
         self.env.step_physics(ACT::get_tick_skip());
         self.finish_step()
     }
@@ -257,6 +345,21 @@ where
     /// Access the game state after the most recent `reset` or `step` call.
     pub fn last_game_state(&self) -> &GameState {
         &self.last_state
+    }
+
+    /// Refresh cached state and observations after a viewer-only physics edit.
+    pub fn refresh_after_vis_action(&mut self) -> (FullObs, Vec<Vec<bool>>) {
+        self.last_state = self.env.current_state();
+        self.env.shared_info.update(&self.last_state);
+        let obs = self
+            .env
+            .observations
+            .build_obs(&self.last_state, &mut self.env.shared_info);
+        let masks = self
+            .env
+            .action
+            .get_action_masks(&self.last_state, &mut self.env.shared_info);
+        (obs, masks)
     }
 
     pub fn get_metrics(&self) -> &Report {

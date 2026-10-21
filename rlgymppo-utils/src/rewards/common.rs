@@ -134,7 +134,7 @@ pub struct AirReward;
 
 impl AirReward {
     fn get_reward(car: &CarState) -> f32 {
-        f32::from(!car.is_on_ground)
+        f32::from(!car.is_on_ground())
     }
 }
 
@@ -429,7 +429,7 @@ impl WavedashReward {
         self.prev_flipping[car_idx] = car.is_flipping;
 
         // Wavedash detected: car was flipping in the air, now on ground
-        if car.is_on_ground && prev_flipping && !car.is_flipping {
+        if car.is_on_ground() && prev_flipping && !car.is_flipping {
             1.0
         } else {
             0.0

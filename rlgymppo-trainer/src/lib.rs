@@ -42,7 +42,7 @@ impl SharedInfoProvider for SharedInfo {
             let dist_to_ball = state.pos.distance(game_state.ball.pos);
             self.metrics["Player/Distance to ball"] += AvgTracker::from(dist_to_ball);
 
-            self.metrics["Player/In Air Ratio"] += AvgTracker::from(!state.is_on_ground);
+            self.metrics["Player/In Air Ratio"] += AvgTracker::from(!state.is_on_ground());
             self.metrics["Player/Demoed Ratio"] += AvgTracker::from(state.is_demoed);
 
             self.metrics["Player/Speed"] += AvgTracker::from(state.vel.length());

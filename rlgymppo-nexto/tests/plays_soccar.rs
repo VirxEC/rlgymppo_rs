@@ -101,19 +101,15 @@ fn blue_scored(state: &GameState) -> bool {
 }
 
 fn place_car(arena: &mut Arena, car: usize, pos: Vec3A, yaw: f32, boost: f32) {
-    arena.set_car_state(
-        car,
-        CarState {
-            phys: PhysState {
-                pos,
-                rot_mat: Mat3A::from_rotation_z(yaw),
-                vel: Vec3A::ZERO,
-                ang_vel: Vec3A::ZERO,
-            },
-            boost,
-            ..CarState::DEFAULT
-        },
-    );
+    let mut state = CarState::DEFAULT;
+    state.phys = PhysState {
+        pos,
+        rot_mat: Mat3A::from_rotation_z(yaw),
+        vel: Vec3A::ZERO,
+        ang_vel: Vec3A::ZERO,
+    };
+    state.boost = boost;
+    arena.set_car_state(car, state.core());
 }
 
 fn place_ball(arena: &mut Arena, pos: Vec3A) {

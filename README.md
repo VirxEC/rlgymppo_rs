@@ -5,6 +5,10 @@ training, built on [RocketSim v3](https://github.com/ZealanL/RocketSim/tree/v3-r
 [rocketsim_viewer](https://crates.io/crates/rocketsim_viewer) via
 [RLGym-rs](https://github.com/VirxEC/rlgym_rs).
 
+For an existing bot, see the [downstream migration guide](MIGRATING_DOWNSTREAM.md).
+It covers RocketSim 0.3, the replacement for RLViser, Docker viewer networking,
+and Burn 0.22.
+
 ### Project structure
 
 The workspace is split into nine crates:

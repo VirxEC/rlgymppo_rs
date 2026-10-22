@@ -229,17 +229,34 @@ where
         self.finish_step()
     }
 
-    /// Step the renderer game and let fresh viewer controls override policy
-    /// controls for the selected car. Training steps must use [`Self::step`].
-    pub fn step_vis(&mut self, actions: &[ACT::Input]) -> StepResult {
+    /// Apply policy controls before the renderer advances a policy interval.
+    pub fn begin_vis_step(&mut self, actions: &[ACT::Input]) {
         self.env.pre_step(&self.last_state, actions);
+    }
+
+    /// Advance one physics tick and apply fresh viewer controls.
+    pub fn step_vis_tick(&mut self) {
         let controls = self
             .env
             .latest_vis_controls()
             .map(|message| (message.car_index as usize, message.controls));
         apply_vis_controls(&mut self.env.arena, controls);
-        self.env.step_physics(ACT::get_tick_skip());
+        self.env.step_physics(1);
+    }
+
+    /// Finish the policy interval after its physics ticks.
+    pub fn finish_vis_step(&mut self) -> StepResult {
         self.finish_step()
+    }
+
+    /// Step the renderer game for one policy interval. Training steps must use
+    /// [`Self::step`].
+    pub fn step_vis(&mut self, actions: &[ACT::Input]) -> StepResult {
+        self.begin_vis_step(actions);
+        for _ in 0..ACT::get_tick_skip() {
+            self.step_vis_tick();
+        }
+        self.finish_vis_step()
     }
 
     /// Apply generic `ACT` actions to every car, then overwrite the selected

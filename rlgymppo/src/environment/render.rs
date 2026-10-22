@@ -113,7 +113,10 @@ where
             return;
         }
 
-        let tick_rate = Duration::from_secs_f32(ACT::get_tick_skip() as f32 * consts::TICK_TIME);
+        let tick_rate = Duration::from_secs_f32(consts::TICK_TIME);
+        let tick_skip = ACT::get_tick_skip();
+        let mut ticks_until_action = 0;
+        let mut actions = Vec::new();
         let mut next_time = Instant::now();
 
         loop {
@@ -144,6 +147,7 @@ where
                     let (obs, _old_obs, masks) = self.game.reset();
                     self.last_obs = obs;
                     self.last_masks = masks;
+                    ticks_until_action = 0;
                     next_time = Instant::now();
                     continue;
                 }
@@ -151,21 +155,25 @@ where
                     let (obs, masks) = self.game.refresh_after_vis_action();
                     self.last_obs = obs;
                     self.last_masks = masks;
+                    ticks_until_action = 0;
                     next_time = Instant::now();
                     continue;
                 }
                 VisActionResult::Unchanged => {}
             }
 
-            let actions = if deterministic {
-                model.react_deterministic(&self.last_obs, &self.last_masks, &self.device)
-            } else {
-                model
-                    .react(&self.last_obs, &self.last_masks, &self.device)
-                    .0
-            };
+            if ticks_until_action == 0 {
+                actions = if deterministic {
+                    model.react_deterministic(&self.last_obs, &self.last_masks, &self.device)
+                } else {
+                    model
+                        .react(&self.last_obs, &self.last_masks, &self.device)
+                        .0
+                };
+                self.game.begin_vis_step(&actions);
+                ticks_until_action = tick_skip;
+            }
 
-            let interval = tick_rate;
             let now = Instant::now();
             if next_time > now {
                 sleep(next_time - now);
@@ -174,17 +182,21 @@ where
                 // permanently trying to catch up.
                 next_time = now;
             }
-            next_time += interval;
+            next_time += tick_rate;
 
-            let result = self.game.step_vis(&actions);
+            self.game.step_vis_tick();
+            ticks_until_action -= 1;
+            if ticks_until_action == 0 {
+                let result = self.game.finish_vis_step();
 
-            if result.is_terminal || result.truncated {
-                let (obs, _old_obs, masks) = self.game.reset();
-                self.last_obs = obs;
-                self.last_masks = masks;
-            } else {
-                self.last_obs = result.obs;
-                self.last_masks = result.action_masks;
+                if result.is_terminal || result.truncated {
+                    let (obs, _old_obs, masks) = self.game.reset();
+                    self.last_obs = obs;
+                    self.last_masks = masks;
+                } else {
+                    self.last_obs = result.obs;
+                    self.last_masks = result.action_masks;
+                }
             }
         }
     }

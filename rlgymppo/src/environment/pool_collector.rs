@@ -40,7 +40,7 @@ where
     TERM: Terminal<SI> + Send,
     TRUNC: Truncate<SI> + Send,
 {
-    /// Build one collector. The seed multiplier is `pool_index + 1`.
+    /// Build one collector with pool-local game IDs.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<F, FO>(
         create_env_fn: F,
@@ -62,7 +62,6 @@ where
         let batch_sim = BatchSim::new(
             create_env_fn,
             make_old_obs,
-            pool_index + 1,
             num_games_per_pool,
             device,
             reward_sampling,

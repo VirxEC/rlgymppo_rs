@@ -565,13 +565,11 @@ where
     TERM: Terminal<SI>,
     TRUNC: Truncate<SI>,
 {
-    /// Build `num_games` seeded game instances. Game `i` gets the seed
-    /// `thread_num * (i + 1)`.
+    /// Build `num_games` game instances with pool-local IDs `0..num_games`.
     #[allow(clippy::too_many_arguments)]
     pub fn new<F, FO>(
         create_env_fn: F,
         make_old_obs: Option<FO>,
-        thread_num: usize,
         num_games: usize,
         device: burn::tensor::Device,
         reward_sampling: RewardSamplingConfig,
@@ -599,7 +597,7 @@ where
 
         let mut player_offset = 0;
         for i in 0..num_games {
-            let env = create_env_fn(Some(thread_num * (i + 1)));
+            let env = create_env_fn(Some(i));
             let old_obs = make_old_obs.as_ref().map(|make| make());
             let mut game = GameInstance::new(env, old_obs, reward_sampling.clone());
             let (obs, old_obs, masks) = game.reset();
@@ -1821,7 +1819,6 @@ mod phase3_tests {
             BatchSimType::new(
                 make_env,
                 None::<fn() -> Box<dyn Obs<TestSharedInfo> + Send>>,
-                1,
                 3,
                 Device::flex(),
                 RewardSamplingConfig::default(),

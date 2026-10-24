@@ -57,8 +57,7 @@ where
     TERM: Terminal<SI> + Send,
     TRUNC: Truncate<SI> + Send,
 {
-    /// Build `num_pools` collectors. Pool `p` seeds its games with the
-    /// multiplier `p + 1`.
+    /// Build `num_pools` collectors. Each pool uses game IDs `0..num_games_per_pool`.
     #[allow(clippy::too_many_arguments)]
     pub fn new<F, FO>(
         create_env_fn: F,

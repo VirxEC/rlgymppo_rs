@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod bench;
 pub mod config;
 mod gae;
 pub mod model;
@@ -13,17 +15,16 @@ use burn::nn::loss::{MseLoss, Reduction};
 use burn::nn::modules::norm::Normalization;
 use burn::optim::{GradientsAccumulator, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
-use burn::tensor::{DType, FloatDType, Transaction};
+use burn::tensor::{DType, FloatDType, TensorData, Transaction};
 use rand::Rng;
 use rand::seq::SliceRandom;
-use rayon::prelude::*;
 use rlgymppo_utils::Report;
 
 use crate::OptimizerNetwork;
 use crate::agent::config::{PpoLearnerConfig, RegenConfig};
-use crate::agent::gae::{GAEOutput, get_gae};
+use crate::agent::gae::{DeviceGaeOutput, gae_cpu_flags, get_gae_device};
 use crate::agent::model::{Actic, Net, PPOOutput};
-use crate::base::{Memory, TerminalState, get_batch_1d, get_states_batch_range};
+use crate::base::{Memory, TerminalState, get_states_batch_range};
 use crate::utils::running_stat::Stats;
 
 pub struct Ppo {
@@ -385,8 +386,6 @@ impl Ppo {
                 self.config.timesteps_per_iteration
             };
 
-        let memory_indices = (0..rollout_size).collect::<Vec<_>>();
-
         // Fail loudly with row counts when collection returns a short
         // rollout. Without this, the first batching helper below panics with
         // a bare index-out-of-bounds that names no buffer.
@@ -413,11 +412,13 @@ impl Ppo {
             }
         }
 
-        // Snapshot parameters before training for update-magnitude computation.
-        // This downloads all weights to the CPU, so it is timed separately.
+        // Snapshot parameters before training for update-magnitude
+        // computation. The flat snapshots stay on the device; the delta
+        // norms are reduced there and read back with the end-of-iteration
+        // metrics, so no weights cross the bus per iteration.
         let snapshot_start = Instant::now();
-        let actor_params_before = flatten_net(&net.actor);
-        let critic_params_before = flatten_net(&net.critic);
+        let actor_params_before = flatten_net_device(&net.actor);
+        let critic_params_before = flatten_net_device(&net.critic);
         metrics["PPO/param snapshot time"] = snapshot_start.elapsed().as_secs_f64().into();
 
         // Upload ordered states once as `f16` and keep them resident on the
@@ -440,15 +441,15 @@ impl Ppo {
         // resident states: no upload per chunk, and no second shared-head
         // pass anywhere else. Chunking bounds forward activation memory.
         let value_inference_start = Instant::now();
-        let old_values = {
+        let old_values: Tensor<2> = {
             let nodiff_net = net.valid();
             let mb = self.config.gpu_timestep_buffer_size;
             let n = rollout_size;
-            // Queue every chunk forward, then a single transaction
-            // readback: one CPU/GPU sync for the whole rollout instead of
-            // one per chunk, with no concat kernel. Chunk activations stay
-            // bounded (handles drop each iteration) while forwards pipeline.
-            let mut transaction = Transaction::default();
+            // Queue every chunk forward, then concatenate the chunk outputs
+            // on the device: no CPU readback, no sync. Chunk activations
+            // stay bounded (handles drop each iteration) while forwards
+            // pipeline; the GAE scan below consumes the tensor directly.
+            let mut chunks = Vec::new();
             for start in (0..n).step_by(mb) {
                 let end = (start + mb).min(n);
                 let states = resident_states
@@ -456,15 +457,13 @@ impl Ppo {
                     .narrow(0, start, end - start)
                     .cast(DType::F32);
                 let features = nodiff_net.apply_shared_head(states);
-                transaction = transaction.register(nodiff_net.critic.forward(features));
+                chunks.push(nodiff_net.critic.forward(features));
             }
-
-            let mut values = Vec::with_capacity(n);
-            for data in transaction.execute() {
-                values.extend_from_slice(data.as_slice().unwrap());
+            if chunks.is_empty() {
+                Tensor::<2>::zeros([0, 1], &self.device)
+            } else {
+                Tensor::cat(chunks, 0)
             }
-
-            values
         };
         metrics["PPO/value inference time"] = value_inference_start.elapsed().as_secs_f64().into();
 
@@ -474,12 +473,12 @@ impl Ppo {
             1.0
         };
 
-        let terminals = get_batch_1d(memory.terminals(), &memory_indices);
+        let terminals = &memory.terminals()[..rollout_size];
 
         // Run the critic on truncation next-state observations for the
         // bootstrap in configurable batches on a non-autodiff model clone.
         let trunc_start = Instant::now();
-        let trunc_val_preds = {
+        let trunc_val_preds: Tensor<2> = {
             // Only truncated rows inside the training window receive a
             // bootstrap prediction. Complete-trajectories mode can push a
             // final trajectory past `timesteps_per_iteration`; its truncated
@@ -491,88 +490,111 @@ impl Ppo {
                 .filter(|&&terminal| terminal == TerminalState::Truncated)
                 .count();
             if window_truncations == 0 {
-                Vec::new()
+                Tensor::<2>::zeros([0, 1], &self.device)
             } else {
                 let nodiff_net = net.valid();
                 let mb = self.config.truncation_value_batch_size;
                 let width = memory.state_width();
                 let states = &memory.trunc_next_states()[..window_truncations * width];
 
-                // Same single-sync shape as value inference above.
-                let mut transaction = Transaction::default();
+                // Chunk forwards concatenate on the device: no readback, no
+                // sync. The GAE scan below gathers from this tensor.
+                let mut chunks = Vec::new();
                 for start in (0..window_truncations).step_by(mb) {
                     let end = (start + mb).min(window_truncations);
                     let batch = get_states_batch_range(states, width, start, end, &self.device)
                         .cast(DType::F32);
 
                     let features = nodiff_net.apply_shared_head(batch);
-                    transaction = transaction.register(nodiff_net.critic.forward(features));
+                    chunks.push(nodiff_net.critic.forward(features));
                 }
-
-                let mut values = Vec::with_capacity(window_truncations);
-                for data in transaction.execute() {
-                    values.extend_from_slice(data.as_slice().unwrap());
-                }
-
-                values
+                Tensor::cat(chunks, 0)
             }
         };
 
         metrics["PPO/trunc bootstrap time"] = trunc_start.elapsed().as_secs_f64().into();
 
         let gae_start = Instant::now();
-        let GAEOutput {
+        // Upload the per-row scan side-data and raw rewards once; everything
+        // downstream of GAE (advantages, returns, targets, deltas) stays
+        // device-resident. No PCIe crossing and no CPU scan.
+        let gae_flags = gae_cpu_flags(
+            terminals,
+            self.config.gamma,
+            self.config.lambda,
+            self.config.gae_estimator,
+        );
+        let gae_flags =
+            Tensor::<2>::from_data(TensorData::new(gae_flags, [rollout_size, 4]), &self.device);
+        let gae_rewards = Tensor::<2>::from_data(
+            TensorData::new(memory.rewards()[..rollout_size].to_vec(), [rollout_size, 1]),
+            &self.device,
+        );
+        let DeviceGaeOutput {
             returns,
             target_vals,
             mut advantages,
-            rew_clip_portion,
             deltas,
-        } = get_gae(
+            reward_abs_sum,
+            clipped_abs_sum,
+        } = get_gae_device(
             old_values,
-            get_batch_1d(memory.rewards(), &memory_indices),
-            &terminals,
-            &trunc_val_preds,
+            gae_rewards,
+            gae_flags,
+            trunc_val_preds,
             self.config.gamma,
-            self.config.lambda,
             return_std,
             self.config.reward_clip_range,
-            self.config.gae_estimator,
         );
         metrics["GAE/time"] = gae_start.elapsed().as_secs_f64().into();
-        metrics["GAE/reward clip portion"] = rew_clip_portion.into();
 
-        // GAE distribution metrics.
-        let n = returns.len().max(1) as f32;
-        metrics["GAE/avg return"] =
-            ((returns.iter().map(|x| x.abs()).sum::<f32>() / n) as f64).into();
-        metrics["GAE/avg advantage"] =
-            ((advantages.iter().map(|x| x.abs()).sum::<f32>() / n) as f64).into();
-        metrics["GAE/avg val target"] =
-            ((target_vals.iter().map(|x| x.abs()).sum::<f32>() / n) as f64).into();
+        // GAE distribution metrics: reduced on the device, read back with
+        // the end-of-iteration transaction.
+        let gae_avg_return = returns.clone().abs().mean();
+        let gae_avg_advantage = advantages.clone().abs().mean();
+        let gae_avg_target = target_vals.clone().abs().mean();
 
+        let mut return_samples: Option<Tensor<2>> = None;
         if self.config.standardize_returns {
-            // Randomly sample returns for the running stat.
+            // Randomly sample returns for the running stat. The RNG stream
+            // and sampled values match the serial implementation exactly;
+            // the gathered samples are read back with the end-of-iteration
+            // transaction and fed to the running stat there.
             let n_to_sample = self
                 .config
                 .max_returns_per_stats_increment
-                .min(returns.len());
+                .min(rollout_size);
             if n_to_sample > 0 {
-                for _ in 0..n_to_sample {
-                    let idx = rng.next_u32() as usize % returns.len();
-                    stats.return_stat.increment(vec![returns[idx]]);
-                }
+                let indices = (0..n_to_sample)
+                    .map(|_| rng.next_u32() as usize % rollout_size)
+                    .collect::<Vec<_>>();
+                let index = Tensor::<1, Int>::from_data(
+                    TensorData::new(
+                        indices.into_iter().map(|i| i as i64).collect::<Vec<_>>(),
+                        [n_to_sample],
+                    ),
+                    &self.device,
+                )
+                .reshape([n_to_sample, 1]);
+                return_samples = Some(returns.gather(0, index));
             }
         }
-
-        metrics["GAE/returns STD"] = (stats.return_stat.get_std() as f64).into();
 
         // Optionally standardize advantages to zero mean and unit variance.
         // Percentile scaling takes precedence when both are configured: the
         // two normalizations compose badly (standardized advantages always
         // have a spread above 1, which would pin the percentile scale).
         if let Some(percentile) = self.config.percentile_adv_scaling {
-            let n = advantages.len();
-            let mut sorted = advantages.clone();
+            // Rarely-configured path: the CPU sort needs the values, so this
+            // one readback (and re-upload of the scaled result) only happens
+            // when percentile scaling is enabled.
+            let mut advantages_cpu = advantages
+                .clone()
+                .into_data()
+                .try_into_vec::<f32>()
+                .expect("advantages are f32");
+            let n = advantages_cpu.len();
+            let mut sorted = advantages_cpu.clone();
             sorted.sort_by(f32::total_cmp);
             let quantile = |p: f32| sorted[((p * (n - 1) as f32) as usize).min(n - 1)];
             let spread = quantile(0.95) - quantile(0.05);
@@ -580,19 +602,20 @@ impl Ppo {
                 percentile.ema_decay * self.adv_scale_ema + (1.0 - percentile.ema_decay) * spread;
             metrics["GAE/adv scale"] = f64::from(self.adv_scale_ema).into();
             if self.adv_scale_ema > 1.0 {
-                for advantage in &mut advantages {
+                for advantage in &mut advantages_cpu {
                     *advantage /= self.adv_scale_ema;
                 }
+                advantages = Tensor::<2>::from_data(
+                    TensorData::new(advantages_cpu, [rollout_size, 1]),
+                    &self.device,
+                );
             }
         } else if self.config.standardize_advantages {
-            let mean = advantages.iter().sum::<f32>() / advantages.len() as f32;
-            let var = advantages.iter().map(|a| (a - mean).powi(2)).sum::<f32>()
-                / advantages.len() as f32;
-            let std = var.sqrt().max(f32::EPSILON);
-
-            for a in &mut advantages {
-                *a = (*a - mean) / std;
-            }
+            let mean = advantages.clone().mean();
+            let centered = advantages.clone().sub(mean.reshape([1, 1]));
+            let var = centered.clone().powi_scalar(2).mean();
+            let std = var.sqrt().clamp_min(f32::EPSILON);
+            advantages = centered.div(std.reshape([1, 1]));
         }
 
         // Per-row PPO clip bounds from TD-residual coherence. Disabled
@@ -600,17 +623,32 @@ impl Ppo {
         let clip_eps = match self.config.adaptive_clip {
             Some(clip) => {
                 assert!(clip.window > 0, "adaptive clip window must be positive");
-                let scales = coherence_scales(&deltas, &terminals, clip.window);
+                // coherence_scales is a CPU window scan; adaptive clipping is
+                // explicitly configured, so its one deltas readback is
+                // accepted overhead.
+                let deltas_cpu = deltas
+                    .clone()
+                    .into_data()
+                    .try_into_vec::<f32>()
+                    .expect("deltas are f32");
+                let scales = coherence_scales(&deltas_cpu, terminals, clip.window);
                 let mean_scale = scales.iter().sum::<f32>() / scales.len().max(1) as f32;
                 metrics["PPO/mean clip scale"] = f64::from(mean_scale).into();
-                scales
-                    .iter()
-                    .map(|scale| {
-                        self.config.clip_range * clip.min_scale.max(clip.max_scale.min(*scale))
-                    })
-                    .collect::<Vec<_>>()
+                Tensor::<2>::from_data(
+                    TensorData::new(
+                        scales
+                            .into_iter()
+                            .map(|scale| {
+                                self.config.clip_range
+                                    * clip.min_scale.max(clip.max_scale.min(scale))
+                            })
+                            .collect::<Vec<_>>(),
+                        [rollout_size, 1],
+                    ),
+                    &self.device,
+                )
             }
-            None => vec![self.config.clip_range; advantages.len()],
+            None => Tensor::<2>::full([rollout_size, 1], self.config.clip_range, &self.device),
         };
 
         // Learning-rate schedule factor for this update (1.0 when Constant).
@@ -623,7 +661,6 @@ impl Ppo {
 
         let mut metric_totals = MetricTotals::new(&self.device);
         let training_start = Instant::now();
-        let mut batch_staging_time = Duration::from_secs_f64(resident_secs);
         let mut batch_training_time = Duration::ZERO;
 
         // Wrap the resident states for the autodiff backend once (no copy:
@@ -631,74 +668,77 @@ impl Ppo {
         // gather their states from it on the GPU.
         let resident_b = resident_states;
 
+        // Upload the rollout's per-row fields once: actions, old log-probs,
+        // and action masks. Advantages/targets/clip bounds already live on
+        // the device from the GAE pass. For a 100k-row rollout these are a
+        // few MB total, crossing the bus one time per iteration; every
+        // batch then gathers its rows on the device. This replaces the
+        // per-batch CPU staging thread entirely.
+        let upload_start = Instant::now();
+        let mask_width = memory.action_mask_width();
+        let stored_masks = memory.action_masks();
+        let rollout = DeviceRollout {
+            states: resident_b.clone(),
+            actions: Tensor::<2, Int>::from_data(
+                TensorData::new(
+                    memory.actions()[..rollout_size]
+                        .iter()
+                        .map(|&action| action as i64)
+                        .collect::<Vec<_>>(),
+                    [rollout_size, 1],
+                ),
+                &self.device,
+            ),
+            old_log_probs: Tensor::<2>::from_data(
+                TensorData::new(
+                    memory.log_probs()[..rollout_size].to_vec(),
+                    [rollout_size, 1],
+                ),
+                &self.device,
+            ),
+            advantages,
+            target_vals,
+            clip_eps,
+            action_masks: (!stored_masks.is_empty()).then(|| {
+                Tensor::<2, Int>::from_data(
+                    TensorData::new(
+                        stored_masks[..rollout_size * mask_width].to_vec(),
+                        [rollout_size, mask_width],
+                    ),
+                    &self.device,
+                )
+                .cast(FloatDType::F32)
+            }),
+        };
+        let mut upload_time = upload_start.elapsed();
+
         // Shuffle the full rollout up front so the RNG stream matches the
-        // serial implementation exactly.
-        let mut epoch_batches: Vec<Vec<usize>> = Vec::with_capacity(
-            rollout_size.div_ceil(self.config.batch_size) * self.config.epochs.max(1),
-        );
+        // serial implementation exactly. Each epoch's shuffled order is
+        // uploaded as one index tensor and sliced per batch, so batches
+        // build no index of their own.
+        let mut optim_time = Duration::ZERO;
         for _ in 0..self.config.epochs {
             let mut rollout_order: Vec<usize> = (0..rollout_size).collect();
             rollout_order.shuffle(rng);
-            for batch_indices in rollout_order.chunks(self.config.batch_size) {
-                epoch_batches.push(batch_indices.to_vec());
-            }
-        }
+            let idx_start = Instant::now();
+            let epoch_index = Tensor::<1, Int>::from_data(
+                TensorData::new(
+                    rollout_order
+                        .into_iter()
+                        .map(|index| index as i64)
+                        .collect::<Vec<_>>(),
+                    [rollout_size],
+                ),
+                &self.device,
+            );
+            upload_time += idx_start.elapsed();
 
-        // Double-buffered pipeline: a staging thread fills the small CPU
-        // batch buffers (actions, log-probs, advantages, targets, masks)
-        // while the learner thread uploads them, gathers states from the
-        // resident tensor, and trains. VRAM holds the resident states plus
-        // one batch instead of the full rollout plus one batch.
-        let epoch_batches_ref = &epoch_batches;
-        std::thread::scope(|scope| {
-            // Bounded so at most two filled batches queue up: caps queued
-            // CPU RAM and keeps the producer from racing pointlessly ahead.
-            let (staged_tx, staged_rx) = std::sync::mpsc::sync_channel::<StagedBatch>(2);
-
-            scope.spawn(move || {
-                for batch_indices in epoch_batches_ref {
-                    let staged = StagedBatch::stage(
-                        memory,
-                        &advantages,
-                        &target_vals,
-                        &clip_eps,
-                        batch_indices,
-                    );
-                    if staged_tx.send(staged).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let mut upload_time = Duration::ZERO;
-            let mut optim_time = Duration::ZERO;
-            let mut primed = false;
-            for batch_indices in &epoch_batches {
-                let recv_start = Instant::now();
-                let staged = staged_rx.recv().expect("staging thread is live");
-                if !primed {
-                    // Time to the first staged batch: pipeline fill latency.
-                    metrics["PPO/pipeline prime time"] = recv_start.elapsed().as_secs_f64().into();
-                    primed = true;
-                }
-                batch_staging_time += Duration::from_secs_f64(staged.staged_secs);
-                // Upload and training both run on the learner thread, so both
-                // count as training time. Staging work overlaps with them.
-                // Upload is timed separately for attribution.
-                let training_start = Instant::now();
-                let upload_start = Instant::now();
-                // One index build plus upload per batch, shared by the state
-                // gather; the small fields arrive already gathered.
-                let index = Tensor::<1, Int>::from_data(
-                    TensorData::new(
-                        batch_indices.iter().map(|&i| i as i64).collect::<Vec<_>>(),
-                        [batch_indices.len()],
-                    ),
-                    &self.device,
-                );
-                let states = resident_b.clone().select(0, index).cast(DType::F32);
-                let batch = GpuBatch::from_staged(states, staged, &self.device);
-                upload_time += upload_start.elapsed();
+            let mut offset = 0;
+            while offset < rollout_size {
+                let len = self.config.batch_size.min(rollout_size - offset);
+                let index = epoch_index.clone().narrow(0, offset, len);
+                let batch_start = Instant::now();
+                let batch = GpuBatch::gather(&rollout, index);
                 self.train_gpu_batch(
                     &mut net,
                     &batch,
@@ -706,14 +746,17 @@ impl Ppo {
                     &mut optim_time,
                     lr_scale,
                 );
-                batch_training_time += training_start.elapsed();
+                batch_training_time += batch_start.elapsed();
+                offset += len;
             }
-            metrics["PPO/upload time"] = upload_time.as_secs_f64().into();
-            metrics["PPO/optimizer step time"] = optim_time.as_secs_f64().into();
-        });
+        }
+        metrics["PPO/upload time"] = upload_time.as_secs_f64().into();
+        metrics["PPO/optimizer step time"] = optim_time.as_secs_f64().into();
 
         metrics["PPO/training time"] = training_start.elapsed().as_secs_f64().into();
-        metrics["PPO/batch staging time"] = batch_staging_time.as_secs_f64().into();
+        // The staging thread is gone; what remains of "staging" is the
+        // once-per-iteration resident-state upload and f16 conversion.
+        metrics["PPO/batch staging time"] = resident_secs.into();
         metrics["PPO/batch training time"] = batch_training_time.as_secs_f64().into();
 
         // Plasticity diagnostics, re-emitted every iteration from the cache
@@ -739,16 +782,73 @@ impl Ppo {
         let batch_iters =
             1.max(rollout_size.div_ceil(self.config.batch_size) * self.config.epochs) as f32;
 
-        // Synchronize the accumulated scalar metrics only once after all epochs.
-        let [entropy_data, kl_data, clip_data, policy_data, critic_data] = Transaction::default()
+        // Compute parameter-update magnitudes on the device: the L2 norm of
+        // the parameter delta over every trainable tensor, summed in f64
+        // like the CPU reference. No weight downloads.
+        let policy_magnitude = device_l2_diff(flatten_net_device(&net.actor), actor_params_before);
+        let critic_magnitude =
+            device_l2_diff(flatten_net_device(&net.critic), critic_params_before);
+
+        // Synchronize every accumulated scalar exactly once after all
+        // epochs: training metrics, the GAE distribution metrics held on the
+        // device, the update magnitudes, and the return-stat samples.
+        let mut transaction = Transaction::default()
             .register(metric_totals.entropy)
             .register(metric_totals.divergence)
             .register(metric_totals.clip_fraction)
             .register(metric_totals.policy_loss)
             .register(metric_totals.value_loss)
-            .execute()
-            .try_into()
-            .expect("Correct amount of tensor data");
+            .register(gae_avg_return)
+            .register(gae_avg_advantage)
+            .register(gae_avg_target)
+            .register(reward_abs_sum)
+            .register(clipped_abs_sum)
+            .register(policy_magnitude)
+            .register(critic_magnitude);
+        if let Some(samples) = return_samples.as_ref() {
+            transaction = transaction.register(samples.clone());
+        }
+        let mut readback = transaction.execute().into_iter();
+
+        let scalar = |data: burn::tensor::TensorData| {
+            data.try_into_vec::<f32>().expect("scalar readback is f32")[0]
+        };
+        let entropy_data = readback.next().expect("readback entropy");
+        let kl_data = readback.next().expect("readback kl");
+        let clip_data = readback.next().expect("readback clip fraction");
+        let policy_data = readback.next().expect("readback policy loss");
+        let critic_data = readback.next().expect("readback value loss");
+        let avg_return_data = readback.next().expect("readback avg return");
+        let avg_advantage_data = readback.next().expect("readback avg advantage");
+        let avg_target_data = readback.next().expect("readback avg target");
+        let clip_raw_data = readback.next().expect("readback clip raw sum");
+        let clip_clipped_data = readback.next().expect("readback clip clipped sum");
+        let policy_mag_data = readback
+            .next()
+            .expect("readback policy magnitude")
+            .try_into_vec::<f64>()
+            .expect("magnitude readback is f64")[0];
+        let critic_mag_data = readback
+            .next()
+            .expect("readback critic magnitude")
+            .try_into_vec::<f64>()
+            .expect("magnitude readback is f64")[0];
+        if return_samples.is_some() {
+            stats.return_stat.increment(
+                readback
+                    .next()
+                    .expect("readback return samples")
+                    .try_into_vec::<f32>()
+                    .expect("return samples are f32"),
+            );
+        }
+        debug_assert!(readback.next().is_none());
+
+        let rew_clip_portion = {
+            let raw = scalar(clip_raw_data);
+            let clipped = scalar(clip_clipped_data);
+            (raw - clipped) / raw.max(f32::EPSILON)
+        };
 
         let mean_entropy = entropy_data.try_to_vec::<f32>().unwrap()[0] / batch_iters;
         let mean_divergence = kl_data.try_to_vec::<f32>().unwrap()[0] / batch_iters;
@@ -762,11 +862,11 @@ impl Ppo {
         let mean_rel_entropy_loss =
             (mean_entropy * self.config.entropy_scale) / mean_policy_loss.abs().max(f32::EPSILON);
 
-        // Compute parameter-update magnitudes (L2 norm of param diff).
-        let actor_params_after = flatten_net(&net.actor);
-        let critic_params_after = flatten_net(&net.critic);
-        let policy_magnitude = l2_diff(&actor_params_before, &actor_params_after);
-        let critic_magnitude = l2_diff(&critic_params_before, &critic_params_after);
+        metrics["GAE/avg return"] = f64::from(scalar(avg_return_data)).into();
+        metrics["GAE/avg advantage"] = f64::from(scalar(avg_advantage_data)).into();
+        metrics["GAE/avg val target"] = f64::from(scalar(avg_target_data)).into();
+        metrics["GAE/reward clip portion"] = f64::from(rew_clip_portion).into();
+        metrics["GAE/returns STD"] = f64::from(stats.return_stat.get_std()).into();
 
         metrics["Loss/entropy"] = mean_entropy.into();
         metrics["Loss/KL divergence"] = mean_divergence.into();
@@ -778,8 +878,8 @@ impl Ppo {
             metrics["Loss/value"] = mean_val_loss.into();
             metrics["Loss/clip fraction"] = mean_clip_fraction.into();
             metrics["Loss/relative entropy"] = mean_rel_entropy_loss.into();
-            metrics["Update/policy magnitude"] = policy_magnitude.into();
-            metrics["Update/critic magnitude"] = critic_magnitude.into();
+            metrics["Update/policy magnitude"] = policy_mag_data.into();
+            metrics["Update/critic magnitude"] = critic_mag_data.into();
         } else {
             // Always report these even on first iteration.
             metrics["Loss/value"] = mean_val_loss.into();
@@ -1075,115 +1175,46 @@ struct GpuBatch {
     clip_eps: Tensor<2>,
 }
 
-/// One batch of rollout rows gathered on the CPU staging thread, ready to
-/// upload. States are excluded: they stay resident on the GPU and batches
-/// gather them with `select`. Every buffer here is allocated once at exact
-/// size: the `Vec`s move straight into `TensorData` on upload, so there are
-/// no growth reallocs.
-struct StagedBatch {
-    rows: usize,
-    mask_width: usize,
-    /// CPU fill time, attributed to batch staging time by the learner thread.
-    staged_secs: f64,
-    actions: Vec<u32>,
-    log_probs: Vec<f32>,
-    advantages: Vec<f32>,
-    target_vals: Vec<f32>,
+/// Full rollout held device-resident: states as uploaded `f16`, every
+/// per-row scalar field as its own tensor. Batches gather rows from here
+/// with the shuffled index tensor; nothing is re-uploaded per batch.
+struct DeviceRollout {
+    states: Tensor<2>,
+    actions: Tensor<2, Int>,
+    old_log_probs: Tensor<2>,
+    advantages: Tensor<2>,
+    target_vals: Tensor<2>,
+    action_masks: Option<Tensor<2>>,
     /// Per-row PPO clip bound (fixed `clip_range` unless adaptive clipping).
-    clip_eps: Vec<f32>,
-    /// `u8` masks (1 = valid), uploaded as-is and upcast on the GPU.
-    /// Empty when the env provides no masks.
-    masks: Vec<u8>,
+    clip_eps: Tensor<2>,
 }
 
-impl StagedBatch {
-    /// Gather one shuffled batch across all CPU cores. Row copies run as
-    /// parallel chunk writes; scalar columns use parallel collect. All
-    /// reads are disjoint, so no synchronization is needed.
-    fn stage(
-        memory: &Memory,
-        advantages: &[f32],
-        target_vals: &[f32],
-        clip_eps: &[f32],
-        indices: &[usize],
-    ) -> Self {
-        let fill_start = Instant::now();
-        let rows = indices.len();
-        let mask_width = memory.action_mask_width();
-        let actions = memory.actions();
-        let log_probs = memory.log_probs();
-        let stored_masks = memory.action_masks();
-
-        let batch_actions = indices
-            .par_iter()
-            .map(|&index| actions[index] as u32)
-            .collect::<Vec<_>>();
-
-        let batch_log_probs = indices
-            .par_iter()
-            .map(|&index| log_probs[index])
-            .collect::<Vec<_>>();
-
-        let batch_advantages = indices
-            .par_iter()
-            .map(|&index| advantages[index])
-            .collect::<Vec<_>>();
-
-        let batch_target_vals = indices
-            .par_iter()
-            .map(|&index| target_vals[index])
-            .collect::<Vec<_>>();
-
-        let batch_clip_eps = indices
-            .par_iter()
-            .map(|&index| clip_eps[index])
-            .collect::<Vec<_>>();
-
-        let mut batch_masks = Vec::new();
-        if !stored_masks.is_empty() {
-            batch_masks = vec![0u8; rows * mask_width];
-            batch_masks
-                .par_chunks_mut(mask_width)
-                .enumerate()
-                .for_each(|(out_row, out)| {
-                    let start = indices[out_row] * mask_width;
-                    out.copy_from_slice(&stored_masks[start..start + mask_width]);
-                });
-        }
-
-        Self {
-            rows,
-            mask_width,
-            staged_secs: fill_start.elapsed().as_secs_f64(),
-            actions: batch_actions,
-            log_probs: batch_log_probs,
-            advantages: batch_advantages,
-            target_vals: batch_target_vals,
-            clip_eps: batch_clip_eps,
-            masks: batch_masks,
-        }
-    }
-}
-
+/// One batch of rollout rows, gathered on the device from a
+/// [`DeviceRollout`] with the batch's shuffled index tensor.
 impl GpuBatch {
-    /// Combine GPU-gathered states with one staged small-field batch. The
-    /// staging `Vec`s move into `TensorData` with no further copy on host.
-    fn from_staged(states: Tensor<2>, staged: StagedBatch, device: &Device) -> Self {
-        let rows = staged.rows;
+    /// Gather one shuffled batch entirely on the device. `index` is the
+    /// batch's 1-D row-index tensor (a slice of the epoch's uploaded order,
+    /// so no index is built or uploaded per batch); `select` gathers rows
+    /// from every full-width tensor, states included.
+    fn gather(rollout: &DeviceRollout, index: Tensor<1, Int>) -> Self {
         Self {
-            states,
-            actions: Tensor::from_data(TensorData::new(staged.actions, [rows, 1]), device),
-            old_log_probs: Tensor::from_data(TensorData::new(staged.log_probs, [rows, 1]), device),
-            advantages: Tensor::from_data(TensorData::new(staged.advantages, [rows, 1]), device),
-            target_vals: Tensor::from_data(TensorData::new(staged.target_vals, [rows, 1]), device),
-            clip_eps: Tensor::from_data(TensorData::new(staged.clip_eps, [rows, 1]), device),
-            action_masks: (!staged.masks.is_empty()).then(|| {
-                Tensor::<2, Int>::from_data(
-                    TensorData::new(staged.masks, [rows, staged.mask_width]),
-                    device,
-                )
-                .cast(FloatDType::F32)
-            }),
+            // States are stored as `f16`; upcast the gathered slice to `f32`
+            // before it reaches the model (half-precision matmul is not
+            // supported on all backends, e.g. CPU).
+            states: rollout
+                .states
+                .clone()
+                .select(0, index.clone())
+                .cast(DType::F32),
+            actions: rollout.actions.clone().select(0, index.clone()),
+            old_log_probs: rollout.old_log_probs.clone().select(0, index.clone()),
+            advantages: rollout.advantages.clone().select(0, index.clone()),
+            target_vals: rollout.target_vals.clone().select(0, index.clone()),
+            clip_eps: rollout.clip_eps.clone().select(0, index.clone()),
+            action_masks: rollout
+                .action_masks
+                .as_ref()
+                .map(|masks| masks.clone().select(0, index.clone())),
         }
     }
 
@@ -1242,6 +1273,45 @@ impl MetricTotals {
         self.policy_loss = self.policy_loss.clone() + policy_loss * weight;
         self.value_loss = self.value_loss.clone() + value_loss * weight;
     }
+}
+
+/// Flatten all trainable parameters of a `Net` into a single device tensor,
+/// in the same order as [`flatten_net`]. Used to compute update-magnitude
+/// L2 norms on the device without downloading the weights each iteration.
+fn flatten_net_device(net: &Net) -> Tensor<1> {
+    let mut parts: Vec<Tensor<1>> = Vec::new();
+    for layer in net.linear_layers() {
+        parts.push(layer.weight.val().clone().flatten::<1>(0, -1));
+        if let Some(bias) = &layer.bias {
+            parts.push(bias.val().clone().flatten::<1>(0, -1));
+        }
+    }
+    for norm in net.layer_norms() {
+        match norm {
+            Normalization::Layer(ln) => {
+                parts.push(ln.gamma.val().clone().flatten::<1>(0, -1));
+                if let Some(beta) = &ln.beta {
+                    parts.push(beta.val().clone().flatten::<1>(0, -1));
+                }
+            }
+            Normalization::Rms(rms) => {
+                parts.push(rms.gamma.val().clone().flatten::<1>(0, -1));
+                // RmsNorm has no beta parameter.
+            }
+            _ => {
+                // Same graceful skip as `flatten_net`.
+            }
+        }
+    }
+    Tensor::cat(parts, 0)
+}
+
+/// L2 norm of `after - before`, computed on the device and summed in f64 to
+/// match the CPU reference ([`l2_diff`]). Returns a `[1]` f64 tensor for the
+/// end-of-iteration readback.
+fn device_l2_diff(after: Tensor<1>, before: Tensor<1>) -> Tensor<1> {
+    let diff = (after - before).cast(DType::F64);
+    diff.powi_scalar(2).sum().sqrt()
 }
 
 /// Flatten all trainable parameters of a `Net` into a single `Vec<f32>`.

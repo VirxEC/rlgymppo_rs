@@ -1,4 +1,6 @@
-#[cfg(test)]
+// The bench harness hardcodes LibTorch devices, so it only compiles under
+// the torch backend.
+#[cfg(all(test, feature = "torch"))]
 mod bench;
 pub mod config;
 mod gae;

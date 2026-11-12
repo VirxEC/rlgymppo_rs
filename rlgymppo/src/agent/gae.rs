@@ -3,6 +3,9 @@ use burn::tensor::{Int, Tensor};
 use super::config::GaeEstimator;
 use crate::base::TerminalState;
 
+/// CPU reference implementation for GAE; kept for the parity tests that
+/// validate the device scan against it.
+#[cfg(test)]
 pub(crate) struct GAEOutput {
     pub(crate) returns: Vec<f32>,
     pub(crate) target_vals: Vec<f32>,
@@ -17,6 +20,7 @@ pub(crate) struct GAEOutput {
 /// Truncation bootstrap predictions are supplied in forward terminal order.
 /// The reverse scan consumes them from the end so each truncated row receives
 /// the prediction for its own boundary observation.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_gae(
     values: Vec<f32>,
@@ -214,7 +218,7 @@ pub(crate) fn gae_cpu_flags(
 
 /// Calculate returns and GAE advantages on the device with tensor ops.
 ///
-/// Semantics match [`get_gae`] exactly (see the parity tests in this
+/// Semantics match `get_gae` exactly (see the parity tests in this
 /// module); differences are only float-level: the reversed scan runs as a
 /// two-level log-domain chunked scan over fixed-size chunks, so results are
 /// accurate to a few ulps of accumulated exp/log rounding rather than
@@ -619,7 +623,7 @@ mod tests {
 /// truncated first row, terminal boundaries mid-trajectory, the
 /// TerminationTime estimator, reward clipping, and degenerate
 /// standardization scales.
-#[cfg(any(feature = "torch", feature = "flex"))]
+#[cfg(all(test, any(feature = "torch", feature = "flex")))]
 mod device_parity_tests {
     use burn::tensor::{Device, Tensor, TensorData};
     use rand::rngs::SmallRng;
@@ -768,6 +772,7 @@ mod device_parity_tests {
         );
     }
 
+    #[cfg(feature = "torch")]
     #[test]
     #[allow(deprecated)]
     fn device_scan_matches_reference_on_torch_cpu() {

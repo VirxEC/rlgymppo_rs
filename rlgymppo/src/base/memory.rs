@@ -11,10 +11,6 @@ pub enum TerminalState {
     Truncated,
 }
 
-pub fn get_batch_1d<T: Copy>(data: &[T], indices: &[usize]) -> Vec<T> {
-    indices.iter().map(|i| data[*i]).collect::<Vec<_>>()
-}
-
 /// Convert one state row range from `f32` to `f16`. Runs on all CPU cores.
 /// Values round to nearest; inputs are normalized observations that fit
 /// easily (magnitude far below 65504, precision around 3 decimal digits).
